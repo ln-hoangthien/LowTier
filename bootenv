@@ -1,0 +1,78 @@
+#!/bin/bash
+# ==============================================================================
+# LowTier Environment Initialization Script
+# Location: $ROOT_DIR
+# ==============================================================================
+# Usage:
+#   source bootenv     # Sourced in bash (adds script dirs to PATH & cleans duplicates)
+#   ./bootenv          # Executed directly (prints system & environment info)
+# ==============================================================================
+
+CYAN='\033[0;36m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+export ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Function to clean up duplicate directories from $PATH while preserving order
+clean_path() {
+    local old_path="${1:-$PATH}"
+    local new_path=""
+    local dir
+    IFS=':' read -ra dirs <<< "$old_path"
+    for dir in "${dirs[@]}"; do
+        [ -z "$dir" ] && continue
+        case ":$new_path:" in
+            *":$dir:"*) ;; # Skip duplicate
+            *) new_path="${new_path:+$new_path:}$dir" ;;
+        esac
+    done
+    export PATH="$new_path"
+}
+
+# Clean existing $PATH duplicates
+clean_path
+
+# Add script directories to PATH when sourced (only if not already present)
+if [[ "${BASH_SOURCE[0]}" != "${0}" ]]; then
+    for dir in "${ROOT_DIR}/workloads/scripts" "${ROOT_DIR}/baselines/scripts"; do
+        if [ -d "$dir" ]; then
+            case ":$PATH:" in
+                *":$dir:"*) ;; # Already in PATH, do nothing
+                *) export PATH="$dir:$PATH" ;;
+            esac
+        fi
+    done
+    # Preserve $PATH across sudo calls
+    alias sudo='sudo env PATH="$PATH"' 2>/dev/null || true
+    # Unset legacy shell functions from prior versions
+    unset -f run_workload run_workloads run_workloads.sh setup_workloads setup_workloads.sh manage_kernels manage_kernels.sh 2>/dev/null || true
+    # Export clean_path function for interactive shell use
+    export -f clean_path 2>/dev/null || true
+fi
+
+echo -e "${CYAN}================================================================================${NC}"
+echo -e "${CYAN}                  LowTier Tiered Memory Evaluation Environment                  ${NC}"
+echo -e "${CYAN}================================================================================${NC}"
+
+echo -e "\n${GREEN}[ Kernel Version (uname -r) ]${NC}"
+uname -r
+
+echo -e "\n${GREEN}[ NUMA Hardware Topology (numactl --hardware) ]${NC}"
+if command -v numactl >/dev/null 2>&1; then
+    numactl --hardware
+else
+    echo -e "${YELLOW}Warning: numactl command not found.${NC}"
+fi
+
+echo -e "\n${BLUE}================================================================================${NC}"
+echo -e "${BLUE} Commands Available (Zero links created; PATH updated cleanly):              ${NC}"
+echo -e "${BLUE}================================================================================${NC}"
+echo -e "  ${GREEN}run_workloads.sh [alias|all]${NC}            : Run workload evaluation suite (auto-elevates with sudo)"
+echo -e "  ${GREEN}setup_workloads.sh [target]${NC}             : Setup & compile baseline workloads"
+echo -e "  ${GREEN}manage_kernels.sh [target]${NC}              : Build, install & set GRUB default kernels (auto-elevates)"
+echo -e "  ${GREEN}nohup run_workloads.sh all > log 2>&1 &${NC} : Run evaluation in background"
+echo -e "  ${GREEN}clean_path${NC}                              : Clean duplicate entries from \$PATH"
+echo -e "${BLUE}================================================================================${NC}\n"
