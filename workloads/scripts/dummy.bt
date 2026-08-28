@@ -1,0 +1,21 @@
+kprobe:decide_queue_page {
+    @start[tid, "decide_queue_page"] = nsecs;
+    @numa_faults["decide_queue_page"] = count();
+}
+
+kretprobe:decide_queue_page /@start[tid, "decide_queue_page"]/ {
+    $us = (nsecs - @start[tid, "decide_queue_page"]) / 1000;
+    @numa_page_latency_us["decide_queue_page"] = hist($us);
+    delete(@start[tid, "decide_queue_page"]);
+}kprobe:migrate_misplaced_page {
+    @start[tid, "migrate_misplaced_page"] = nsecs;
+    @numa_faults["migrate_misplaced_page"] = count();
+}
+
+kretprobe:migrate_misplaced_page /@start[tid, "migrate_misplaced_page"]/ {
+    $us = (nsecs - @start[tid, "migrate_misplaced_page"]) / 1000;
+    @numa_page_latency_us["migrate_misplaced_page"] = hist($us);
+    delete(@start[tid, "migrate_misplaced_page"]);
+}END {
+    clear(@start);
+}

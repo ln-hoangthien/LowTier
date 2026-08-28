@@ -1,0 +1,59 @@
+# Build and Object Files
+*.o
+*.ko
+*.obj
+*.so
+*.a
+*.exe
+*.out
+*.app
+*.i
+*.s
+
+# Kernel Compilation & Module Artifacts
+baselines/*/linux/
+baselines/*/linux-*/
+baselines/*/*.tar.xz
+baselines/*/*.tar.gz
+baselines/*/*.tar.bz2
+*.mod
+*.mod.c
+*.order
+*.symvers
+*.cmd
+.tmp_versions/
+
+# Workload Benchmarks (Cloned & Compiled External Suites)
+workloads/gapbs/
+workloads/redis_src/
+workloads/silo/
+workloads/xsbench/
+
+# Stream Benchmark Binaries
+workloads/stream/stream
+workloads/stream/stream_c.exe
+workloads/stream/stream_hot
+workloads/stream/stream_phases
+
+# Workload Output Logs & Performance Traces
+workloads/output/
+workloads/output_root/
+workloads/output_tmp/
+*.log
+*.data
+*.data.old
+
+# Python Artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+
+# Editors and OS metadata
+.DS_Store
+.directory
+*~
+*.swp
+*.swo
+.vscode/
+.idea/

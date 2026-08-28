@@ -1,0 +1,6 @@
+*.o
+*.exe
+stream
+stream_hot
+stream_phases
+stream_c.exe
