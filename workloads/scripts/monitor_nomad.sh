@@ -7,12 +7,29 @@ PREV_SUCCESS=0
 PREV_RETRY=0
 PREV_NODE1=0
 
+get_node1_used_mb() {
+    if [ -f /sys/devices/system/node/node1/meminfo ]; then
+        local used_kb=$(grep -i "MemUsed:" /sys/devices/system/node/node1/meminfo 2>/dev/null | awk '{print $4}')
+        if [ -n "$used_kb" ]; then
+            echo $(( used_kb / 1024 ))
+            return
+        fi
+    fi
+    local n1_size=$(numactl -H 2>/dev/null | grep "node 1 size" | awk '{print $4}')
+    local n1_free=$(numactl -H 2>/dev/null | grep "node 1 free" | awk '{print $4}')
+    if [ -n "$n1_size" ] && [ -n "$n1_free" ]; then
+        echo $(( n1_size - n1_free ))
+    else
+        echo 0
+    fi
+}
+
 while true; do
     if [ -f /proc/perfnomad ]; then
         SUCCESS=$(grep "success_nr" /proc/perfnomad | head -n 1 | awk '{print $2}')
         RETRY=$(grep "retry_nr" /proc/perfnomad | head -n 1 | awk '{print $2}')
         TRY=$(grep "try_to_promote_nr" /proc/perfnomad | head -n 1 | awk '{print $2}')
-        NODE1_USED=$(numactl -H 2>/dev/null | grep "node 1 free" | awk '{print 7926 - $4}')
+        NODE1_USED=$(get_node1_used_mb)
 
         if [ $PREV_TRY -gt 0 ]; then
             DELTA_TRY=$((TRY - PREV_TRY))

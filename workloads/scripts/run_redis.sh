@@ -61,7 +61,9 @@ echo "==> Redis server is running. Launching benchmark workload..."
 
 # Run redis-benchmark if available
 if [ -x "$REDIS_BENCH" ]; then
-    "${REDIS_BENCH}" -t set,get,lpush,mset -n 2000000 -c 50 -d 4096 -r 1000000 --threads 4 || true
+    REDIS_KEYS="${REDIS_KEYS:-4300000}"
+    REDIS_REQUESTS="${REDIS_REQUESTS:-4300000}"
+    "${REDIS_BENCH}" -t set,get,lpush,mset -n "${REDIS_REQUESTS}" -c 50 -d 4096 -r "${REDIS_KEYS}" --threads 4 || true
 else
     echo "redis-benchmark binary missing; performing set/get workload via redis-cli..."
     for i in $(seq 1 100000); do

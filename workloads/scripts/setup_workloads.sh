@@ -10,7 +10,9 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="${ROOT_DIR:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
 WORKLOAD_DIR="${ROOT_DIR}/workloads"
-NPROC=$(nproc)
+NUM_CORES="$(nproc)"
+RESERVED_CORES="${RESERVED_CORES:-2}"
+NPROC=$(( NUM_CORES > RESERVED_CORES ? NUM_CORES - RESERVED_CORES : NUM_CORES ))
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -37,7 +39,7 @@ show_help() {
     echo "  all            Setup and compile ALL workloads [Default]"
     echo ""
     echo "Available Targets:"
-    echo "  stream         Build STREAM Hot & Multi-Phase Benchmarks"
+    echo "  stream         Build STREAM Classic, Hot & Multi-Phase Benchmarks"
     echo "  gapbs          Clone & Build GAPBS Benchmark Suite (pr, tc, bfs, bc, cc, sssp)"
     echo "  twitter        Decompress & Prepare Twitter Real-World Graph Dataset"
     echo "  silo           Clone & Build Silo OLTP Database (TPC-C)"
@@ -66,20 +68,32 @@ GCC_MAJOR=$(gcc -dumpversion | cut -d. -f1)
 setup_stream() {
     echo ""
     echo "-------------------------------------------------------------------"
-    echo " Building STREAM Workloads..."
+    echo " Building STREAM Workloads (Running on ${NPROC} OpenMP cores: all cores - 2)..."
     echo "-------------------------------------------------------------------"
+    if [ ! -d "${WORKLOAD_DIR}/stream" ]; then
+        echo "Cloning STREAM repository..."
+        git clone https://github.com/jeffhammond/STREAM.git "${WORKLOAD_DIR}/stream"
+    fi
     cd "${WORKLOAD_DIR}/stream"
 
     EXTRA_FLAGS=""
     [ "$GCC_MAJOR" -ge 12 ] && EXTRA_FLAGS="-Wno-error"
 
+    # High memory footprint: 800M elements * 8 bytes * 3 arrays = 19.2 GB memory footprint
+    STREAM_FLAGS="-O3 -fopenmp -mcmodel=medium -DSTREAM_ARRAY_SIZE=800000000ULL -DNTIMES=40 -DNUM_THREADS=${NPROC} ${EXTRA_FLAGS}"
+
+    if [ -f "stream.c" ]; then
+        echo "Compiling stream.c (19.2 GB footprint, -DSTREAM_ARRAY_SIZE=800000000ULL -DNTIMES=40 -DNUM_THREADS=${NPROC})..."
+        gcc ${STREAM_FLAGS} stream.c -o stream
+        gcc ${STREAM_FLAGS} stream.c -o stream_c.exe
+    fi
     if [ -f "stream_hot.c" ]; then
-        echo "Compiling stream_hot.c..."
-        gcc -O3 -fopenmp -mcmodel=medium $EXTRA_FLAGS stream_hot.c -o stream_hot
+        echo "Compiling stream_hot.c (18.0 GB worsened-latency, -DNUM_THREADS=${NPROC})..."
+        gcc -O3 -fopenmp -mcmodel=medium -DNUM_THREADS=${NPROC} $EXTRA_FLAGS stream_hot.c -o stream_hot
     fi
     if [ -f "stream_phases.c" ]; then
-        echo "Compiling stream_phases.c..."
-        gcc -O3 -fopenmp -mcmodel=medium $EXTRA_FLAGS stream_phases.c -o stream_phases
+        echo "Compiling stream_phases.c (18.0 GB worsened-latency, -DNUM_THREADS=${NPROC})..."
+        gcc -O3 -fopenmp -mcmodel=medium -DNUM_THREADS=${NPROC} $EXTRA_FLAGS stream_phases.c -o stream_phases
     fi
     echo -e "${GREEN}STREAM binaries compiled successfully!${NC}"
 }
@@ -113,12 +127,23 @@ setup_twitter() {
     RAW_DIR="${WORKLOAD_DIR}/gapbs/benchmark/graphs/raw"
     mkdir -p "${RAW_DIR}"
 
+    TWITTER_BASE_URL="https://github.com/ANLAB-KAIST/traces/releases/download/twitter_rv.net"
+    TWITTER_PARTS=("00" "01" "02" "03")
+
     if [ ! -f "${RAW_DIR}/twitter_rv.net" ] && [ ! -f "${RAW_DIR}/twitter.el" ]; then
-        echo "Decompressing Twitter graph files in ${RAW_DIR}..."
-        if ls ${RAW_DIR}/twitter_rv.net.*.gz 1>/dev/null 2>&1; then
-            cat ${RAW_DIR}/twitter_rv.net.*.gz | gzip -d > "${RAW_DIR}/twitter_rv.net"
-            ln -sf twitter_rv.net "${RAW_DIR}/twitter.el"
-        fi
+        echo "Downloading Twitter dataset split archives from ${TWITTER_BASE_URL}..."
+        for part in "${TWITTER_PARTS[@]}"; do
+            part_file="twitter_rv.net.${part}.gz"
+            if [ ! -f "${RAW_DIR}/${part_file}" ]; then
+                echo "Downloading ${part_file}..."
+                wget -q --show-progress -P "${RAW_DIR}" "${TWITTER_BASE_URL}/${part_file}" || \
+                curl -L -o "${RAW_DIR}/${part_file}" "${TWITTER_BASE_URL}/${part_file}"
+            fi
+        done
+
+        echo "Decompressing Twitter graph files into ${RAW_DIR}/twitter_rv.net..."
+        gunzip -c "${RAW_DIR}"/twitter_rv.net.*.gz > "${RAW_DIR}/twitter_rv.net"
+        ln -sf twitter_rv.net "${RAW_DIR}/twitter.el"
     fi
 
     if [ -f "${RAW_DIR}/twitter_rv.net" ] && [ ! -f "${RAW_DIR}/twitter.el" ]; then
@@ -126,10 +151,15 @@ setup_twitter() {
     fi
 
     cd "${WORKLOAD_DIR}/gapbs"
+    if [ ! -f "converter" ]; then
+        echo "Building GAPBS converter tool..."
+        make converter -j${NPROC} 2>/dev/null || make -j${NPROC} 2>/dev/null || true
+    fi
+
     if [ -f "${RAW_DIR}/twitter.el" ] && [ ! -f "twitter.sg" ]; then
         echo "Converting Twitter edgelist (twitter.el) -> Serialized binary graph (twitter.sg)..."
-        if ./converter -f "${RAW_DIR}/twitter.el" -m -b twitter.sg 2>/dev/null; then
-            echo "Twitter binary graph created: ${WORKLOAD_DIR}/gapbs/twitter.sg"
+        if ./converter -f "${RAW_DIR}/twitter.el" -b twitter.sg 2>/dev/null; then
+            echo -e "${GREEN}Twitter binary graph created: ${WORKLOAD_DIR}/gapbs/twitter.sg${NC}"
         else
             echo "Note: Twitter binary graph (.sg) conversion skipped due to system RAM limit."
             echo "GAPBS benchmarks will read raw ${RAW_DIR}/twitter.el directly."
@@ -206,10 +236,17 @@ EOF
             sed -i 's/-Werror//g' Makefile 2>/dev/null || true && \
             MODE=perf make -j${NPROC} dbtest
         "
-        docker run --rm -v "${WORKLOAD_DIR}/silo":/usr/src/silo -w /usr/src/silo ubuntu:20.04 bash -c "$DOCKER_CMD"
+        docker run --rm --net=host -v "${WORKLOAD_DIR}/silo":/usr/src/silo -w /usr/src/silo ubuntu:20.04 bash -c "$DOCKER_CMD"
     else
         MODE=perf make -j${NPROC} dbtest
     fi
+
+    # Build local liblz4.so from third-party sources to avoid host dependency issues
+    mkdir -p "${WORKLOAD_DIR}/silo/lib"
+    if [ -f "${WORKLOAD_DIR}/silo/third-party/lz4/lz4.c" ]; then
+        gcc -O3 -fPIC -shared "${WORKLOAD_DIR}/silo/third-party/lz4/lz4.c" "${WORKLOAD_DIR}/silo/third-party/lz4/lz4hc.c" -o "${WORKLOAD_DIR}/silo/lib/liblz4.so" 2>/dev/null || true
+    fi
+
     echo -e "${GREEN}Silo DB binary compiled successfully!${NC}"
 }
 

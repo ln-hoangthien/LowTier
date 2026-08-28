@@ -1,5 +1,5 @@
 #!/bin/bash
-# Build the Nomad baseline kernel: Linux 5.13-rc6 + nomad.patch + nomad-alto.patch.
+# Build the Nomad baseline kernel: Linux v5.13-rc6 + nomad.patch.
 # Expects a Linux git checkout at ./linux (clone it there first; not bundled).
 set -euo pipefail
 
@@ -26,90 +26,57 @@ echo "==> Checking out v5.13-rc6..."
 git checkout v5.13-rc6
 make clean
 
-# When you run make inside Docker, the container has an older glibc that doesn't support GLIBC_2.34, so the host-built fixdep binary fails to execute.
+# Remove host-built fixdep binary to avoid glibc compatibility issues
 rm -f tools/objtool/fixdep scripts/basic/fixdep
 
 for p in "${PATCHES[@]}"; do
     echo "Applying $(basename "$p") ..."
-    git apply "$p"
+    if git apply --reverse --check "$p" >/dev/null 2>&1; then
+        echo "  (already applied, skipping)"
+    else
+        git apply "$p"
+    fi
 done
 
-# Base the config on the running kernel, then resolve new symbols
-# non-interactively. (Do NOT pipe `yes` into `make oldconfig`: under
-# `set -o pipefail`, `yes` dies with SIGPIPE and aborts the build.)
-echo "configuring (olddefconfig) ... "
-if [[ -f "/boot/config-$(uname -r)" ]]; then
-    cp "/boot/config-$(uname -r)" .config
-elif [[ -f "../host.config" ]]; then
-    echo "Using host config from ../host.config"
-    cp "../host.config" .config
+# Copy configuration from generic kernel to .config
+echo "configuring (olddefconfig) ..."
+GENERIC_CONFIG=$(ls /boot/config-*-generic 2>/dev/null | sort -V | tail -n 1)
+if [[ -n "$GENERIC_CONFIG" && -f "$GENERIC_CONFIG" ]]; then
+    echo "Using official distro generic config: $GENERIC_CONFIG"
+    cp "$GENERIC_CONFIG" .config
+else
+    echo "Error: No official distro generic config (/boot/config-*-generic) found."
+    exit 1
 fi
 
 # ------------------------------------------------------------------------------
 # Kernel Configuration Adjustments (scripts/config)
-# Adjust kernel configuration parameters for build compatibility, booting,
-# and core Nomad NUMA-based tiered memory functionality.
 # ------------------------------------------------------------------------------
-
 # 1. Kernel Naming & Certificate Key Fixes
-# - CONFIG_LOCALVERSION: Appends '-Nomad' suffix to kernel version (e.g. 5.13.0-rc6-Nomad)
-# - CONFIG_SYSTEM_*_KEYS: Empties distro build certificate paths copied from Ubuntu /boot config
-#   to prevent compilation failures caused by missing Canonical/Ubuntu signing keys
 scripts/config --set-str CONFIG_LOCALVERSION "-Nomad"
 scripts/config --set-str CONFIG_SYSTEM_TRUSTED_KEYS ""
 scripts/config --set-str CONFIG_SYSTEM_REVOCATION_KEYS ""
+scripts/config --disable CONFIG_DEBUG_INFO_BTF
 
-# 2. Core Nomad Tiered Memory & Architecture Requirements
-# - CONFIG_SMP: Enables Symmetric Multiprocessing across CPU cores
-# - CONFIG_NUMA: Enables Non-Uniform Memory Access architecture support for multi-tier memory
-# - CONFIG_NUMA_BALANCING: Enables kernel NUMA page balancing and migration mechanisms
-# - CONFIG_MEMCG: Enables Memory Control Groups accounting for cgroup-level page tracking
+# 2. Core Architecture Configuration
 # - CONFIG_X86_5LEVEL (disabled): Enforces standard 4-level paging expected by Nomad patch
-scripts/config --enable SMP             # Will remove it in real NUMA with 2-socket.
-scripts/config --enable NUMA            # Will remove it in real NUMA with 2-socket.
-scripts/config --enable NUMA_BALANCING  # Will remove it in real NUMA with 2-socket.
-scripts/config --enable MEMCG           # Will remove it in real NUMA with 2-socket.
 scripts/config --disable CONFIG_X86_5LEVEL
 
-# 3. Bootloader & Driver Support
-# - CONFIG_MODULES: Enables loadable kernel module support for device drivers
-# - CONFIG_BLK_DEV_INITRD & CONFIG_RD_GZIP: Enables Initial RAM Disk (initrd) support for Ubuntu bootloader
-# scripts/config --enable MODULES # Is turned my default
-# scripts/config --enable BLK_DEV_INITRD
-# scripts/config --enable RD_GZIP
-
-# 4. Toolchain Build Compatibility
-# - CONFIG_DEBUG_INFO_BTF (disabled): Bypasses BPF Type Format debug generation to prevent
-#   'pahole' toolchain version mismatch build failures during vmlinux linking
-scripts/config --disable DEBUG_INFO_BTF
-
-# 5. Hardware Emulation for Single-Socket Testing
-# - CONFIG_NUMA_EMU (enabled): Enables fake NUMA node emulation ('numa=fake=X') for testing
-#   tiered memory policies on single-socket test machines without physical NUMA hardware
-scripts/config --enable NUMA_EMU # Will remove it in real NUMA with 2-socket.
-
-GCC_MAJOR=$(gcc -dumpversion | cut -d. -f1)
-eval make olddefconfig > "$LOGF" 2>&1
-echo "make ..."
-if [ "$GCC_MAJOR" -ge 12 ]; then
-    echo "Using Docker for compilation (GCC $GCC_MAJOR >= 12)..."
-    DOCKER_CMD="
-        DEBIAN_FRONTEND=noninteractive apt-get update && \
-        DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            build-essential bc bison flex libelf-dev libssl-dev libncurses-dev \
-            libcap-dev zlib1g-dev pkg-config dwarves openssl xz-utils cpio zstd || true && \
-        make olddefconfig && \
-        make -j\$(nproc) && \
-        make -C /usr/src/nomad/nomad_module KERNEL_SRC=/usr/src/nomad/linux
-    "
-    docker run --rm -v "$SCRIPT_DIR":/usr/src/nomad -w /usr/src/nomad/linux ubuntu:22.04 bash -c "$DOCKER_CMD" >> "$LOGF" 2>&1
-else
-    eval make -j "$(nproc)" >> "$LOGF" 2>&1
-    make -C "$SCRIPT_DIR/nomad_module" KERNEL_SRC="$KERNEL_DIR" >> "$LOGF" 2>&1
+# 3. Single-Socket NUMA Emulation Configs (managed in manage_kernels.sh; will remove in real 2-socket NUMA in the future)
+if type configure_single_socket_numa >/dev/null 2>&1; then
+    configure_single_socket_numa "$KERNEL_DIR"
 fi
 
+# ------------------------------------------------------------------------------
+# Compile Kernel and Nomad Module
+# ------------------------------------------------------------------------------
+make olddefconfig CC=gcc-11 HOSTCC=gcc-11 > "$LOGF" 2>&1
+echo "make ..."
+make -j "$(nproc)" CC=gcc-11 HOSTCC=gcc-11 > "$LOGF" 2>&1
+make -C "$SCRIPT_DIR/nomad_module" KERNEL_SRC="$KERNEL_DIR" CC=gcc-11 HOSTCC=gcc-11 > "$LOGF" 2>&1
+
 # ---------------------------------------------------------------------------
-# 5. Done
+# Done
 # ---------------------------------------------------------------------------
 echo ""
 echo "==> Build complete."

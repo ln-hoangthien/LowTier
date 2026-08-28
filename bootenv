@@ -37,7 +37,7 @@ clean_path
 
 # Add script directories to PATH when sourced (only if not already present)
 if [[ "${BASH_SOURCE[0]}" != "${0}" ]]; then
-    for dir in "${ROOT_DIR}/workloads/scripts" "${ROOT_DIR}/baselines/scripts"; do
+    for dir in "${ROOT_DIR}/workloads/scripts" "${ROOT_DIR}/baselines/scripts" "${ROOT_DIR}/regression"; do
         if [ -d "$dir" ]; then
             case ":$PATH:" in
                 *":$dir:"*) ;; # Already in PATH, do nothing
@@ -71,8 +71,11 @@ echo -e "\n${BLUE}==============================================================
 echo -e "${BLUE} Commands Available (Zero links created; PATH updated cleanly):              ${NC}"
 echo -e "${BLUE}================================================================================${NC}"
 echo -e "  ${GREEN}run_workloads.sh [alias|all]${NC}            : Run workload evaluation suite (auto-elevates with sudo)"
+echo -e "  ${GREEN}run_regression.sh${NC}                       : Run single-kernel regression workload suite"
+echo -e "  ${GREEN}run_auto_regression.sh [start|status]${NC}   : Orchestrate multi-kernel switching & evaluation"
+echo -e "  ${GREEN}run_bpftrace.sh [alias|all]${NC}             : Profile do_numa_page() latency while running workload"
 echo -e "  ${GREEN}setup_workloads.sh [target]${NC}             : Setup & compile baseline workloads"
 echo -e "  ${GREEN}manage_kernels.sh [target]${NC}              : Build, install & set GRUB default kernels (auto-elevates)"
-echo -e "  ${GREEN}nohup run_workloads.sh all > log 2>&1 &${NC} : Run evaluation in background"
+echo -e "  ${GREEN}calc_overhead.sh [kernel|all]${NC}          : Parse regression logs and calculate handler overhead %"
 echo -e "  ${GREEN}clean_path${NC}                              : Clean duplicate entries from \$PATH"
 echo -e "${BLUE}================================================================================${NC}\n"
