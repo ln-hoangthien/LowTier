@@ -1,12 +1,13 @@
 #!/bin/bash
 # ==============================================================================
-# Automated Multi-Kernel Regression Orchestrator
+# Automated Multi-Kernel & Multi-Ratio Regression Orchestrator
 # Location: ~/thienle/LowTier/regression/run_auto_regression.sh
 # ==============================================================================
 # Description:
-#   Reads kernel targets sequentially from regression_list, sets GRUB default
-#   kernel via manage_kernels.sh, reboots, runs run_regression.sh upon boot,
-#   and proceeds to the next kernel until all targets are evaluated.
+#   Reads kernels, tier ratios, and benchmarks from regression_list.
+#   For each (Kernel, Benchmark, Ratio), fast-tier capacity is dynamically
+#   calculated from the workload RSS, set via memmap in GRUB, and rebooted.
+#   Post-reboot, executes the targeted benchmark directly.
 #
 # Usage:
 #   sudo ./run_auto_regression.sh [start | status | stop | reset]
@@ -16,7 +17,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="${ROOT_DIR:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
-REGRESSION_LIST="${SCRIPT_DIR}/regression_list"
+REGRESSION_LIST="${REGRESSION_LIST:-${SCRIPT_DIR}/regression_list}"
 STATE_FILE="${SCRIPT_DIR}/.regression_state"
 SERVICE_NAME="lowtier-regression.service"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}"
@@ -40,8 +41,22 @@ if [[ "$ACTION" != "status" && "$ACTION" != "check" && "$ACTION" != "-h" && "$AC
 fi
 
 log() {
-    local msg="[$(date '+%Y-%m-%d %H:%M:%S')] $1"
-    echo -e "$msg" | tee -a "$LOG_FILE"
+    local timestamp="[$(date '+%Y-%m-%d %H:%M:%S')]"
+    local raw_msg="$1"
+    # Print formatted message with terminal colors to console / stdout
+    echo -e "${timestamp} ${raw_msg}"
+    # Strip ANSI escape sequences before appending to the log file
+    local clean_msg
+    clean_msg=$(printf '%b' "${raw_msg}" | sed -E 's/\x1B\[[0-9;]*[a-zA-Z]//g')
+    echo "${timestamp} ${clean_msg}" >> "$LOG_FILE"
+}
+
+# ------------------------------------------------------------------------------
+# Helper: Memmap calculation via manage_kernels.sh
+# ------------------------------------------------------------------------------
+resolve_memmap() {
+    local bench="$1" ratio="${2:-1:1}"
+    bash "${ROOT_DIR}/baselines/scripts/manage_kernels.sh" resolve_memmap "$bench" "$ratio"
 }
 
 # ------------------------------------------------------------------------------
@@ -52,20 +67,41 @@ load_targets() {
         echo -e "${RED}Error: regression_list not found at ${REGRESSION_LIST}${NC}"
         exit 1
     fi
-    TARGETS=()
-    while IFS= read -r line || [ -n "$line" ]; do
-        # Strip comments and whitespace
-        local cleaned
-        cleaned=$(echo "$line" | sed 's/#.*//' | tr -d ' \t\r\n')
-        if [ -n "$cleaned" ]; then
-            TARGETS+=("$cleaned")
-        fi
-    done < "$REGRESSION_LIST"
 
-    if [ ${#TARGETS[@]} -eq 0 ]; then
-        echo -e "${RED}Error: No valid kernel targets found in ${REGRESSION_LIST}${NC}"
+    if [ ! -s "$REGRESSION_LIST" ]; then
+        echo -e "${RED}Error: regression_list at ${REGRESSION_LIST} is empty${NC}"
         exit 1
     fi
+
+    unset TIER_RATIOS BENCHMARKS KERNELS
+    # shellcheck source=/dev/null
+    source "$REGRESSION_LIST"
+    read -ra TIER_RATIOS <<< "${TIER_RATIOS[*]//,/ }"
+    read -ra BENCHMARKS <<< "${BENCHMARKS[*]//,/ }"
+    read -ra KERNELS <<< "${KERNELS[*]//,/ }"
+
+    if [ ${#KERNELS[@]} -eq 0 ]; then
+        echo -e "${RED}Error: No target kernels specified in ${REGRESSION_LIST}${NC}"
+        exit 1
+    fi
+    if [ ${#BENCHMARKS[@]} -eq 0 ]; then
+        echo -e "${RED}Error: No benchmarks specified in ${REGRESSION_LIST} (BENCHMARKS=...)${NC}"
+        exit 1
+    fi
+    if [ ${#TIER_RATIOS[@]} -eq 0 ]; then
+        echo -e "${RED}Error: No tier ratios specified in ${REGRESSION_LIST} (TIER_RATIOS=...)${NC}"
+        exit 1
+    fi
+
+    # Execution matrix: Kernel -> Benchmark -> Ratio
+    TARGET_ITEMS=()
+    for k in "${KERNELS[@]}"; do
+        for b in "${BENCHMARKS[@]}"; do
+            for r in "${TIER_RATIOS[@]}"; do
+                TARGET_ITEMS+=("${k}|${b}|${r}")
+            done
+        done
+    done
 }
 
 # ------------------------------------------------------------------------------
@@ -106,12 +142,11 @@ remove_service() {
 }
 
 # ------------------------------------------------------------------------------
-# Helper: Check if target kernel source tree and compiled bzImage/vmlinux exist
+# Helper: Kernel verification
 # ------------------------------------------------------------------------------
 is_kernel_ready() {
     local target="$1"
     local kdir=""
-
     case "$target" in
         generic|distro|default)
             return 0
@@ -144,18 +179,9 @@ is_kernel_ready() {
             kdir="${ROOT_DIR}/baselines/${target}/linux"
             ;;
     esac
-
-    # Check if the linux source directory exists and contains a built bzImage or vmlinux
-    if [ -d "$kdir" ] && ([ -f "$kdir/arch/x86/boot/bzImage" ] || [ -f "$kdir/vmlinux" ]); then
-        return 0
-    fi
-
-    return 1
+    [ -d "$kdir" ] && ([ -f "$kdir/arch/x86/boot/bzImage" ] || [ -f "$kdir/vmlinux" ])
 }
 
-# ------------------------------------------------------------------------------
-# Helper: Check if system is already booted into the requested target kernel
-# ------------------------------------------------------------------------------
 is_kernel_running() {
     local target="$1"
     local curr_k
@@ -195,97 +221,108 @@ is_kernel_running() {
     esac
 }
 
+is_target_and_memmap_running() {
+    local target_kernel="$1"
+    local target_memmap="$2"
+
+    if ! is_kernel_running "$target_kernel"; then
+        return 1
+    fi
+    if [ -n "$target_memmap" ] && ! grep -qF "$target_memmap" /proc/cmdline; then
+        return 1
+    fi
+    return 0
+}
+
 # ------------------------------------------------------------------------------
-# Helper: Set next kernel in GRUB and reboot (compiles first if not ready)
+# Helper: Kernel switch & reboot
 # ------------------------------------------------------------------------------
 switch_kernel_and_reboot() {
-    local target="$1"
+    local target_kernel="$1"
+    local target_memmap="$2"
     log "${BLUE}================================================================================${NC}"
-    log "${BLUE} Preparing kernel switch to: '${target}' ${NC}"
+    log "${BLUE} Switching to: '${target_kernel}' with ${target_memmap} ${NC}"
     log "${BLUE}================================================================================${NC}"
 
     local MANAGE_KERNELS="${ROOT_DIR}/baselines/scripts/manage_kernels.sh"
-    if [ ! -f "$MANAGE_KERNELS" ]; then
-        log "${RED}Error: manage_kernels.sh not found at ${MANAGE_KERNELS}${NC}"
-        exit 1
-    fi
-
-    if is_kernel_ready "$target"; then
-        if [[ "$target" =~ ^(generic|distro|default)$ ]]; then
-            log "${GREEN}[+] Setting GRUB default to official distro generic kernel...${NC}"
-        else
-            log "${GREEN}[+] Kernel '${target}' source and binary found in baselines/${target}/linux.${NC}"
-            log "${CYAN}Updating GRUB default boot entry to '${target}' and rebooting...${NC}"
-        fi
-        bash "$MANAGE_KERNELS" "$target" update_grub --reboot
+    if is_kernel_ready "$target_kernel"; then
+        bash "$MANAGE_KERNELS" "$target_kernel" update_grub --memmap "$target_memmap" --reboot
     else
-        log "${YELLOW}[!] Kernel '${target}' source/binary NOT found in baselines/${target}/linux.${NC}"
-        log "${CYAN}Automatically compiling, installing modules & kernel, and setting GRUB default via manage_kernels.sh...${NC}"
-        bash "$MANAGE_KERNELS" "$target" --reboot
+        log "${YELLOW}[!] Source/binary for '${target_kernel}' not built. Compiling and installing...${NC}"
+        bash "$MANAGE_KERNELS" "$target_kernel" --memmap "$target_memmap" --reboot
     fi
 }
 
 # ------------------------------------------------------------------------------
-# Action: Step Execution (Run workload on current kernel, then switch to next)
+# Helper: Execute targeted benchmark directly
+# ------------------------------------------------------------------------------
+run_target_benchmark() {
+    local bench="$1"
+    local ratio="${2:-${TIER_RATIO:-}}"
+    local run_sh="${ROOT_DIR}/workloads/scripts/run_workloads.sh"
+    if [[ "$bench" =~ ^(gapbs_[a-z]+)_(kron|urand|twitter|web|road)$ ]]; then
+        bash "$run_sh" "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "$ratio"
+    else
+        bash "$run_sh" "$bench" "" "$ratio"
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# Action: Step Execution
 # ------------------------------------------------------------------------------
 execute_step() {
     load_targets
+    [ ! -f "$STATE_FILE" ] && { log "${RED}No active regression state found. Exiting.${NC}"; exit 0; }
 
-    if [ ! -f "$STATE_FILE" ]; then
-        log "${RED}No active regression state found. Exiting.${NC}"
-        exit 0
-    fi
-
-    # Read state
     # shellcheck source=/dev/null
     source "$STATE_FILE"
     CURRENT_INDEX="${CURRENT_INDEX:-0}"
-    TOTAL_KERNELS="${#TARGETS[@]}"
+    TOTAL_ITEMS="${#TARGET_ITEMS[@]}"
 
-    if [ "$CURRENT_INDEX" -ge "$TOTAL_KERNELS" ]; then
-        log "${GREEN}================================================================================${NC}"
-        log "${GREEN} ALL KERNEL REGRESSIONS COMPLETED (${TOTAL_KERNELS}/${TOTAL_KERNELS})! ${NC}"
-        log "${GREEN}================================================================================${NC}"
-        remove_service
-        rm -f "$STATE_FILE"
-        exit 0
-    fi
+    while [ "$CURRENT_INDEX" -lt "$TOTAL_ITEMS" ]; do
+        IFS='|' read -r CURRENT_KERNEL CURRENT_BENCHMARK CURRENT_RATIO <<< "${TARGET_ITEMS[$CURRENT_INDEX]}"
+        CURRENT_MEMMAP=$(resolve_memmap "$CURRENT_BENCHMARK" "$CURRENT_RATIO")
 
-    CURRENT_TARGET="${TARGETS[$CURRENT_INDEX]}"
-    log "${CYAN}================================================================================${NC}"
-    log "${CYAN} [Step $((CURRENT_INDEX + 1))/${TOTAL_KERNELS}] Target: '${CURRENT_TARGET}' | Current Kernel: $(uname -r)${NC}"
-    log "${CYAN}================================================================================${NC}"
+        # If current running system doesn't match required kernel and memmap, configure & reboot
+        if ! is_target_and_memmap_running "$CURRENT_KERNEL" "$CURRENT_MEMMAP"; then
+            log "${YELLOW}[!] Current system does not match target '${CURRENT_KERNEL}' or ${CURRENT_MEMMAP}.${NC}"
+            switch_kernel_and_reboot "$CURRENT_KERNEL" "$CURRENT_MEMMAP"
+            return 0
+        fi
 
-    # Allow system services to fully settle after boot
-    log "Allowing system to settle for 10 seconds before starting workloads..."
-    sleep 10
+        log "${CYAN}================================================================================${NC}"
+        log "${CYAN} [Step $((CURRENT_INDEX + 1))/${TOTAL_ITEMS}] Kernel: ${CURRENT_KERNEL} | Workload: ${CURRENT_BENCHMARK} | Ratio: ${CURRENT_RATIO} (${CURRENT_MEMMAP})${NC}"
+        log "${CYAN}================================================================================${NC}"
 
-    # Execute workload suite for this kernel
-    local RUN_REGRESS="${SCRIPT_DIR}/run_regression.sh"
-    if [ -f "$RUN_REGRESS" ]; then
-        log "${GREEN}Running workload regression suite: ${RUN_REGRESS}...${NC}"
-        bash "$RUN_REGRESS"
-        log "${GREEN}Workload regression completed for target: '${CURRENT_TARGET}' (Kernel: $(uname -r))${NC}"
-    else
-        log "${RED}Error: run_regression.sh not found at ${RUN_REGRESS}${NC}"
-    fi
+        log "Allowing system to settle for 10 seconds before starting benchmark..."
+        sleep 10
 
-    # Advance to next kernel target
-    NEXT_INDEX=$((CURRENT_INDEX + 1))
-    if [ "$NEXT_INDEX" -lt "$TOTAL_KERNELS" ]; then
-        NEXT_TARGET="${TARGETS[$NEXT_INDEX]}"
-        echo "CURRENT_INDEX=${NEXT_INDEX}" > "$STATE_FILE"
+        log "${GREEN}Executing targeted benchmark: ${CURRENT_BENCHMARK} (Ratio: ${CURRENT_RATIO})...${NC}"
+        export TIER_RATIO="$CURRENT_RATIO"
+        run_target_benchmark "$CURRENT_BENCHMARK" "$CURRENT_RATIO"
+        log "${GREEN}Completed benchmark: ${CURRENT_BENCHMARK} (Ratio: ${CURRENT_RATIO}).${NC}"
+
+        # Advance to next item
+        CURRENT_INDEX=$((CURRENT_INDEX + 1))
+        echo "CURRENT_INDEX=${CURRENT_INDEX}" > "$STATE_FILE"
         echo "STARTED_TIME=${STARTED_TIME:-$(date +%s)}" >> "$STATE_FILE"
-        log "${YELLOW}Progress: Finished $((NEXT_INDEX))/${TOTAL_KERNELS} kernels. Next target: '${NEXT_TARGET}'${NC}"
-        switch_kernel_and_reboot "$NEXT_TARGET"
-    else
-        log "${GREEN}================================================================================${NC}"
-        log "${GREEN} ALL KERNEL REGRESSIONS COMPLETED SUCCESSFULLY! (${TOTAL_KERNELS}/${TOTAL_KERNELS})${NC}"
-        log "${GREEN} Output logs saved to: ${ROOT_DIR}/workloads/output/${NC}"
-        log "${GREEN}================================================================================${NC}"
-        remove_service
-        rm -f "$STATE_FILE"
-    fi
+
+        if [ "$CURRENT_INDEX" -lt "$TOTAL_ITEMS" ]; then
+            IFS='|' read -r NEXT_KERNEL NEXT_BENCHMARK NEXT_RATIO <<< "${TARGET_ITEMS[$CURRENT_INDEX]}"
+            NEXT_MEMMAP=$(resolve_memmap "$NEXT_BENCHMARK" "$NEXT_RATIO")
+            if ! is_target_and_memmap_running "$NEXT_KERNEL" "$NEXT_MEMMAP"; then
+                log "${YELLOW}Next target [Step $((CURRENT_INDEX + 1))/${TOTAL_ITEMS}]: '${NEXT_KERNEL}' | ${NEXT_BENCHMARK} | ${NEXT_RATIO} (${NEXT_MEMMAP})${NC}"
+                switch_kernel_and_reboot "$NEXT_KERNEL" "$NEXT_MEMMAP"
+                return 0
+            fi
+        fi
+    done
+
+    log "${GREEN}================================================================================${NC}"
+    log "${GREEN} ALL MULTI-KERNEL & MULTI-RATIO REGRESSIONS COMPLETED (${TOTAL_ITEMS}/${TOTAL_ITEMS})! ${NC}"
+    log "${GREEN}================================================================================${NC}"
+    remove_service
+    rm -f "$STATE_FILE"
 }
 
 # ------------------------------------------------------------------------------
@@ -293,34 +330,20 @@ execute_step() {
 # ------------------------------------------------------------------------------
 start_regression() {
     load_targets
-    local total="${#TARGETS[@]}"
+    local total="${#TARGET_ITEMS[@]}"
 
     echo -e "${CYAN}================================================================================${NC}"
-    echo -e "${CYAN}        Starting Automated Multi-Kernel Regression Suite (${total} Kernels)        ${NC}"
-    echo -e "${CYAN}================================================================================${NC}"
-    echo "Targets to evaluate in sequence:"
-    local i=1
-    for t in "${TARGETS[@]}"; do
-        echo "  $i. $t"
-        i=$((i + 1))
-    done
+    echo -e "${CYAN} Starting Automated Multi-Kernel & Multi-Ratio Regression Suite (${total} Steps) ${NC}"
+    echo -e "${CYAN} Kernels     : ${KERNELS[*]}${NC}"
+    echo -e "${CYAN} Benchmarks  : ${BENCHMARKS[*]}${NC}"
+    echo -e "${CYAN} Tier Ratios : ${TIER_RATIOS[*]}${NC}"
     echo -e "${CYAN}================================================================================${NC}"
 
-    # Save initial state
     echo "CURRENT_INDEX=0" > "$STATE_FILE"
     echo "STARTED_TIME=$(date +%s)" >> "$STATE_FILE"
-
-    # Install autostart service for cross-reboot execution
     install_service
 
-    FIRST_TARGET="${TARGETS[0]}"
-    if is_kernel_running "$FIRST_TARGET"; then
-        log "${GREEN}[+] Currently running target kernel '${FIRST_TARGET}' ($(uname -r)). Starting regression immediately without reboot...${NC}"
-        execute_step
-    else
-        log "Initiating first target: '${FIRST_TARGET}'..."
-        switch_kernel_and_reboot "$FIRST_TARGET"
-    fi
+    execute_step
 }
 
 # ------------------------------------------------------------------------------
@@ -328,31 +351,35 @@ start_regression() {
 # ------------------------------------------------------------------------------
 show_status() {
     load_targets
-    local total="${#TARGETS[@]}"
-
-    if [ ! -f "$STATE_FILE" ]; then
-        echo -e "${YELLOW}No active regression in progress.${NC}"
-        echo "Configured targets in regression_list (${total} total):"
-        local i=1
-        for t in "${TARGETS[@]}"; do
-            echo "  $i. $t"
-            i=$((i + 1))
-        done
-        return 0
-    fi
-
-    # shellcheck source=/dev/null
-    source "$STATE_FILE"
-    local curr="${CURRENT_INDEX:-0}"
-    local target="${TARGETS[$curr]:-Unknown}"
+    local total="${#TARGET_ITEMS[@]}"
 
     echo -e "${CYAN}================================================================================${NC}"
     echo -e "${CYAN}                  Automated Regression Status                                   ${NC}"
     echo -e "${CYAN}================================================================================${NC}"
-    echo -e " Current Progress   : $((curr + 1)) of ${total} kernels"
-    echo -e " Current Target     : ${target}"
+    echo -e " Configured Kernels : ${KERNELS[*]}"
+    echo -e " Benchmarks         : ${BENCHMARKS[*]}"
+    echo -e " Tier Ratios        : ${TIER_RATIOS[*]}"
+    echo -e " Total Steps        : ${total}"
     echo -e " Running Kernel     : $(uname -r)"
-    echo -e " Autostart Service  : $(systemctl is-enabled ${SERVICE_NAME} 2>/dev/null || echo "inactive")"
+    echo -e " Active Cmdline     : $(grep -oE 'memmap=[^ ]+' /proc/cmdline 2>/dev/null || echo 'none')"
+    echo -e " Autostart Service  : $(systemctl is-active --quiet "${SERVICE_NAME}" && echo "active" || echo "inactive")"
+
+    if [ ! -f "$STATE_FILE" ]; then
+        echo -e "\n${YELLOW}No active regression in progress.${NC}"
+    else
+        # shellcheck source=/dev/null
+        source "$STATE_FILE"
+        local curr="${CURRENT_INDEX:-0}"
+        if [ "$curr" -lt "$total" ]; then
+            IFS='|' read -r k b r <<< "${TARGET_ITEMS[$curr]}"
+            local m
+            m=$(resolve_memmap "$b" "$r")
+            echo -e "\n Current Progress   : Step $((curr + 1)) of ${total}"
+            echo -e " Active Target      : Kernel='${k}', Benchmark='${b}', Ratio='${r}' (${m})"
+        else
+            echo -e "\n Current Progress   : Completed all ${total} steps"
+        fi
+    fi
     echo -e "${CYAN}================================================================================${NC}"
 }
 
@@ -375,16 +402,13 @@ case "$ACTION" in
     start|run)
         start_regression
         ;;
-    --step)
+    --step|step)
         execute_step
         ;;
     status|check)
         show_status
         ;;
-    stop|abort|cancel)
-        abort_regression
-        ;;
-    reset)
+    stop|abort|cancel|reset)
         abort_regression
         ;;
     -h|--help|help)
@@ -393,8 +417,8 @@ case "$ACTION" in
         echo "Commands:"
         echo "  start (default) : Start the automated regression over regression_list"
         echo "  status          : Display current progress and active target"
-        echo "  stop / abort    : Cancel the running regression and remove reboot service"
-        echo "  reset           : Clear state and service configuration"
+        echo "  stop / abort    : Cancel running regression and remove autostart service"
+        echo "  reset           : Clear state and autostart service"
         ;;
     *)
         echo "Usage: sudo $0 [start | status | stop | reset]"

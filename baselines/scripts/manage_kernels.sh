@@ -30,6 +30,8 @@ NOMAD_ALTO_NOINLINE_DIR="${BASELINES_DIR}/nomad-alto-noinline"
 TPP_DIR="${BASELINES_DIR}/tpp"
 COLLOID_TPP_DIR="${BASELINES_DIR}/colloid-tpp"
 COLLOID_TPP_ALTO_DIR="${BASELINES_DIR}/colloid-tpp-alto"
+PACT_DIR="${BASELINES_DIR}/pact"
+HYBRIDTIER_DIR="${BASELINES_DIR}/hybridtier"
 
 # Formatting color definitions for terminal output
 export RED='\033[0;31m'
@@ -39,20 +41,131 @@ export BLUE='\033[0;34m'
 export CYAN='\033[0;36m'
 export NC='\033[0m' # No Color
 
+# Baseline kernel target list
+BASELINE_TARGETS=(memtis nomad nomad-noinline nomad-alto nomad-alto-noinline tpp colloid-tpp colloid-tpp-alto pact hybridtier)
+
+# Target metadata resolver: returns "kdir|fallback_release|display_name"
+get_kernel_meta() {
+    local target="$1"
+    case "$target" in
+        memtis)              echo "${MEMTIS_DIR}/linux|5.15.19-Memtis|Memtis" ;;
+        nomad)               echo "${NOMAD_DIR}/linux|5.13.0-rc6-Nomad|Nomad" ;;
+        nomad-noinline)      echo "${NOMAD_NOINLINE_DIR}/linux|5.13.0-rc6-Nomad-Noinline|Nomad-Noinline" ;;
+        nomad-alto)          echo "${NOMAD_ALTO_DIR}/linux|5.13.0-rc6-Nomad-Alto|Nomad-Alto" ;;
+        nomad-alto-noinline) echo "${NOMAD_ALTO_NOINLINE_DIR}/linux|5.13.0-rc6-Nomad-Alto-Noinline|Nomad-Alto-Noinline" ;;
+        tpp)                 echo "${TPP_DIR}/linux|5.15.0-TPP|TPP" ;;
+        colloid|colloid-tpp) echo "${COLLOID_TPP_DIR}/linux|6.3.0-Colloid-TPP|Colloid-tpp" ;;
+        colloid-tpp-alto)    echo "${COLLOID_TPP_ALTO_DIR}/linux|6.3.0-Colloid-TPP-Alto|Colloid-tpp-alto" ;;
+        pact)                echo "${PACT_DIR}/linux|6.3.0-PACT|PACT" ;;
+        hybridtier)          echo "${HYBRIDTIER_DIR}/linux|6.2.0-hybridtier+|HybridTier" ;;
+        generic)             echo "/boot|generic|Generic" ;;
+        *)                   echo "" ;;
+    esac
+}
+export -f get_kernel_meta
+
+# ------------------------------------------------------------------------------
+# Helpers: Benchmark RSS and Fast-Tier Memmap Resolution
+# ------------------------------------------------------------------------------
+get_rss() {
+    case "$1" in
+        # --- GAPBS PageRank (PR) ---
+        gapbs_pr_kron)        echo 18 ;;  # Measured: 17.74 GB
+        gapbs_pr_urand)       echo 18 ;;  # Measured: 18.00 GB
+        gapbs_pr_twitter)     echo 12 ;;  # Measured: 12.32 GB
+        gapbs_pr_web)         echo 16 ;;  # Measured: 15.52 GB
+        gapbs_pr_road)        echo 1  ;;  # Measured:  0.97 GB
+
+        # --- GAPBS Triangle Counting (TC) ---
+        gapbs_tc_kron)        echo 38 ;;  # Measured: 37.50 GB
+        gapbs_tc_urand)       echo 18 ;;  # Measured: 18.00 GB
+        gapbs_tc_twitter)     echo 21 ;;  # Measured: 20.72 GB
+        gapbs_tc_web)         echo 29 ;;  # Measured: 29.29 GB
+        gapbs_tc_road)        echo 1  ;;  # Measured:  0.58 GB
+
+        # --- GAPBS Breadth-First Search (BFS) ---
+        gapbs_bfs_kron)       echo 18 ;;  # Measured: 17.74 GB
+        gapbs_bfs_urand)      echo 18 ;;  # Measured: 18.00 GB
+        gapbs_bfs_twitter)    echo 12 ;;  # Measured: 12.32 GB
+        gapbs_bfs_web)        echo 16 ;;  # Measured: 15.52 GB
+        gapbs_bfs_road)       echo 1  ;;  # Measured:  0.98 GB
+
+        # --- GAPBS Betweenness Centrality (BC) ---
+        gapbs_bc_kron)        echo 20 ;;  # Measured: 19.47 GB
+        gapbs_bc_urand)       echo 20 ;;  # Measured: 20.01 GB
+        gapbs_bc_twitter)     echo 13 ;;  # Measured: 13.08 GB
+        gapbs_bc_web)         echo 16 ;;  # Measured: 16.31 GB
+        gapbs_bc_road)        echo 1  ;;  # Measured:  1.24 GB
+
+        # --- GAPBS Connected Components (CC) ---
+        gapbs_cc_kron)        echo 18 ;;  # Measured: 17.74 GB
+        gapbs_cc_urand)       echo 18 ;;  # Measured: 18.00 GB
+        gapbs_cc_twitter)     echo 12 ;;  # Measured: 12.32 GB
+        gapbs_cc_web)         echo 16 ;;  # Measured: 15.52 GB
+        gapbs_cc_road)        echo 1  ;;  # Measured:  0.97 GB
+
+        # --- GAPBS Single-Source Shortest Paths (SSSP) ---
+        gapbs_sssp_kron)      echo 34 ;;  # Measured: 33.78 GB
+        gapbs_sssp_urand)     echo 36 ;;  # Measured: 35.82 GB
+        gapbs_sssp_twitter)   echo 23 ;;  # Measured: 23.45 GB
+        gapbs_sssp_web)       echo 30 ;;  # Measured: 30.14 GB
+        gapbs_sssp_road)      echo 1  ;;  # Measured:  1.40 GB
+
+        # --- Silo In-Memory OLTP Database ---
+        silo_tpcc)            echo 53 ;;  # Measured:  52.68 GB
+        silo_queue)           echo 57 ;;  # Measured:  57.11 GB
+        silo_bid)             echo 61 ;;  # Measured:  60.99 GB
+        silo_ycsb)            echo 14 ;;  # Measured:  14.10 GB
+        silo_encstress)       echo 12 ;;  # Measured:  12.29 GB
+
+        # --- Microbenchmarks & Other Workloads ---
+        redis)                echo 22 ;;  # Measured:  22.30 GB (4.3M keys @ 8KB payload)
+        xsbench)              echo 18 ;;  # Measured:  18.06 GB
+        stream|stream_hot|stream_phase*) echo 20 ;; # Baseline: 20 GB
+
+        # --- Fallback Default ---
+        *)                    echo 20 ;;  # Default: 20 GB
+    esac
+}
+
+calc_fast_gb() {
+    local rss="$1" ratio="${2:-1:1}"
+    local f="${ratio%%:*}" s="${ratio##*:}"
+    local os_headroom="${OS_HEADROOM:-6}"
+    local min_fast="${MIN_FAST:-1}"
+    awk -v rss="$rss" -v f="$f" -v s="$s" -v os="$os_headroom" -v min_f="$min_fast" 'BEGIN {
+        wl_fast = (rss * f) / (f + s);
+        fast = int(wl_fast + os + 0.5);
+        if (fast < min_f) fast = min_f;
+        if (fast > 120) fast = 120;
+        print fast;
+    }'
+}
+
+resolve_memmap() {
+    local bench="$1" ratio="${2:-1:1}"
+    local rss fast_gb
+    rss=$(get_rss "$bench")
+    fast_gb=$(calc_fast_gb "$rss" "$ratio")
+    echo "memmap=$((128 - fast_gb))G!${fast_gb}G"
+}
+export -f get_rss calc_fast_gb resolve_memmap
+
 # ------------------------------------------------------------------------------
 # Function: show_help
 # Description: Displays command line usage information, available actions,
 #              supported targets, optional flags, and usage examples.
 # ------------------------------------------------------------------------------
 show_help() {
-    echo "Usage: sudo $0 [memtis|nomad|nomad-noinline|nomad-alto|tpp|colloid-tpp|colloid-tpp-alto|all] [build|compile_only|update_grub|clean|purge] [--reboot|-r] [--help|-h]"
+    echo "Usage: sudo $0 [target] [build|compile_only|update_grub|clean|purge] [--benchmark|-b <name>] [--ratio|-R <ratio>] [--memmap <param>] [--reboot|-r]"
     echo "       sudo $0 clean_grub"
+    echo "       sudo $0 resolve_memmap <benchmark> <ratio>"
     echo ""
     echo "Actions:"
     echo "  build (default) Full build: auto-clone repo, compile, install kernel/modules, update GRUB & set default"
     echo "  compile_only    Compile kernel & modules ONLY (no installation to /boot or /lib/modules, no GRUB changes)"
     echo "  update_grub     Only set GRUB default boot entry (without compiling or installing)"
-    echo "  clean_grub      Clean all duplicate .old backup kernel images from /boot and update GRUB"
+    echo "  clean_grub      Clean all duplicate .old backup kernel images and links from /boot and update GRUB"
     echo "  clean / purge   Uninstall specified kernel target (or all) from /boot & /lib/modules, delete <dir>/linux source tree, and update GRUB"
     echo ""
     echo "Targets:"
@@ -63,143 +176,59 @@ show_help() {
     echo "  tpp               TPP kernel baseline (Linux 5.15.0-TPP)"
     echo "  colloid-tpp       Colloid-tpp kernel baseline (Linux 6.3.0-Colloid-TPP)"
     echo "  colloid-tpp-alto  Colloid-tpp kernel baseline with alto (Linux 6.3.0-Colloid-TPP-Alto)"
+    echo "  pact              PACT kernel baseline (Linux 6.3.0-PACT)"
+    echo "  hybridtier        HybridTier kernel baseline (Linux 6.2.0-hybridtier+)"
+    echo "  generic           Distro generic kernel"
     echo "  all               All baseline kernels"
     echo ""
     echo "Options:"
-    echo "  -r, --reboot    Automatically reboot system after completing task"
-    echo "  -h, --help      Show this help message"
+    echo "  -b, --benchmark <name>   Target benchmark (e.g. gapbs_bc_kron, xsbench, stream_hot) for RSS calculation"
+    echo "  -R, --ratio <ratio>      Tier ratio Fast:Slow relative to RSS (e.g. 1:1, 1:2, 1:4, 1:8, 4:1)"
+    echo "  --memmap <param>         Explicit Linux memmap parameter (e.g. memmap=118G!10G)"
+    echo "  -r, --reboot             Automatically reboot system after completing task"
+    echo "  -h, --help               Show this help message"
     echo ""
     echo "Examples:"
-    echo "  sudo $0 clean_grub          # Remove all duplicate .old kernel entries and clean GRUB"
-    echo "  sudo $0 colloid-tpp clean   # Uninstall Colloid-tpp kernel and update GRUB"
-    echo "  sudo $0 all clean           # Purge all custom baseline kernels and restore distro GRUB"
-    echo "  sudo $0 memtis              # Full build & install Memtis kernel & set GRUB default"
-    echo "  sudo $0 nomad compile_only  # Compile Nomad kernel ONLY (without installing or changing GRUB)"
-    echo "  sudo $0 tpp update_grub     # Only set GRUB default to TPP"
-    echo "  sudo $0 colloid-tpp         # Full build & install Colloid-tpp kernel & set GRUB default"
+    echo "  sudo $0 generic update_grub --benchmark gapbs_bc_kron --ratio 1:1 --reboot"
+    echo "  sudo $0 colloid-tpp update_grub -b xsbench -R 1:2 --reboot"
+    echo "  sudo $0 tpp update_grub --memmap memmap=112G!16G"
+    echo "  sudo $0 clean_grub"
 }
 
-# Allow help to be displayed without root
-for arg in "$@"; do
-    if [[ "$arg" == "--help" || "$arg" == "-h" || "$arg" == "help" ]]; then
-        show_help
-        exit 0
-    fi
-done
 
-if [ "$EUID" -ne 0 ]; then
-    echo -e "${YELLOW}Notice: Root privileges are required to install kernels and update GRUB.${NC}"
-    echo -e "${YELLOW}Re-running script with sudo...${NC}"
-    exec sudo bash "$0" "$@"
-fi
 
 # ------------------------------------------------------------------------------
-# Function: clone_memtis
-# Description: Checks if the Memtis kernel source directory exists.
-#              If missing, shallow-clones Linux v5.15.19 repository into place.
+# Git Shallow Clone Helper & Kernel Repositories
 # ------------------------------------------------------------------------------
-clone_memtis() {
-    local kdir="${MEMTIS_DIR}/linux"
+clone_git_repo() {
+    local kdir="$1"
+    local name="$2"
+    local branch="$3"
+    local url="$4"
+    local ref_dir="${5:-}"
+
     if [ ! -d "$kdir" ]; then
-        echo -e "${CYAN}Linux folder missing at ${kdir}. Auto-cloning Memtis kernel tree (Linux v5.15.19)...${NC}"
-        # Shallow clone specific branch to minimize download size
-        git clone --depth=1 --branch v5.15.19 \
-            https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git "$kdir"
+        echo -e "${CYAN}Linux folder missing at ${kdir}. Auto-cloning ${name} kernel tree (${branch})...${NC}"
+        if [ -n "$ref_dir" ] && [ -d "${ref_dir}/.git" ] && git -C "${ref_dir}" rev-parse --verify "${branch}" >/dev/null 2>&1; then
+            echo -e "${CYAN}Fast-cloning from local repository reference (${ref_dir})...${NC}"
+            git clone --depth=1 --branch "${branch}" "${ref_dir}" "$kdir"
+        else
+            git clone --depth=1 --branch "${branch}" "${url}" "$kdir"
+        fi
     fi
 }
 
-# ------------------------------------------------------------------------------
-# Function: clone_nomad
-# Description: Checks if the Nomad kernel source directory exists.
-#              If missing, shallow-clones Linux v5.13-rc6 repository into place.
-# ------------------------------------------------------------------------------
-clone_nomad() {
-    local kdir="${NOMAD_DIR}/linux"
-    if [ ! -d "$kdir" ]; then
-        echo -e "${CYAN}Linux folder missing at ${kdir}. Auto-cloning Nomad kernel tree (Linux v5.13-rc6)...${NC}"
-        # Shallow clone specific release candidate tag
-        git clone --depth=1 --branch v5.13-rc6 \
-            https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git "$kdir"
-    fi
-}
+clone_memtis() { clone_git_repo "${MEMTIS_DIR}/linux" "Memtis" "v5.15.19" "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git"; }
+clone_nomad() { clone_git_repo "${NOMAD_DIR}/linux" "Nomad" "v5.13-rc6" "https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git"; }
+clone_nomad_noinline() { clone_git_repo "${NOMAD_NOINLINE_DIR}/linux" "Nomad-Noinline" "v5.13-rc6" "https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git"; }
+clone_nomad_alto() { clone_git_repo "${NOMAD_ALTO_DIR}/linux" "Nomad-Alto" "v5.13-rc6" "https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git"; }
+clone_nomad_alto_noinline() { clone_git_repo "${NOMAD_ALTO_NOINLINE_DIR}/linux" "Nomad-Alto-Noinline" "v5.13-rc6" "https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git"; }
+clone_tpp() { clone_git_repo "${TPP_DIR}/linux" "TPP" "v5.15" "https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git"; }
+clone_colloid_tpp() { clone_git_repo "${COLLOID_TPP_DIR}/linux" "Colloid-tpp" "v6.3" "https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git"; }
+clone_colloid_tpp_alto() { clone_git_repo "${COLLOID_TPP_ALTO_DIR}/linux" "Colloid-tpp-alto" "v6.3" "https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git"; }
+clone_pact() { clone_git_repo "${PACT_DIR}/linux" "PACT" "v6.3" "https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git" "${COLLOID_TPP_DIR}/linux"; }
+clone_hybridtier() { clone_git_repo "${HYBRIDTIER_DIR}/linux" "HybridTier" "v6.2" "https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git" "${COLLOID_TPP_DIR}/linux"; }
 
-# ------------------------------------------------------------------------------
-# Function: clone_nomad_noinline
-# ------------------------------------------------------------------------------
-clone_nomad_noinline() {
-    local kdir="${NOMAD_NOINLINE_DIR}/linux"
-    if [ ! -d "$kdir" ]; then
-        echo -e "${CYAN}Linux folder missing at ${kdir}. Auto-cloning Nomad-Noinline kernel tree (Linux v5.13-rc6)...${NC}"
-        git clone --depth=1 --branch v5.13-rc6 \
-            https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git "$kdir"
-    fi
-}
-
-# ------------------------------------------------------------------------------
-# Function: clone_nomad_alto
-# ------------------------------------------------------------------------------
-clone_nomad_alto() {
-    local kdir="${NOMAD_ALTO_DIR}/linux"
-    if [ ! -d "$kdir" ]; then
-        echo -e "${CYAN}Linux folder missing at ${kdir}. Auto-cloning Nomad-Alto kernel tree (Linux v5.13-rc6)...${NC}"
-        git clone --depth=1 --branch v5.13-rc6 \
-            https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git "$kdir"
-    fi
-}
-
-# ------------------------------------------------------------------------------
-# Function: clone_nomad_alto_noinline
-# ------------------------------------------------------------------------------
-clone_nomad_alto_noinline() {
-    local kdir="${NOMAD_ALTO_NOINLINE_DIR}/linux"
-    if [ ! -d "$kdir" ]; then
-        echo -e "${CYAN}Linux folder missing at ${kdir}. Auto-cloning Nomad-Alto-Noinline kernel tree (Linux v5.13-rc6)...${NC}"
-        git clone --depth=1 --branch v5.13-rc6 \
-            https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git "$kdir"
-    fi
-}
-
-# ------------------------------------------------------------------------------
-# Function: clone_tpp
-# Description: Checks if the TPP kernel source directory exists.
-#              If missing, shallow-clones Linux v5.15 repository into place.
-# ------------------------------------------------------------------------------
-clone_tpp() {
-    local kdir="${TPP_DIR}/linux"
-    if [ ! -d "$kdir" ]; then
-        echo -e "${CYAN}Linux folder missing at ${kdir}. Auto-cloning TPP kernel tree (Linux v5.15)...${NC}"
-        git clone --depth=1 --branch v5.15 \
-            https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git "$kdir"
-    fi
-}
-
-# ------------------------------------------------------------------------------
-# Function: clone_colloid_tpp
-# Description: Checks if the Colloid-tpp kernel source directory exists.
-#              If missing, shallow-clones Linux v6.3 repository into place.
-# ------------------------------------------------------------------------------
-clone_colloid_tpp() {
-    local kdir="${COLLOID_TPP_DIR}/linux"
-    if [ ! -d "$kdir" ]; then
-        echo -e "${CYAN}Linux folder missing at ${kdir}. Auto-cloning Colloid-tpp kernel tree (Linux v6.3)...${NC}"
-        git clone --depth=1 --branch v6.3 \
-            https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git "$kdir"
-    fi
-}
-
-# ------------------------------------------------------------------------------
-# Function: clone_colloid_tpp_alto
-# Description: Checks if the Colloid-tpp-alto kernel source directory exists.
-#              If missing, shallow-clones Linux v6.3 repository into place.
-# ------------------------------------------------------------------------------
-clone_colloid_tpp_alto() {
-    local kdir="${COLLOID_TPP_ALTO_DIR}/linux"
-    if [ ! -d "$kdir" ]; then
-        echo -e "${CYAN}Linux folder missing at ${kdir}. Auto-cloning Colloid-tpp-alto kernel tree (Linux v6.3)...${NC}"
-        git clone --depth=1 --branch v6.3 \
-            https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git "$kdir"
-    fi
-}
 
 # ------------------------------------------------------------------------------
 # Function: resolve_kernel_release
@@ -249,6 +278,12 @@ resolve_kernel_release() {
                 ;;
             colloid-tpp-alto|colloid-alto)
                 installed=$(ls /boot/vmlinuz-* 2>/dev/null | grep -i "colloid" | grep -i "alto" | head -n 1 | sed 's|/boot/vmlinuz-||' || true)
+                ;;
+            pact)
+                installed=$(ls /boot/vmlinuz-* 2>/dev/null | grep -i "pact" | head -n 1 | sed 's|/boot/vmlinuz-||' || true)
+                ;;
+            hybridtier)
+                installed=$(ls /boot/vmlinuz-* 2>/dev/null | grep -i "hybridtier" | head -n 1 | sed 's|/boot/vmlinuz-||' || true)
                 ;;
             generic|distro|default)
                 installed=$(ls /boot/vmlinuz-*-generic 2>/dev/null | sort -V | tail -n 1 | sed 's|/boot/vmlinuz-||' || true)
@@ -306,42 +341,14 @@ generate_initramfs() {
 }
 
 # ------------------------------------------------------------------------------
-# Function: clean_current_kernel_state
-# Description: Cleans runtime kernel state, unloads custom kernel modules,
-#              terminates stale background profilers, resets memory caches,
-#              and clears backup/stale GRUB entries without deleting any installed
-#              kernel images (/boot/vmlinuz-*, /boot/initrd.img-*, /lib/modules/*).
+# Function: clean_boot_backups
+# Description: Removes backup (.old/.bak) kernel images and broken symlinks from /boot.
 # ------------------------------------------------------------------------------
-clean_current_kernel_state() {
-    echo -e "${CYAN}==> Cleaning current kernel runtime state and stale artifacts (preserving all kernel images)...${NC}"
-    
-    # 1. Unload any custom dynamically loaded kernel modules (e.g. Nomad async_promote)
-    if lsmod 2>/dev/null | grep -q "async_promote"; then
-        echo -e "${YELLOW}Unloading async_promote kernel module...${NC}"
-        rmmod async_promote 2>/dev/null || true
-    fi
-
-    # 2. Terminate any lingering background profilers or monitors
-    killall -9 perf bpftrace 2>/dev/null || true
-    perf probe -q -d 'probe:*' 2>/dev/null || true
-
-    # 3. Clean backup .old and .bak files from /boot (preserves all installed vmlinuz-* and initrd.img-*)
-    rm -f /boot/vmlinuz-*.old /boot/initrd.img-*.old /boot/System.map-*.old /boot/config-*.old /boot/*.bak 2>/dev/null || true
-
-    # 4. Flush dirty caches, dentries/inodes, and compact memory
-    sync
-    echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
-    echo 1 > /proc/sys/vm/compact_memory 2>/dev/null || true
-    swapoff -a 2>/dev/null && swapon -a 2>/dev/null || true
-
-    # 5. Reset NUMA balancing sysctls to clean defaults
-    sysctl -w kernel.numa_balancing=1 2>/dev/null || true
-    sysctl -w kernel.perf_event_max_sample_rate=100000 2>/dev/null || true
-    echo true > /sys/kernel/mm/numa/demotion_enabled 2>/dev/null || true
-
-    echo -e "${GREEN}==> Kernel runtime state cleaned successfully.${NC}"
+clean_boot_backups() {
+    rm -f /boot/vmlinuz*.old /boot/initrd.img*.old /boot/System.map*.old /boot/config*.old /boot/*.old /boot/*.bak 2>/dev/null || true
+    find /boot -maxdepth 1 -xtype l -delete 2>/dev/null || true
 }
-export -f clean_current_kernel_state
+export -f clean_boot_backups
 
 # ------------------------------------------------------------------------------
 # Function: set_grub_default
@@ -356,9 +363,6 @@ set_grub_default() {
     local krelease="$1"
     local name="$2"
 
-    # Clean current kernel runtime state and stale artifacts before switching
-    # clean_current_kernel_state
-
     echo -e "\n${CYAN}==> Updating GRUB configuration for ${name} (${krelease})...${NC}"
 
     # Backup original /etc/default/grub file if a backup does not already exist
@@ -366,50 +370,67 @@ set_grub_default() {
         cp /etc/default/grub /etc/default/grub.bak
     fi
 
-    # Temporary: Ensure mem limit (default: 20G, overridable via MEM_LIMIT) and numa=fake=2 parameters
-    # Note: Remove this setting when running on a physical 2-socket machine.
+    # Dynamic or custom memmap resolution for Node 0 fast tier
+    local memmap_param="${CUSTOM_MEMMAP:-memmap=112G!16G}"
+    if [ -n "${BENCHMARK:-}" ] && [ -n "${RATIO:-}" ]; then
+        memmap_param="$(resolve_memmap "$BENCHMARK" "$RATIO")"
+    fi
+    echo -e "${CYAN}Applying Node 0 fast-tier limit: ${memmap_param}${NC}"
+
     if grep -q "^GRUB_CMDLINE_LINUX_DEFAULT=" /etc/default/grub; then
-        # Strip any existing mem=... and numa=fake=... parameters to prevent duplicates/overlaps
-        sed -i -E 's/\bmem=[0-9]+[kKmMgGtT]?[bB]?\b//g' /etc/default/grub
-        sed -i -E 's/\bnuma=fake=[^ "]*//g' /etc/default/grub
-        sed -i -E 's/([[:space:]]+)/ /g' /etc/default/grub
-        sed -i -E 's/GRUB_CMDLINE_LINUX_DEFAULT="[[:space:]]*/GRUB_CMDLINE_LINUX_DEFAULT="/' /etc/default/grub
-        sed -i -E 's/[[:space:]]*"$/"/' /etc/default/grub
-        # Append target mem and numa=fake parameters cleanly
-        sed -i "s|^GRUB_CMDLINE_LINUX_DEFAULT=\"\(.*\)\"|GRUB_CMDLINE_LINUX_DEFAULT=\"\1 numa=fake=2\"|" /etc/default/grub
-        sed -i -E 's/GRUB_CMDLINE_LINUX_DEFAULT="[[:space:]]+/GRUB_CMDLINE_LINUX_DEFAULT="/' /etc/default/grub
+        # Atomic clean pass: strip mem=, numa=fake=, and memmap= parameters, normalize spacing, and append target memmap
+        sed -i -E \
+            -e '/^GRUB_CMDLINE_LINUX_DEFAULT=/ s/\bmem=[0-9]+[kKmMgGtT]?[bB]?\b//g' \
+            -e '/^GRUB_CMDLINE_LINUX_DEFAULT=/ s/\bnuma=fake=[^ "]*//g' \
+            -e '/^GRUB_CMDLINE_LINUX_DEFAULT=/ s/\bmemmap=[^ "]*//g' \
+            -e '/^GRUB_CMDLINE_LINUX_DEFAULT=/ s/[[:space:]]+/ /g' \
+            -e '/^GRUB_CMDLINE_LINUX_DEFAULT=/ s/"[[:space:]]*/"/' \
+            -e '/^GRUB_CMDLINE_LINUX_DEFAULT=/ s/[[:space:]]*"[[:space:]]*$/"/' \
+            -e "/^GRUB_CMDLINE_LINUX_DEFAULT=/ s/\"$/ ${memmap_param}\"/" \
+            -e '/^GRUB_CMDLINE_LINUX_DEFAULT=/ s/"[[:space:]]+/"/' \
+            /etc/default/grub
     else
-        echo "GRUB_CMDLINE_LINUX_DEFAULT=\"quiet splash numa=fake=2\"" >> /etc/default/grub
+        echo "GRUB_CMDLINE_LINUX_DEFAULT=\"quiet splash ${memmap_param}\"" >> /etc/default/grub
     fi
 
-    # Remove stale backup (.old) kernels so GRUB menu does not have duplicate entries
-    rm -f /boot/vmlinuz-*.old /boot/initrd.img-*.old /boot/System.map-*.old /boot/config-*.old /boot/*.bak 2>/dev/null || true
+    # Remove stale backup (.old) kernels and links so GRUB menu does not have duplicate entries
+    clean_boot_backups
 
-    # Remove all other custom kernels from /boot and /lib/modules excluding generic and the target kernel
-    for vmlinuz in /boot/vmlinuz-*; do
-        [ ! -f "$vmlinuz" ] && continue
-        local kver
-        kver=$(basename "$vmlinuz" | sed 's/^vmlinuz-//')
+    # Remove all other custom kernels from /boot and /lib/modules excluding generic and the target kernel (skip during update_grub)
+    if [ "$ACTION" != "update_grub" ]; then
+        for vmlinuz in /boot/vmlinuz-*; do
+            [ ! -f "$vmlinuz" ] && continue
+            local kver
+            kver=$(basename "$vmlinuz" | sed 's/^vmlinuz-//')
 
-        # 1. Always preserve official Ubuntu generic kernels
-        if [[ "$kver" =~ generic ]]; then
-            continue
-        fi
-
-        # 2. Preserve the target kernel being switched to
-        if [ -n "$krelease" ] && [ "$krelease" != "generic" ]; then
-            if [[ "$kver" == "$krelease" || "$kver" =~ $krelease || "$krelease" =~ $kver ]]; then
+            # 1. Always preserve official Ubuntu generic kernels
+            if [[ "$kver" == *generic* ]]; then
                 continue
             fi
-        fi
 
-        # 3. Remove inactive custom kernel from /boot & /lib/modules
-        echo -e "${YELLOW}Removing inactive custom kernel '${kver}' from /boot & /lib/modules...${NC}"
-        rm -f "/boot/vmlinuz-${kver}"* "/boot/initrd.img-${kver}"* "/boot/System.map-${kver}"* "/boot/config-${kver}"* 2>/dev/null || true
-        rm -rf "/lib/modules/${kver}" 2>/dev/null || true
-    done
+            # 2. Preserve the target kernel being switched to
+            if [ -n "$krelease" ] && [ "$krelease" != "generic" ]; then
+                if [[ "$kver" == "$krelease" || "$kver" == *"$krelease"* || "$krelease" == *"$kver"* ]]; then
+                    continue
+                fi
+            fi
 
-    # First run update-grub to ensure /boot/grub/grub.cfg contains all installed kernels
+            # 3. Remove inactive custom kernel from /boot & /lib/modules
+            echo -e "${YELLOW}Removing inactive custom kernel '${kver}' from /boot & /lib/modules...${NC}"
+            rm -f "/boot/vmlinuz-${kver}"* "/boot/initrd.img-${kver}"* "/boot/System.map-${kver}"* "/boot/config-${kver}"* 2>/dev/null || true
+            rm -rf "/lib/modules/${kver}" 2>/dev/null || true
+        done
+    fi
+
+    # Clean any dangling links or backups left behind
+    clean_boot_backups
+    if [[ "$krelease" == "generic" || "$name" == "Generic" ]]; then
+        [ -L /boot/vmlinuz ] && rm -f /boot/vmlinuz
+        [ -L /boot/initrd.img ] && rm -f /boot/initrd.img
+    fi
+
+    # 1. First run update-grub to ensure /boot/grub/grub.cfg contains all installed kernels
+    echo -e "${CYAN}Updating GRUB to discover installed kernels...${NC}"
     update-grub
 
     # Inspect /boot/grub/grub.cfg to find the exact submenu and menuentry titles
@@ -418,331 +439,185 @@ set_grub_default() {
     local menu_title=""
     local grub_entry=""
 
-    if [ -f "$grub_cfg" ]; then
-        submenu_title=$(grep -E "submenu ['\"]" "$grub_cfg" | head -n 1 | sed -E "s/.*submenu ['\"]([^'\"]+)['\"].*/\1/" || true)
-        menu_title=$(grep -E "menuentry ['\"]" "$grub_cfg" | grep -v -i "recovery" | grep -E "Linux ${krelease}('|\"| |\$)" | head -n 1 | sed -E "s/.*menuentry ['\"]([^'\"]+)['\"].*/\1/" || true)
-        if [ -z "$menu_title" ]; then
-            menu_title=$(grep -E "menuentry ['\"]" "$grub_cfg" | grep -v -i "recovery" | grep -F "${krelease}" | head -n 1 | sed -E "s/.*menuentry ['\"]([^'\"]+)['\"].*/\1/" || true)
-        fi
-    fi
-
-    if [ -n "$submenu_title" ] && [ -n "$menu_title" ]; then
-        grub_entry="${submenu_title}>${menu_title}"
-    elif [ -n "$menu_title" ]; then
-        grub_entry="${menu_title}"
-    elif [ -n "$submenu_title" ]; then
-        grub_entry="${submenu_title}>Ubuntu, with Linux ${krelease}"
+    if [[ "$krelease" == "generic" || "$name" == "Generic" ]]; then
+        grub_entry="0"
     else
-        grub_entry="Advanced options for Ubuntu>Ubuntu, with Linux ${krelease}"
+        if [ -f "$grub_cfg" ]; then
+            submenu_title=$(grep -E "^[[:space:]]*submenu ['\"]" "$grub_cfg" | head -n 1 | sed -E "s/^[[:space:]]*submenu ['\"]([^'\"]+)['\"].*/\1/" || true)
+            # Find the exact menuentry matching krelease without regex operator issues (e.g. trailing +)
+            menu_title=$(grep -E "^[[:space:]]*menuentry ['\"]" "$grub_cfg" | grep -v -i "recovery" | grep -F "${krelease}" | head -n 1 | sed -E "s/^[[:space:]]*menuentry ['\"]([^'\"]+)['\"].*/\1/" || true)
+            if [ -z "$menu_title" ]; then
+                local base_krelease="${krelease%+}"
+                menu_title=$(grep -E "^[[:space:]]*menuentry ['\"]" "$grub_cfg" | grep -v -i "recovery" | grep -F "${base_krelease}" | head -n 1 | sed -E "s/^[[:space:]]*menuentry ['\"]([^'\"]+)['\"].*/\1/" || true)
+            fi
+        fi
+
+        if [ -n "$submenu_title" ] && [ -n "$menu_title" ]; then
+            grub_entry="${submenu_title}>${menu_title}"
+        elif [ -n "$menu_title" ]; then
+            grub_entry="${menu_title}"
+        elif [ -n "$submenu_title" ]; then
+            grub_entry="${submenu_title}>Ubuntu, with Linux ${krelease}"
+        else
+            grub_entry="Advanced options for Ubuntu>Ubuntu, with Linux ${krelease}"
+        fi
     fi
 
     echo -e "${CYAN}Setting GRUB default entry: '${grub_entry}'${NC}"
     sed -i "s|^GRUB_DEFAULT=.*|GRUB_DEFAULT=\"${grub_entry}\"|" /etc/default/grub
 
+    # 2. RUN update-grub AFTER modifying /etc/default/grub so the new default is compiled into /boot/grub/grub.cfg
+    echo -e "${CYAN}Applying default entry into /boot/grub/grub.cfg...${NC}"
+    update-grub
+
     # Execute grub-set-default to update grubenv
     grub-set-default "${grub_entry}" 2>/dev/null || grub-set-default "${krelease}" 2>/dev/null || true
 
-    echo -e "${GREEN}==> Successfully set default boot kernel to ${name} (${krelease}).${NC}"
+    echo -e "${GREEN}==> Successfully set default boot kernel to ${name} (${krelease}) [GRUB_DEFAULT='${grub_entry}'].${NC}"
 }
 
 # ------------------------------------------------------------------------------
-# Function: set_memtis_default
-# Description: Determines the exact kernel release string for Memtis from its
-#              source directory or /boot, installs modules/kernel if required,
-#              generates initramfs, and triggers GRUB setup.
+# Kernel Installation & GRUB Default Helpers
 # ------------------------------------------------------------------------------
-set_memtis_default() {
-    local kdir="${MEMTIS_DIR}/linux"
+install_and_set_default() {
+    local target="$1"
+    local extra_hook="${2:-}"
+    local meta IFS='|'
+    meta=$(get_kernel_meta "$target")
+    read -r kdir fallback name <<< "$meta"
+
     local krelease
-    krelease=$(resolve_kernel_release "memtis" "$kdir" "5.15.19-Memtis")
+    krelease=$(resolve_kernel_release "$target" "$kdir" "$fallback")
 
     if [ -d "$kdir" ] && [ -f "$kdir/.config" ]; then
-        echo -e "${CYAN}Installing Memtis modules and kernel...${NC}"
+        echo -e "${CYAN}Installing ${name} modules and kernel...${NC}"
         make -C "$kdir" modules_install
         make -C "$kdir" install
-        krelease=$(resolve_kernel_release "memtis" "$kdir" "$krelease")
+        krelease=$(resolve_kernel_release "$target" "$kdir" "$krelease")
         generate_initramfs "${krelease}"
+
+        if [ -n "$extra_hook" ]; then
+            "$extra_hook" "$kdir"
+        fi
     fi
-    set_grub_default "$krelease" "Memtis"
+    set_grub_default "$krelease" "$name"
 }
 
-# ------------------------------------------------------------------------------
-# Function: set_nomad_default
-# Description: Determines the exact kernel release string for Nomad from its
-#              source directory or /boot, installs modules/kernel if required,
-#              generates initramfs, and triggers GRUB setup.
-# ------------------------------------------------------------------------------
-set_nomad_default() {
-    local kdir="${NOMAD_DIR}/linux"
-    local krelease
-    krelease=$(resolve_kernel_release "nomad" "$kdir" "5.13.0-rc6-Nomad")
-
-    if [ -d "$kdir" ] && [ -f "$kdir/.config" ]; then
-        echo -e "${CYAN}Installing Nomad modules and kernel...${NC}"
-        make -C "$kdir" modules_install
-        make -C "$kdir" install
-        krelease=$(resolve_kernel_release "nomad" "$kdir" "$krelease")
-        generate_initramfs "${krelease}"
+_pact_post_install() {
+    local kdir="$1"
+    if [ -d "${PACT_DIR}/tierinit" ]; then
+        echo -e "${CYAN}Building PACT tierinit.ko...${NC}"
+        make -C "$kdir" M="${PACT_DIR}/tierinit" modules || true
     fi
-    set_grub_default "$krelease" "Nomad"
+    if [ -d "${PACT_DIR}/kswapdrst" ]; then
+        echo -e "${CYAN}Building PACT kswapdrst.ko...${NC}"
+        make -C "$kdir" M="${PACT_DIR}/kswapdrst" modules || true
+    fi
+    if [ -d "${PACT_DIR}/src" ]; then
+        echo -e "${CYAN}Building PACT user-space runtime daemon...${NC}"
+        make -C "${PACT_DIR}/src" || true
+    fi
 }
 
-# ------------------------------------------------------------------------------
-# Function: set_nomad_noinline_default
-# ------------------------------------------------------------------------------
-set_nomad_noinline_default() {
-    local kdir="${NOMAD_NOINLINE_DIR}/linux"
-    local krelease
-    krelease=$(resolve_kernel_release "nomad-noinline" "$kdir" "5.13.0-rc6-Nomad-Noinline")
-
-    if [ -d "$kdir" ] && [ -f "$kdir/.config" ]; then
-        echo -e "${CYAN}Installing Nomad-Noinline modules and kernel...${NC}"
-        make -C "$kdir" modules_install
-        make -C "$kdir" install
-        krelease=$(resolve_kernel_release "nomad-noinline" "$kdir" "$krelease")
-        generate_initramfs "${krelease}"
+_hybridtier_post_install() {
+    local kdir="$1"
+    if [ -d "${HYBRIDTIER_DIR}/hook" ]; then
+        echo -e "${CYAN}Building HybridTier hook runtime libraries...${NC}"
+        make -C "${HYBRIDTIER_DIR}/hook" || true
     fi
-    set_grub_default "$krelease" "Nomad-Noinline"
 }
 
-# ------------------------------------------------------------------------------
-# Function: set_nomad_alto_default
-# ------------------------------------------------------------------------------
-set_nomad_alto_default() {
-    local kdir="${NOMAD_ALTO_DIR}/linux"
-    local krelease
-    krelease=$(resolve_kernel_release "nomad-alto" "$kdir" "5.13.0-rc6-Nomad-Alto")
+set_memtis_default() { install_and_set_default "memtis"; }
+set_nomad_default() { install_and_set_default "nomad"; }
+set_nomad_noinline_default() { install_and_set_default "nomad-noinline"; }
+set_nomad_alto_default() { install_and_set_default "nomad-alto"; }
+set_nomad_alto_noinline_default() { install_and_set_default "nomad-alto-noinline"; }
+set_tpp_default() { install_and_set_default "tpp"; }
+set_colloid_tpp_default() { install_and_set_default "colloid-tpp"; }
+set_colloid_tpp_alto_default() { install_and_set_default "colloid-tpp-alto"; }
+set_pact_default() { install_and_set_default "pact" _pact_post_install; }
+set_hybridtier_default() { install_and_set_default "hybridtier" _hybridtier_post_install; }
 
-    if [ -d "$kdir" ] && [ -f "$kdir/.config" ]; then
-        echo -e "${CYAN}Installing Nomad-Alto modules and kernel...${NC}"
-        make -C "$kdir" modules_install
-        make -C "$kdir" install
-        krelease=$(resolve_kernel_release "nomad-alto" "$kdir" "$krelease")
-        generate_initramfs "${krelease}"
-    fi
-    set_grub_default "$krelease" "Nomad-Alto"
-}
-
-# ------------------------------------------------------------------------------
-# Function: set_nomad_alto_noinline_default
-# ------------------------------------------------------------------------------
-set_nomad_alto_noinline_default() {
-    local kdir="${NOMAD_ALTO_NOINLINE_DIR}/linux"
-    local krelease
-    krelease=$(resolve_kernel_release "nomad-alto-noinline" "$kdir" "5.13.0-rc6-Nomad-Alto-Noinline")
-
-    if [ -d "$kdir" ] && [ -f "$kdir/.config" ]; then
-        echo -e "${CYAN}Installing Nomad-Alto-Noinline modules and kernel...${NC}"
-        make -C "$kdir" modules_install
-        make -C "$kdir" install
-        krelease=$(resolve_kernel_release "nomad-alto-noinline" "$kdir" "$krelease")
-        generate_initramfs "${krelease}"
-    fi
-    set_grub_default "$krelease" "Nomad-Alto-Noinline"
-}
-
-# ------------------------------------------------------------------------------
-# Function: set_tpp_default
-# Description: Determines the exact kernel release string for TPP from its
-#              source directory or /boot, installs modules/kernel if required,
-#              generates initramfs, and triggers GRUB setup.
-# ------------------------------------------------------------------------------
-set_tpp_default() {
-    local kdir="${TPP_DIR}/linux"
-    local krelease
-    krelease=$(resolve_kernel_release "tpp" "$kdir" "5.15.0-TPP")
-
-    if [ -d "$kdir" ] && [ -f "$kdir/.config" ]; then
-        echo -e "${CYAN}Installing TPP modules and kernel...${NC}"
-        make -C "$kdir" modules_install
-        make -C "$kdir" install
-        krelease=$(resolve_kernel_release "tpp" "$kdir" "$krelease")
-        generate_initramfs "${krelease}"
-    fi
-    set_grub_default "$krelease" "TPP"
-}
-
-# ------------------------------------------------------------------------------
-# Function: set_colloid_tpp_default
-# Description: Determines the exact kernel release string for Colloid-tpp from its
-#              source directory or /boot, installs modules/kernel if required,
-#              generates initramfs, and triggers GRUB setup.
-# ------------------------------------------------------------------------------
-set_colloid_tpp_default() {
-    local kdir="${COLLOID_TPP_DIR}/linux"
-    local krelease
-    krelease=$(resolve_kernel_release "colloid" "$kdir" "6.3.0-Colloid-TPP")
-
-    if [ -d "$kdir" ] && [ -f "$kdir/.config" ]; then
-        echo -e "${CYAN}Installing Colloid-tpp modules and kernel...${NC}"
-        make -C "$kdir" modules_install
-        make -C "$kdir" install
-        krelease=$(resolve_kernel_release "colloid" "$kdir" "$krelease")
-        generate_initramfs "${krelease}"
-    fi
-    set_grub_default "$krelease" "Colloid-tpp"
-}
-
-# ------------------------------------------------------------------------------
-# Function: set_colloid_tpp_alto_default
-# Description: Determines the exact kernel release string for Colloid-tpp-alto from its
-#              source directory or /boot, installs modules/kernel if required,
-#              generates initramfs, and triggers GRUB setup.
-# ------------------------------------------------------------------------------
-set_colloid_tpp_alto_default() {
-    local kdir="${COLLOID_TPP_ALTO_DIR}/linux"
-    local krelease
-    krelease=$(resolve_kernel_release "colloid-tpp-alto" "$kdir" "6.3.0-Colloid-TPP-Alto")
-
-    if [ -d "$kdir" ] && [ -f "$kdir/.config" ]; then
-        echo -e "${CYAN}Installing Colloid-tpp-alto modules and kernel...${NC}"
-        make -C "$kdir" modules_install
-        make -C "$kdir" install
-        krelease=$(resolve_kernel_release "colloid-tpp-alto" "$kdir" "$krelease")
-        generate_initramfs "${krelease}"
-    fi
-    set_grub_default "$krelease" "Colloid-tpp-alto"
-}
-
-# ------------------------------------------------------------------------------
-# Function: set_generic_default
-# Description: Finds the latest official distro generic kernel in /boot
-#              (e.g., 7.0.0-30-generic) and sets it as the GRUB default.
-# ------------------------------------------------------------------------------
 set_generic_default() {
     local krelease
     krelease=$(ls /boot/vmlinuz-*-generic 2>/dev/null | sort -V | tail -n 1 | sed 's|/boot/vmlinuz-||')
-    if [ -z "$krelease" ]; then
-        krelease="generic"
-    fi
+    [ -z "$krelease" ] && krelease="generic"
     set_grub_default "$krelease" "Generic"
 }
 
+
 # ------------------------------------------------------------------------------
-# Function: build_memtis
 # Compile Pipeline Functions
 # ------------------------------------------------------------------------------
-compile_memtis() {
+compile_baseline_kernel() {
+    local name="$1"
+    local dir="$2"
+    local script_name="${3:-compile.sh}"
+    local clone_fn="$4"
+
     echo -e "\n${BLUE}====================================================${NC}"
-    echo -e "${BLUE} Compiling Memtis Kernel ${NC}"
+    echo -e "${BLUE} Compiling ${name} Kernel ${NC}"
     echo -e "${BLUE}====================================================${NC}"
-    [ ! -f "${MEMTIS_DIR}/setup_memtis.sh" ] && { echo -e "${RED}Error: ${MEMTIS_DIR}/setup_memtis.sh not found.${NC}"; exit 1; }
-    clone_memtis
-    echo -e "${CYAN}Running setup_memtis.sh...${NC}"
-    (cd "${MEMTIS_DIR}" && bash setup_memtis.sh)
+    if [ ! -f "${dir}/${script_name}" ]; then
+        echo -e "${RED}Error: ${dir}/${script_name} not found.${NC}"
+        exit 1
+    fi
+    "$clone_fn"
+    echo -e "${CYAN}Running ${script_name}...${NC}"
+    (cd "${dir}" && bash "${script_name}")
 }
 
-compile_nomad() {
-    echo -e "\n${BLUE}====================================================${NC}"
-    echo -e "${BLUE} Compiling Nomad Kernel ${NC}"
-    echo -e "${BLUE}====================================================${NC}"
-    [ ! -f "${NOMAD_DIR}/compile.sh" ] && { echo -e "${RED}Error: ${NOMAD_DIR}/compile.sh not found.${NC}"; exit 1; }
-    clone_nomad
-    echo -e "${CYAN}Running compile.sh...${NC}"
-    (cd "${NOMAD_DIR}" && bash compile.sh)
-}
-
-compile_nomad_noinline() {
-    echo -e "\n${BLUE}====================================================${NC}"
-    echo -e "${BLUE} Compiling Nomad-Noinline Kernel ${NC}"
-    echo -e "${BLUE}====================================================${NC}"
-    [ ! -f "${NOMAD_NOINLINE_DIR}/compile.sh" ] && { echo -e "${RED}Error: ${NOMAD_NOINLINE_DIR}/compile.sh not found.${NC}"; exit 1; }
-    clone_nomad_noinline
-    echo -e "${CYAN}Running compile.sh...${NC}"
-    (cd "${NOMAD_NOINLINE_DIR}" && bash compile.sh)
-}
-
-compile_nomad_alto() {
-    echo -e "\n${BLUE}====================================================${NC}"
-    echo -e "${BLUE} Compiling Nomad-Alto Kernel ${NC}"
-    echo -e "${BLUE}====================================================${NC}"
-    [ ! -f "${NOMAD_ALTO_DIR}/compile.sh" ] && { echo -e "${RED}Error: ${NOMAD_ALTO_DIR}/compile.sh not found.${NC}"; exit 1; }
-    clone_nomad_alto
-    echo -e "${CYAN}Running compile.sh...${NC}"
-    (cd "${NOMAD_ALTO_DIR}" && bash compile.sh)
-}
-
-compile_nomad_alto_noinline() {
-    echo -e "\n${BLUE}====================================================${NC}"
-    echo -e "${BLUE} Compiling Nomad-Alto-Noinline Kernel ${NC}"
-    echo -e "${BLUE}====================================================${NC}"
-    [ ! -f "${NOMAD_ALTO_NOINLINE_DIR}/compile.sh" ] && { echo -e "${RED}Error: ${NOMAD_ALTO_NOINLINE_DIR}/compile.sh not found.${NC}"; exit 1; }
-    clone_nomad_alto_noinline
-    echo -e "${CYAN}Running compile.sh...${NC}"
-    (cd "${NOMAD_ALTO_NOINLINE_DIR}" && bash compile.sh)
-}
-
-compile_tpp() {
-    echo -e "\n${BLUE}====================================================${NC}"
-    echo -e "${BLUE} Compiling TPP Kernel ${NC}"
-    echo -e "${BLUE}====================================================${NC}"
-    [ ! -f "${TPP_DIR}/compile.sh" ] && { echo -e "${RED}Error: ${TPP_DIR}/compile.sh not found.${NC}"; exit 1; }
-    clone_tpp
-    echo -e "${CYAN}Running compile.sh...${NC}"
-    (cd "${TPP_DIR}" && bash compile.sh)
-}
-
-compile_colloid_tpp() {
-    echo -e "\n${BLUE}====================================================${NC}"
-    echo -e "${BLUE} Compiling Colloid-tpp Kernel ${NC}"
-    echo -e "${BLUE}====================================================${NC}"
-    [ ! -f "${COLLOID_TPP_DIR}/compile.sh" ] && { echo -e "${RED}Error: ${COLLOID_TPP_DIR}/compile.sh not found.${NC}"; exit 1; }
-    clone_colloid_tpp
-    echo -e "${CYAN}Running compile.sh...${NC}"
-    (cd "${COLLOID_TPP_DIR}" && bash compile.sh)
-}
-
-compile_colloid_tpp_alto() {
-    echo -e "\n${BLUE}====================================================${NC}"
-    echo -e "${BLUE} Compiling Colloid-tpp-alto Kernel ${NC}"
-    echo -e "${BLUE}====================================================${NC}"
-    [ ! -f "${COLLOID_TPP_ALTO_DIR}/compile.sh" ] && { echo -e "${RED}Error: ${COLLOID_TPP_ALTO_DIR}/compile.sh not found.${NC}"; exit 1; }
-    clone_colloid_tpp_alto
-    echo -e "${CYAN}Running compile.sh...${NC}"
-    (cd "${COLLOID_TPP_ALTO_DIR}" && bash compile.sh)
-}
+compile_memtis() { compile_baseline_kernel "Memtis" "${MEMTIS_DIR}" "setup_memtis.sh" clone_memtis; }
+compile_nomad() { compile_baseline_kernel "Nomad" "${NOMAD_DIR}" "compile.sh" clone_nomad; }
+compile_nomad_noinline() { compile_baseline_kernel "Nomad-Noinline" "${NOMAD_NOINLINE_DIR}" "compile.sh" clone_nomad_noinline; }
+compile_nomad_alto() { compile_baseline_kernel "Nomad-Alto" "${NOMAD_ALTO_DIR}" "compile.sh" clone_nomad_alto; }
+compile_nomad_alto_noinline() { compile_baseline_kernel "Nomad-Alto-Noinline" "${NOMAD_ALTO_NOINLINE_DIR}" "compile.sh" clone_nomad_alto_noinline; }
+compile_tpp() { compile_baseline_kernel "TPP" "${TPP_DIR}" "compile.sh" clone_tpp; }
+compile_colloid_tpp() { compile_baseline_kernel "Colloid-tpp" "${COLLOID_TPP_DIR}" "compile.sh" clone_colloid_tpp; }
+compile_colloid_tpp_alto() { compile_baseline_kernel "Colloid-tpp-alto" "${COLLOID_TPP_ALTO_DIR}" "compile.sh" clone_colloid_tpp_alto; }
+compile_pact() { compile_baseline_kernel "PACT" "${PACT_DIR}" "compile.sh" clone_pact; }
+compile_hybridtier() { compile_baseline_kernel "HybridTier" "${HYBRIDTIER_DIR}" "compile.sh" clone_hybridtier; }
 
 # ------------------------------------------------------------------------------
 # Full Build Pipeline Functions (Compile + Install + GRUB Default)
 # ------------------------------------------------------------------------------
-build_memtis() {
-    compile_memtis
-    set_memtis_default
-}
+build_memtis() { compile_memtis && set_memtis_default; }
+build_nomad() { compile_nomad && set_nomad_default; }
+build_nomad_noinline() { compile_nomad_noinline && set_nomad_noinline_default; }
+build_nomad_alto() { compile_nomad_alto && set_nomad_alto_default; }
+build_nomad_alto_noinline() { compile_nomad_alto_noinline && set_nomad_alto_noinline_default; }
+build_tpp() { compile_tpp && set_tpp_default; }
+build_colloid_tpp() { compile_colloid_tpp && set_colloid_tpp_default; }
+build_colloid_tpp_alto() { compile_colloid_tpp_alto && set_colloid_tpp_alto_default; }
+build_pact() { compile_pact && set_pact_default; }
+build_hybridtier() { compile_hybridtier && set_hybridtier_default; }
 
-build_nomad() {
-    compile_nomad
-    set_nomad_default
-}
+# ------------------------------------------------------------------------------
+# Function: update_target_grub
+# Description: Directly sets GRUB default if the kernel image already exists
+#              in /boot, otherwise triggers full module/kernel installation.
+# ------------------------------------------------------------------------------
+update_target_grub() {
+    local target="$1"
+    if [ "$target" == "generic" ]; then
+        set_generic_default
+        return
+    fi
+    local meta IFS='|'
+    meta=$(get_kernel_meta "$target")
+    read -r kdir fallback name <<< "$meta"
 
-build_nomad_noinline() {
-    compile_nomad_noinline
-    set_nomad_noinline_default
-}
+    local krelease
+    krelease=$(resolve_kernel_release "$target" "$kdir" "$fallback")
 
-build_nomad_alto() {
-    compile_nomad_alto
-    set_nomad_alto_default
-}
-
-build_nomad_alto_noinline() {
-    compile_nomad_alto_noinline
-    set_nomad_alto_noinline_default
-}
-
-build_tpp() {
-    compile_tpp
-    set_tpp_default
-}
-
-build_colloid_tpp() {
-    compile_colloid_tpp
-    set_colloid_tpp_default
-}
-
-build_colloid_tpp_alto() {
-    compile_colloid_tpp_alto
-    set_colloid_tpp_alto_default
+    # If the kernel image is already installed in /boot, update GRUB only (skip make install)
+    if [ -f "/boot/vmlinuz-${krelease}" ]; then
+        echo -e "${GREEN}Kernel '${krelease}' already installed in /boot. Skipping make install & updating GRUB only...${NC}"
+        set_grub_default "$krelease" "$name"
+    else
+        echo -e "${YELLOW}Kernel '${krelease}' not found in /boot. Installing modules and kernel...${NC}"
+        "set_${target//-/_}_default"
+    fi
 }
 
 # ------------------------------------------------------------------------------
@@ -751,16 +626,8 @@ build_colloid_tpp_alto() {
 #              or all custom baseline kernels from /boot and /lib/modules,
 #              then updates GRUB.
 # ------------------------------------------------------------------------------
-clean_kernel() {
+_uninstall_target_files() {
     local target="$1"
-    echo -e "\n${BLUE}====================================================${NC}"
-    echo -e "${BLUE} Cleaning GRUB & Kernel: '${target}' ${NC}"
-    echo -e "${BLUE}====================================================${NC}"
-
-    # Always remove .old backup files from /boot
-    echo -e "${CYAN}Removing backup .old kernel and initrd images from /boot...${NC}"
-    rm -f /boot/vmlinuz-*.old /boot/initrd.img-*.old /boot/System.map-*.old /boot/config-*.old 2>/dev/null || true
-
     case "$target" in
         generic|distro|default)
             echo -e "${YELLOW}Notice: 'generic' is the official Ubuntu distribution kernel and will never be removed.${NC}"
@@ -789,7 +656,7 @@ clean_kernel() {
             echo -e "${YELLOW}Uninstalling TPP kernel from /boot, /lib/modules, and removing source tree...${NC}"
             rm -rf /boot/*5.15.0-TPP* /boot/*5.15.0 /boot/*5.15.0.* /lib/modules/*5.15.0-TPP* /lib/modules/*5.15.0 "${TPP_DIR}/linux" "${TPP_DIR}/log" 2>/dev/null || true
             ;;
-        colloid-tpp)
+        colloid|colloid-tpp)
             echo -e "${YELLOW}Uninstalling Colloid-tpp kernel from /boot, /lib/modules, and removing source tree...${NC}"
             rm -rf /boot/*Colloid-TPP* /boot/*6.3.0 /boot/*6.3.0.* /lib/modules/*Colloid-TPP* /lib/modules/*6.3.0 "${COLLOID_TPP_DIR}/linux" "${COLLOID_TPP_DIR}/log" 2>/dev/null || true
             ;;
@@ -797,58 +664,136 @@ clean_kernel() {
             echo -e "${YELLOW}Uninstalling Colloid-tpp-alto kernel from /boot, /lib/modules, and removing source tree...${NC}"
             rm -rf /boot/*Colloid-TPP-Alto* /lib/modules/*Colloid-TPP-Alto* "${COLLOID_TPP_ALTO_DIR}/linux" "${COLLOID_TPP_ALTO_DIR}/log" 2>/dev/null || true
             ;;
-        all)
-            echo -e "${YELLOW}Purging all custom baseline kernels from /boot, /lib/modules, and removing all source trees...${NC}"
-            rm -rf /boot/*memtis* /boot/*Memtis* /lib/modules/*memtis* /lib/modules/*Memtis* "${MEMTIS_DIR}/linux" "${MEMTIS_DIR}/log" 2>/dev/null || true
-            rm -rf /boot/*Nomad* /lib/modules/*Nomad* "${NOMAD_DIR}/linux" "${NOMAD_DIR}/log" "${NOMAD_DIR}/nomad_module/async_promote.ko" "${NOMAD_NOINLINE_DIR}/linux" "${NOMAD_NOINLINE_DIR}/log" "${NOMAD_ALTO_DIR}/linux" "${NOMAD_ALTO_DIR}/log" "${NOMAD_ALTO_NOINLINE_DIR}/linux" "${NOMAD_ALTO_NOINLINE_DIR}/log" 2>/dev/null || true
-            rm -rf /boot/*5.15.0-TPP* /lib/modules/*5.15.0-TPP* "${TPP_DIR}/linux" "${TPP_DIR}/log" 2>/dev/null || true
-            rm -rf /boot/*Colloid* /lib/modules/*Colloid* "${COLLOID_TPP_DIR}/linux" "${COLLOID_TPP_DIR}/log" "${COLLOID_TPP_ALTO_DIR}/linux" "${COLLOID_TPP_ALTO_DIR}/log" 2>/dev/null || true
+        pact)
+            echo -e "${YELLOW}Uninstalling PACT kernel from /boot, /lib/modules, and removing source tree...${NC}"
+            rm -rf /boot/*PACT* /boot/*pact* /lib/modules/*PACT* /lib/modules/*pact* "${PACT_DIR}/linux" "${PACT_DIR}/log" "${PACT_DIR}/tierinit"/*.ko "${PACT_DIR}/kswapdrst"/*.ko "${PACT_DIR}/src/pact" 2>/dev/null || true
             ;;
-        grub|clean_grub|old)
-            echo -e "${GREEN}Cleaned all duplicate .old entries from /boot.${NC}"
+        hybridtier)
+            echo -e "${YELLOW}Uninstalling HybridTier kernel from /boot, /lib/modules, and removing source tree...${NC}"
+            rm -rf /boot/*hybridtier* /boot/*HybridTier* /lib/modules/*hybridtier* /lib/modules/*HybridTier* "${HYBRIDTIER_DIR}/linux" "${HYBRIDTIER_DIR}/log" "${HYBRIDTIER_DIR}/hook"/*.so 2>/dev/null || true
             ;;
     esac
+}
+
+clean_kernel() {
+    local target="$1"
+    echo -e "\n${BLUE}====================================================${NC}"
+    echo -e "${BLUE} Cleaning GRUB & Kernel: '${target}' ${NC}"
+    echo -e "${BLUE}====================================================${NC}"
+
+    clean_boot_backups
+
+    if [ "$target" == "all" ]; then
+        echo -e "${YELLOW}Purging all custom baseline kernels from /boot, /lib/modules, and removing all source trees...${NC}"
+        for t in "${BASELINE_TARGETS[@]}"; do
+            _uninstall_target_files "$t"
+        done
+        [ -L /boot/vmlinuz ] && rm -f /boot/vmlinuz
+        [ -L /boot/initrd.img ] && rm -f /boot/initrd.img
+        sed -i "s|^GRUB_DEFAULT=.*|GRUB_DEFAULT=0|" /etc/default/grub 2>/dev/null || true
+    elif [[ "$target" =~ ^(grub|clean_grub|old)$ ]]; then
+        echo -e "${GREEN}Cleaned all duplicate .old entries and links from /boot.${NC}"
+    else
+        _uninstall_target_files "$target"
+    fi
+
+    clean_boot_backups
 
     echo -e "${CYAN}Updating GRUB configuration...${NC}"
     update-grub
     echo -e "${GREEN}==> GRUB cleaned successfully.${NC}"
 }
 
+
 # ------------------------------------------------------------------------------
 # Command Line Argument Parsing
 # Defaults: ACTION="build", TARGET="", AUTO_REBOOT=false
 # ------------------------------------------------------------------------------
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    # Allow help and resolve_memmap to be displayed without root
+    for arg in "$@"; do
+        if [[ "$arg" == "--help" || "$arg" == "-h" || "$arg" == "help" ]]; then
+            show_help
+            exit 0
+        fi
+    done
+
+    if [ "${1:-}" == "resolve_memmap" ]; then
+        resolve_memmap "${2:-gapbs_bc_kron}" "${3:-1:1}"
+        exit 0
+    fi
+
+    # Enforce root privileges for kernel management operations
+    if [ "$EUID" -ne 0 ]; then
+        echo -e "${YELLOW}Notice: Root privileges are required to install kernels and update GRUB.${NC}"
+        echo -e "${YELLOW}Re-running script with sudo...${NC}"
+        exec sudo bash "$0" "$@"
+    fi
+
     TARGET=""
     ACTION="build"
     AUTO_REBOOT=false
+    BENCHMARK=""
+    RATIO=""
+    CUSTOM_MEMMAP=""
 
-    for arg in "$@"; do
-        case "$arg" in
+    while [ $# -gt 0 ]; do
+        case "$1" in
             --reboot|-r)
                 AUTO_REBOOT=true
+                shift
                 ;;
             --help|-h|help)
                 show_help
                 exit 0
                 ;;
+            resolve_memmap)
+                resolve_memmap "${2:-gapbs_bc_kron}" "${3:-1:1}"
+                exit 0
+                ;;
+            --benchmark|-b)
+                BENCHMARK="$2"
+                shift 2
+                ;;
+            --benchmark=*)
+                BENCHMARK="${1#*=}"
+                shift
+                ;;
+            --ratio|-R)
+                RATIO="$2"
+                shift 2
+                ;;
+            --ratio=*)
+                RATIO="${1#*=}"
+                shift
+                ;;
+            --memmap)
+                CUSTOM_MEMMAP="$2"
+                shift 2
+                ;;
+            --memmap=*)
+                CUSTOM_MEMMAP="${1#*=}"
+                shift
+                ;;
             compile_only|compile-only|compile|build_only|build-only|--compile-only|-c)
                 ACTION="compile_only"
+                shift
                 ;;
             update_grub|update-grub|set_default|set_grub|set_grub_default|select)
                 ACTION="update_grub"
+                shift
                 ;;
             clean_grub|clean-grub|clean_old|clean-old)
                 ACTION="clean"
-                if [ -z "$TARGET" ]; then
-                    TARGET="grub"
-                fi
+                [ -z "$TARGET" ] && TARGET="grub"
+                shift
                 ;;
             clean|purge|uninstall|remove)
                 ACTION="clean"
+                shift
                 ;;
-            memtis|nomad|nomad-noinline|nomad-alto|nomad_alto|nomad-alto-noinline|nomad_alto_noinline|nomad-noinline-alto|nomad_noinline_alto|tpp|colloid-tpp|colloid_tpp|colloid|colloid-tpp-alto|colloid_tpp_alto|colloid-alto|colloid_alto|generic|distro|default|all)
-                TARGET="${arg,,}" # Convert target name to lowercase
+            memtis|nomad|nomad-noinline|nomad-alto|nomad_alto|nomad-alto-noinline|nomad_alto_noinline|nomad-noinline-alto|nomad_noinline_alto|tpp|colloid-tpp|colloid_tpp|colloid|colloid-tpp-alto|colloid_tpp_alto|colloid-alto|colloid_alto|pact|hybridtier|generic|distro|default|all)
+                TARGET="${1,,}" # Convert target name to lowercase
                 if [[ "$TARGET" == "colloid_tpp" || "$TARGET" == "colloid" ]]; then
                     TARGET="colloid-tpp"
                 elif [[ "$TARGET" == "colloid_tpp_alto" || "$TARGET" == "colloid-alto" || "$TARGET" == "colloid_alto" ]]; then
@@ -860,9 +805,10 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
                 elif [[ "$TARGET" == "distro" || "$TARGET" == "default" ]]; then
                     TARGET="generic"
                 fi
+                shift
                 ;;
             *)
-                echo -e "${RED}Error: Unknown argument '${arg}'.${NC}\n"
+                echo -e "${RED}Error: Unknown argument '$1'.${NC}\n"
                 show_help
                 exit 1
                 ;;
@@ -874,7 +820,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
         if [ "$ACTION" == "clean" ]; then
             TARGET="grub"
         else
-            echo -e "${RED}Error: No kernel target specified (memtis, nomad, nomad-noinline, nomad-alto, nomad-alto-noinline, tpp, colloid-tpp, colloid-tpp-alto, generic, or all).${NC}\n"
+            echo -e "${RED}Error: No kernel target specified (memtis, nomad, nomad-noinline, nomad-alto, nomad-alto-noinline, tpp, colloid-tpp, colloid-tpp-alto, pact, hybridtier, generic, or all).${NC}\n"
             show_help
             exit 1
         fi
@@ -887,126 +833,34 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     if [ "$ACTION" == "clean" ]; then
         clean_kernel "$TARGET"
     elif [ "$ACTION" == "update_grub" ]; then
-        case "$TARGET" in
-            memtis)
-                set_memtis_default
-                ;;
-            nomad)
-                set_nomad_default
-                ;;
-            nomad-noinline)
-                set_nomad_noinline_default
-                ;;
-            nomad-alto)
-                set_nomad_alto_default
-                ;;
-            nomad-alto-noinline)
-                set_nomad_alto_noinline_default
-                ;;
-            tpp)
-                set_tpp_default
-                ;;
-            colloid-tpp)
-                set_colloid_tpp_default
-                ;;
-            colloid-tpp-alto)
-                set_colloid_tpp_alto_default
-                ;;
-            generic)
-                set_generic_default
-                ;;
-            all)
-                set_memtis_default
-                set_nomad_default
-                set_nomad_noinline_default
-                set_nomad_alto_default
-                set_nomad_alto_noinline_default
-                set_tpp_default
-                set_colloid_tpp_default
-                set_colloid_tpp_alto_default
-                ;;
-        esac
+        if [ "$TARGET" == "all" ]; then
+            for t in "${BASELINE_TARGETS[@]}"; do
+                update_target_grub "$t"
+            done
+        else
+            update_target_grub "$TARGET"
+        fi
     elif [ "$ACTION" == "compile_only" ]; then
-        case "$TARGET" in
-            memtis)
-                compile_memtis
-                ;;
-            nomad)
-                compile_nomad
-                ;;
-            nomad-noinline)
-                compile_nomad_noinline
-                ;;
-            nomad-alto)
-                compile_nomad_alto
-                ;;
-            nomad-alto-noinline)
-                compile_nomad_alto_noinline
-                ;;
-            tpp)
-                compile_tpp
-                ;;
-            colloid-tpp)
-                compile_colloid_tpp
-                ;;
-            colloid-tpp-alto)
-                compile_colloid_tpp_alto
-                ;;
-            generic)
-                echo -e "${GREEN}==> Target 'generic' uses the pre-installed Ubuntu distribution kernel (no compilation required).${NC}"
-                ;;
-            all)
-                compile_memtis
-                compile_nomad
-                compile_nomad_noinline
-                compile_nomad_alto
-                compile_nomad_alto_noinline
-                compile_tpp
-                compile_colloid_tpp
-                compile_colloid_tpp_alto
-                ;;
-        esac
+        if [ "$TARGET" == "all" ]; then
+            for t in "${BASELINE_TARGETS[@]}"; do
+                "compile_${t//-/_}"
+            done
+        elif [ "$TARGET" == "generic" ]; then
+            echo -e "${GREEN}==> Target 'generic' uses the pre-installed Ubuntu distribution kernel (no compilation required).${NC}"
+        else
+            "compile_${TARGET//-/_}"
+        fi
         echo -e "\n${GREEN}==> Kernel compilation completed successfully for target '${TARGET}' (no system installation or GRUB modification performed).${NC}"
     else
-        case "$TARGET" in
-            memtis)
-                build_memtis
-                ;;
-            nomad)
-                build_nomad
-                ;;
-            nomad-noinline)
-                build_nomad_noinline
-                ;;
-            nomad-alto)
-                build_nomad_alto
-                ;;
-            nomad-alto-noinline)
-                build_nomad_alto_noinline
-                ;;
-            tpp)
-                build_tpp
-                ;;
-            colloid-tpp)
-                build_colloid_tpp
-                ;;
-            colloid-tpp-alto)
-                build_colloid_tpp_alto
-                ;;
-            generic)
-                set_generic_default
-                ;;
-            all)
-                build_memtis
-                build_nomad
-                build_nomad_noinline
-                build_nomad_alto
-                build_nomad_alto_noinline
-                build_tpp
-                build_colloid_tpp
-                build_colloid_tpp_alto
-                ;;
-        esac
+        if [ "$TARGET" == "all" ]; then
+            for t in "${BASELINE_TARGETS[@]}"; do
+                "build_${t//-/_}"
+            done
+        elif [ "$TARGET" == "generic" ]; then
+            set_generic_default
+        else
+            "build_${TARGET//-/_}"
+        fi
     fi
 
     # ------------------------------------------------------------------------------
@@ -1014,8 +868,16 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     # Handles automatic reboot if --reboot was passed, or prompts interactively.
     # ------------------------------------------------------------------------------
     if [ "$ACTION" != "compile_only" ]; then
+        # Ensure all CPUs are online before rebooting to prevent Intel PCU warm-reset hangs
+        ensure_cpus_online() {
+            for cpu_online in /sys/devices/system/cpu/cpu[0-9]*/online; do
+                [ -f "$cpu_online" ] && echo 1 > "$cpu_online" 2>/dev/null || true
+            done
+        }
+
         if [ "$AUTO_REBOOT" = true ]; then
             echo -e "\n${GREEN}Auto-reboot requested. Rebooting system in 3 seconds...${NC}"
+            ensure_cpus_online
             sleep 3
             reboot
         else
@@ -1025,6 +887,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
                 read -rp "Kernel task completed. Reboot into default kernel now? (y/N): " answer
                 if [[ "$answer" =~ ^[Yy]$ ]]; then
                     echo -e "${GREEN}Rebooting system...${NC}"
+                    ensure_cpus_online
                     reboot
                 fi
             fi

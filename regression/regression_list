@@ -1,7 +1,68 @@
-tpp
-colloid-tpp
-colloid-tpp-alto
-nomad-noinline
-nomad-alto-noinline
-memtis
-generic
+# ==============================================================================
+# LowTier Multi-Kernel & Multi-Ratio Regression List
+# ==============================================================================
+
+# Tier ratios (Fast:Slow relative to RSS)
+TIER_RATIOS=(
+    1:8
+    1:4
+    1:2
+    1:1
+    #2:1
+    #4:1
+    #8:1
+)
+
+# Benchmarks to evaluate
+BENCHMARKS=(
+    gapbs_pr_kron
+    gapbs_pr_urand
+    gapbs_pr_twitter
+    gapbs_pr_web
+    #gapbs_pr_road
+    gapbs_tc_kron
+    gapbs_tc_urand
+    gapbs_tc_twitter
+    gapbs_tc_web
+    #gapbs_tc_road
+    gapbs_bfs_kron
+    gapbs_bfs_urand
+    gapbs_bfs_twitter
+    gapbs_bfs_web
+    #gapbs_bfs_road
+    gapbs_bc_kron
+    gapbs_bc_urand
+    gapbs_bc_twitter
+    gapbs_bc_web
+    #gapbs_bc_road
+    gapbs_cc_kron
+    gapbs_cc_urand
+    gapbs_cc_twitter
+    gapbs_cc_web
+    #gapbs_cc_road
+    gapbs_sssp_kron
+    gapbs_sssp_urand
+    gapbs_sssp_twitter
+    gapbs_sssp_web
+    ##gapbs_sssp_road
+    silo_tpcc
+    silo_ycsb
+    #silo_queue
+    silo_bid
+    silo_encstress
+    redis
+    xsbench
+)
+
+# Baseline kernels to evaluate
+KERNELS=(
+    #pact
+    hybridtier
+    generic
+    colloid-tpp
+    #colloid-tpp-alto
+    #memtis
+    #nomad
+    #nomad-alto
+    #tpp
+)

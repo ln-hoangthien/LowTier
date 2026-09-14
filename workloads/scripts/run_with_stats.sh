@@ -10,22 +10,19 @@ if [ $# -eq 0 ]; then
     exit 1
 fi
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="${ROOT_DIR:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
+
 # Function to dynamically calculate Node 1 (slow memory) used memory in MB
 get_node1_used_mb() {
     if [ -f /sys/devices/system/node/node1/meminfo ]; then
-        local used_kb=$(grep -i "MemUsed:" /sys/devices/system/node/node1/meminfo 2>/dev/null | awk '{print $4}')
-        if [ -n "$used_kb" ]; then
-            echo $(( used_kb / 1024 ))
-            return
-        fi
+        local used_kb=$(awk '/MemUsed:/ {print $4; exit}' /sys/devices/system/node/node1/meminfo 2>/dev/null)
+        [ -n "$used_kb" ] && { echo $(( used_kb / 1024 )); return; }
     fi
-    local n1_size=$(numactl -H 2>/dev/null | grep "node 1 size" | awk '{print $4}')
-    local n1_free=$(numactl -H 2>/dev/null | grep "node 1 free" | awk '{print $4}')
-    if [ -n "$n1_size" ] && [ -n "$n1_free" ]; then
-        echo $(( n1_size - n1_free ))
-    else
-        echo 0
-    fi
+    local n1_size n1_free
+    n1_size=$(numactl -H 2>/dev/null | awk '/node 1 size:/ {print $4; exit}')
+    n1_free=$(numactl -H 2>/dev/null | awk '/node 1 free:/ {print $4; exit}')
+    [ -n "$n1_size" ] && [ -n "$n1_free" ] && echo $(( n1_size - n1_free )) || echo 0
 }
 
 SETTLE_SLEEP="${SETTLE_SLEEP:-5}"
@@ -35,67 +32,152 @@ if [ "$SETTLE_SLEEP" -gt 0 ]; then
     sleep "${SETTLE_SLEEP}"
 fi
 
-# 2. Read baseline VMSTAT counters BEFORE workload execution
-PGF_BEFORE=$(grep -w "pgfault" /proc/vmstat 2>/dev/null | awk '{print $2}')
-NUMA_BEFORE=$(grep -w "numa_hint_faults" /proc/vmstat 2>/dev/null | awk '{print $2}')
-NUMA_PAGES_MIG_BEFORE=$(grep -w "numa_pages_migrated" /proc/vmstat 2>/dev/null | awk '{print $2}')
-PGALLOC_NORM_BEFORE=$(grep -w "pgalloc_normal" /proc/vmstat 2>/dev/null | awk '{print $2}')
-PGALLOC_DMA32_BEFORE=$(grep -w "pgalloc_dma32" /proc/vmstat 2>/dev/null | awk '{print $2}')
-NUMA_HIT_BEFORE=$(grep -w "numa_hit" /proc/vmstat 2>/dev/null | awk '{print $2}')
-NUMA_MISS_BEFORE=$(grep -w "numa_miss" /proc/vmstat 2>/dev/null | awk '{print $2}')
-NUMA_FOREIGN_BEFORE=$(grep -w "numa_foreign" /proc/vmstat 2>/dev/null | awk '{print $2}')
-ALLOCSTALL_BEFORE=$(grep -w "allocstall_normal" /proc/vmstat 2>/dev/null | awk '{print $2}')
-PROM_CAND_BEFORE=$(grep -w "pgpromote_candidate" /proc/vmstat 2>/dev/null | awk '{print $2}')
-PROM_TRIED_BEFORE=$(grep -w "pgpromote_tried" /proc/vmstat 2>/dev/null | awk '{print $2}')
-PROM_PAGE_BEFORE=$(grep -w "pgpromote_anon" /proc/vmstat 2>/dev/null | awk '{print $2}')
-DEM_PAGE_ANON_BEFORE=$(grep -w "pgdemote_anon" /proc/vmstat 2>/dev/null | awk '{print $2}')
-DEM_PAGE_FILE_BEFORE=$(grep -w "pgdemote_file" /proc/vmstat 2>/dev/null | awk '{print $2}')
-DEM_KSWAPD_BEFORE=$(grep -w "pgdemote_kswapd" /proc/vmstat 2>/dev/null | awk '{print $2}')
-DEM_DIRECT_BEFORE=$(grep -w "pgdemote_direct" /proc/vmstat 2>/dev/null | awk '{print $2}')
-MIG_SUCC_BEFORE=$(grep -w "pgmigrate_success" /proc/vmstat 2>/dev/null | awk '{print $2}')
-MIG_FAIL_BEFORE=$(grep -w "pgmigrate_fail" /proc/vmstat 2>/dev/null | awk '{print $2}')
-MIG_DST_FULL_BEFORE=$(grep -w "pgmigrate_fail_dst_node_full" /proc/vmstat 2>/dev/null | awk '{print $2}')
-PMI_BEFORE=$(cat /proc/interrupts 2>/dev/null | grep PMI | awk '{s=0; for(i=2;i<=NF-2;i++) s+=$i; print s}')
+# Helpers to read /proc/vmstat and /proc/perfnomad in a single in-memory pass
+read_vmstat() {
+    local -n _arr=$1
+    if [ -f /proc/vmstat ]; then
+        while read -r k v; do
+            _arr["$k"]="$v"
+        done < /proc/vmstat
+    fi
+}
 
-PGF_BEFORE="${PGF_BEFORE:-0}"
-NUMA_BEFORE="${NUMA_BEFORE:-0}"
-NUMA_PAGES_MIG_BEFORE="${NUMA_PAGES_MIG_BEFORE:-0}"
-PGALLOC_NORM_BEFORE="${PGALLOC_NORM_BEFORE:-0}"
-PGALLOC_DMA32_BEFORE="${PGALLOC_DMA32_BEFORE:-0}"
-NUMA_HIT_BEFORE="${NUMA_HIT_BEFORE:-0}"
-NUMA_MISS_BEFORE="${NUMA_MISS_BEFORE:-0}"
-NUMA_FOREIGN_BEFORE="${NUMA_FOREIGN_BEFORE:-0}"
-ALLOCSTALL_BEFORE="${ALLOCSTALL_BEFORE:-0}"
-PROM_CAND_BEFORE="${PROM_CAND_BEFORE:-0}"
-PROM_TRIED_BEFORE="${PROM_TRIED_BEFORE:-0}"
-PROM_PAGE_BEFORE="${PROM_PAGE_BEFORE:-0}"
-DEM_PAGE_ANON_BEFORE="${DEM_PAGE_ANON_BEFORE:-0}"
-DEM_PAGE_FILE_BEFORE="${DEM_PAGE_FILE_BEFORE:-0}"
-DEM_KSWAPD_BEFORE="${DEM_KSWAPD_BEFORE:-0}"
-DEM_DIRECT_BEFORE="${DEM_DIRECT_BEFORE:-0}"
-MIG_SUCC_BEFORE="${MIG_SUCC_BEFORE:-0}"
-MIG_FAIL_BEFORE="${MIG_FAIL_BEFORE:-0}"
-MIG_DST_FULL_BEFORE="${MIG_DST_FULL_BEFORE:-0}"
-PMI_BEFORE="${PMI_BEFORE:-0}"
+read_perfnomad() {
+    local -n _arr=$1
+    if [ -f /proc/perfnomad ]; then
+        while read -r k v; do
+            _arr["$k"]="$v"
+        done < /proc/perfnomad
+    fi
+}
 
-# Read baseline PERFNOMAD counters (Nomad Kernel)
-if [ -f /proc/perfnomad ]; then
-    SUCCESS_BEFORE=$(grep "success_nr" /proc/perfnomad | head -n 1 | awk '{print $2}')
-    RETRY_BEFORE=$(grep "retry_nr" /proc/perfnomad | head -n 1 | awk '{print $2}')
-    TRY_BEFORE=$(grep "try_to_promote_nr" /proc/perfnomad | head -n 1 | awk '{print $2}')
-else
-    SUCCESS_BEFORE=0
-    RETRY_BEFORE=0
-    TRY_BEFORE=0
-fi
+get_pmi_count() {
+    awk '/^[[:space:]]*PMI:/ {s=0; for(i=2;i<=NF;i++) s+=$i; print s; exit}' /proc/interrupts 2>/dev/null || echo 0
+}
 
+# 2. Read baseline counters BEFORE workload execution
+declare -A VMS_B PN_B
+read_vmstat VMS_B
+read_perfnomad PN_B
+PMI_BEFORE=$(get_pmi_count)
 NODE1_BEFORE=$(get_node1_used_mb)
 
 # 3. Execute the workload command with GNU time to capture runtime & Peak RSS
+if [ -f /sys/fs/cgroup/memtis_workload/cgroup.procs ]; then
+    echo $$ > /sys/fs/cgroup/memtis_workload/cgroup.procs 2>/dev/null || true
+fi
+
+KERNEL_VER="$(uname -r)"
+
+# Extract binary name for profiler target matching
+if [ -z "${TARGET_EXE_NAME:-}" ]; then
+    for arg in "$@"; do
+        if [ -f "$arg" ] && [ -x "$arg" ]; then
+            TARGET_EXE_NAME="$(basename "$arg")"
+            break
+        fi
+    done
+fi
+TARGET_EXE_NAME="${TARGET_EXE_NAME:-*}"
+
 START_TIME=$(date +%s)
-/usr/bin/time -v "$@"
-STATUS=$?
+
+# PACT autotie: Launch workload in background, record target PID, and attach PACT daemon
+if echo "${KERNEL_VER}" | grep -iq "pact"; then
+    PACT_BIN="${ROOT_DIR}/baselines/pact/src/pact"
+    TARGET_PID_FILE=$(mktemp /tmp/pact_pid_XXXXXX)
+
+    /usr/bin/time -v bash -c "echo \$\$ > '${TARGET_PID_FILE}'; exec $*" &
+    TIME_PID=$!
+
+    TARGET_PID=""
+    for i in $(seq 1 100); do
+        if [ -s "${TARGET_PID_FILE}" ]; then
+            TARGET_PID=$(cat "${TARGET_PID_FILE}" | tr -d ' \t\n\r')
+            [ -n "${TARGET_PID}" ] && break
+        fi
+        sleep 0.02
+    done
+    rm -f "${TARGET_PID_FILE}"
+
+    PACT_PID=""
+    if [ -n "${TARGET_PID}" ] && [ -x "${PACT_BIN}" ] && kill -0 "${TARGET_PID}" 2>/dev/null; then
+        PACT_LOG_FILE="${TARGET_DIR:-/tmp}/pact_${FILENAME_SUFFIX:-run}.log"
+        # Workload-aware warmup delay (allows manual override if PACT_WARMUP_SEC is set)
+        if [ -z "${PACT_WARMUP_SEC:-}" ]; then
+            if echo "$*" | grep -qE "sssp.*(kron|urand|web)|(kron|urand|web)\.wsg"; then
+                PACT_WARMUP_SEC=15   # Large weighted graphs take ~12s
+            elif echo "$*" | grep -qiE "xsbench"; then
+                PACT_WARMUP_SEC=15   # In-memory grid initialization takes ~12.5s
+            elif echo "$*" | grep -qE "gapbs|/pr|/bc|/bfs|/cc|/tc|/sssp"; then
+                PACT_WARMUP_SEC=7   # Standard graphs take ~6s
+            else
+                PACT_WARMUP_SEC=2
+            fi
+        fi
+        PACT_BATCH_SIZE="${PACT_BATCH_SIZE:-4096}"
+        (
+            if [ "${PACT_WARMUP_SEC}" -gt 0 ]; then
+                echo "[+] Waiting ${PACT_WARMUP_SEC}s (workload ingestion delay) before activating PACT daemon..."
+                sleep "${PACT_WARMUP_SEC}"
+            fi
+            if [ "${TARGET_EXE_NAME}" != "*" ]; then
+                MATCHED_PID=$(pgrep -n -x "${TARGET_EXE_NAME}" 2>/dev/null || true)
+                [ -n "${MATCHED_PID}" ] && TARGET_PID="${MATCHED_PID}"
+            fi
+            if kill -0 "${TARGET_PID}" 2>/dev/null; then
+                echo "[+] PACT autotie active: Attaching PACT daemon (PID ${TARGET_PID}, batch size ${PACT_BATCH_SIZE})..."
+                exec "${PACT_BIN}" --workload "${TARGET_PID}" --max-migrations-per-cycle "${PACT_BATCH_SIZE}" > "${PACT_LOG_FILE}" 2>&1
+            fi
+        ) &
+        PACT_PID=$!
+        echo "[+] PACT monitor task active (PID ${PACT_PID})."
+    fi
+
+    wait "${TIME_PID}"
+    STATUS=$?
+
+    if [ -n "${PACT_PID}" ] && kill -0 "${PACT_PID}" 2>/dev/null; then
+        echo "[*] Waiting for PACT daemon (PID ${PACT_PID}) to finalize..."
+        for i in {1..20}; do
+            if ! kill -0 "${PACT_PID}" 2>/dev/null; then break; fi
+            sleep 0.1
+        done
+        if kill -0 "${PACT_PID}" 2>/dev/null; then
+            kill -INT "${PACT_PID}" 2>/dev/null || true
+            sleep 0.5
+        fi
+        if kill -0 "${PACT_PID}" 2>/dev/null; then
+            kill -9 "${PACT_PID}" 2>/dev/null || true
+        fi
+    fi
+elif echo "${KERNEL_VER}" | grep -iq "hybridtier"; then
+    # HybridTier autotie: In-process PEBS monitoring thread via LD_PRELOAD hook.so
+    # Disable kernel dynamic sample rate throttling and lock max_sample_rate to 150000
+    sysctl -w kernel.perf_event_max_sample_rate=150000 >/dev/null 2>&1 || true
+    sysctl -w kernel.perf_cpu_time_max_percent=0 >/dev/null 2>&1 || true
+    sysctl -w kernel.perf_event_paranoid=-1 >/dev/null 2>&1 || true
+
+    HYBRID_HOOK="${HYBRIDTIER_HOOK:-${ROOT_DIR}/baselines/hybridtier/hook/hook.so}"
+    echo "[+] HybridTier autotie active: LD_PRELOAD=${HYBRID_HOOK}, TARGET_EXE_NAME=${TARGET_EXE_NAME}"
+
+    if [ -f "${HYBRID_HOOK}" ]; then
+        /usr/bin/time -v env LD_PRELOAD="${HYBRID_HOOK}${LD_PRELOAD:+:$LD_PRELOAD}" TARGET_EXE_NAME="${TARGET_EXE_NAME}" bash -c "$*"
+    else
+        /usr/bin/time -v bash -c "$*"
+    fi
+    STATUS=$?
+
+    # Terminate orphan background perf stat process spawned by HybridTier's hook.so
+    pkill -f "perf stat -I 60000" 2>/dev/null || true
+else
+    # Standard In-Kernel Baselines (TPP, Colloid, Nomad, Memtis, Generic)
+    /usr/bin/time -v bash -c "$*"
+    STATUS=$?
+fi
+
 END_TIME=$(date +%s)
+
 WORKLOAD_RUNTIME=$((END_TIME - START_TIME))
 [ $WORKLOAD_RUNTIME -le 0 ] && WORKLOAD_RUNTIME=1
 
@@ -104,125 +186,76 @@ if [ "$SETTLE_SLEEP" -gt 0 ]; then
     sleep "${SETTLE_SLEEP}"
 fi
 
-# 5. Read final VMSTAT counters AFTER execution
-PGF_AFTER=$(grep -w "pgfault" /proc/vmstat 2>/dev/null | awk '{print $2}')
-NUMA_AFTER=$(grep -w "numa_hint_faults" /proc/vmstat 2>/dev/null | awk '{print $2}')
-NUMA_PAGES_MIG_AFTER=$(grep -w "numa_pages_migrated" /proc/vmstat 2>/dev/null | awk '{print $2}')
-PGALLOC_NORM_AFTER=$(grep -w "pgalloc_normal" /proc/vmstat 2>/dev/null | awk '{print $2}')
-PGALLOC_DMA32_AFTER=$(grep -w "pgalloc_dma32" /proc/vmstat 2>/dev/null | awk '{print $2}')
-NUMA_HIT_AFTER=$(grep -w "numa_hit" /proc/vmstat 2>/dev/null | awk '{print $2}')
-NUMA_MISS_AFTER=$(grep -w "numa_miss" /proc/vmstat 2>/dev/null | awk '{print $2}')
-NUMA_FOREIGN_AFTER=$(grep -w "numa_foreign" /proc/vmstat 2>/dev/null | awk '{print $2}')
-ALLOCSTALL_AFTER=$(grep -w "allocstall_normal" /proc/vmstat 2>/dev/null | awk '{print $2}')
-PROM_CAND_AFTER=$(grep -w "pgpromote_candidate" /proc/vmstat 2>/dev/null | awk '{print $2}')
-PROM_TRIED_AFTER=$(grep -w "pgpromote_tried" /proc/vmstat 2>/dev/null | awk '{print $2}')
-PROM_PAGE_AFTER=$(grep -w "pgpromote_anon" /proc/vmstat 2>/dev/null | awk '{print $2}')
-DEM_PAGE_ANON_AFTER=$(grep -w "pgdemote_anon" /proc/vmstat 2>/dev/null | awk '{print $2}')
-DEM_PAGE_FILE_AFTER=$(grep -w "pgdemote_file" /proc/vmstat 2>/dev/null | awk '{print $2}')
-DEM_KSWAPD_AFTER=$(grep -w "pgdemote_kswapd" /proc/vmstat 2>/dev/null | awk '{print $2}')
-DEM_DIRECT_AFTER=$(grep -w "pgdemote_direct" /proc/vmstat 2>/dev/null | awk '{print $2}')
-MIG_SUCC_AFTER=$(grep -w "pgmigrate_success" /proc/vmstat 2>/dev/null | awk '{print $2}')
-MIG_FAIL_AFTER=$(grep -w "pgmigrate_fail" /proc/vmstat 2>/dev/null | awk '{print $2}')
-MIG_DST_FULL_AFTER=$(grep -w "pgmigrate_fail_dst_node_full" /proc/vmstat 2>/dev/null | awk '{print $2}')
-PMI_AFTER=$(cat /proc/interrupts 2>/dev/null | grep PMI | awk '{s=0; for(i=2;i<=NF-2;i++) s+=$i; print s}')
-
-PGF_AFTER="${PGF_AFTER:-0}"
-NUMA_AFTER="${NUMA_AFTER:-0}"
-NUMA_PAGES_MIG_AFTER="${NUMA_PAGES_MIG_AFTER:-0}"
-PGALLOC_NORM_AFTER="${PGALLOC_NORM_AFTER:-0}"
-PGALLOC_DMA32_AFTER="${PGALLOC_DMA32_AFTER:-0}"
-NUMA_HIT_AFTER="${NUMA_HIT_AFTER:-0}"
-NUMA_MISS_AFTER="${NUMA_MISS_AFTER:-0}"
-NUMA_FOREIGN_AFTER="${NUMA_FOREIGN_AFTER:-0}"
-ALLOCSTALL_AFTER="${ALLOCSTALL_AFTER:-0}"
-PROM_CAND_AFTER="${PROM_CAND_AFTER:-0}"
-PROM_TRIED_AFTER="${PROM_TRIED_AFTER:-0}"
-PROM_PAGE_AFTER="${PROM_PAGE_AFTER:-0}"
-DEM_PAGE_ANON_AFTER="${DEM_PAGE_ANON_AFTER:-0}"
-DEM_PAGE_FILE_AFTER="${DEM_PAGE_FILE_AFTER:-0}"
-DEM_KSWAPD_AFTER="${DEM_KSWAPD_AFTER:-0}"
-DEM_DIRECT_AFTER="${DEM_DIRECT_AFTER:-0}"
-MIG_SUCC_AFTER="${MIG_SUCC_AFTER:-0}"
-MIG_FAIL_AFTER="${MIG_FAIL_AFTER:-0}"
-MIG_DST_FULL_AFTER="${MIG_DST_FULL_AFTER:-0}"
-PMI_AFTER="${PMI_AFTER:-0}"
-
-# Read final PERFNOMAD counters
-if [ -f /proc/perfnomad ]; then
-    SUCCESS_AFTER=$(grep "success_nr" /proc/perfnomad | head -n 1 | awk '{print $2}')
-    RETRY_AFTER=$(grep "retry_nr" /proc/perfnomad | head -n 1 | awk '{print $2}')
-    TRY_AFTER=$(grep "try_to_promote_nr" /proc/perfnomad | head -n 1 | awk '{print $2}')
-else
-    SUCCESS_AFTER=0
-    RETRY_AFTER=0
-    TRY_AFTER=0
-fi
-
+# 5. Read final counters AFTER execution
+declare -A VMS_A PN_A
+read_vmstat VMS_A
+read_perfnomad PN_A
+PMI_AFTER=$(get_pmi_count)
 NODE1_AFTER=$(get_node1_used_mb)
 
+vm_delta() {
+    local a="${VMS_A[$1]:-0}" b="${VMS_B[$1]:-0}"
+    [ "$a" -ge "$b" ] 2>/dev/null && echo $(( a - b )) || echo 0
+}
+
+pn_delta() {
+    local a="${PN_A[$1]:-0}" b="${PN_B[$1]:-0}"
+    [ "$a" -ge "$b" ] 2>/dev/null && echo $(( a - b )) || echo 0
+}
+
+pages_to_gb() { awk "BEGIN {printf \"%.2f\", (${1:-0} * 4096) / 1073741824}"; }
+pages_to_mb() { awk "BEGIN {printf \"%.2f\", (${1:-0} * 4096) / 1048576}"; }
+pages_to_bw() { awk "BEGIN {printf \"%.2f MB/s\", (${1:-0} * 4096) / (1048576 * ${WORKLOAD_RUNTIME})}"; }
+
 # 6. Calculate VMSTAT Deltas
-DELTA_PGF=$((PGF_AFTER - PGF_BEFORE))
-DELTA_NUMA=$((NUMA_AFTER - NUMA_BEFORE))
-DELTA_NUMA_PAGES_MIG=$((NUMA_PAGES_MIG_AFTER - NUMA_PAGES_MIG_BEFORE))
-DELTA_PGALLOC=$(( (PGALLOC_NORM_AFTER - PGALLOC_NORM_BEFORE) + (PGALLOC_DMA32_AFTER - PGALLOC_DMA32_BEFORE) ))
-DELTA_NUMA_HIT=$((NUMA_HIT_AFTER - NUMA_HIT_BEFORE))
-DELTA_NUMA_MISS=$((NUMA_MISS_AFTER - NUMA_MISS_BEFORE))
-DELTA_NUMA_FOREIGN=$((NUMA_FOREIGN_AFTER - NUMA_FOREIGN_BEFORE))
-DELTA_ALLOCSTALL=$((ALLOCSTALL_AFTER - ALLOCSTALL_BEFORE))
-DELTA_PROM_CAND=$((PROM_CAND_AFTER - PROM_CAND_BEFORE))
-DELTA_PROM_TRIED=$((PROM_TRIED_AFTER - PROM_TRIED_BEFORE))
-DELTA_PROM_PAGE=$((PROM_PAGE_AFTER - PROM_PAGE_BEFORE))
-DELTA_DEM_PAGE_ANON=$((DEM_PAGE_ANON_AFTER - DEM_PAGE_ANON_BEFORE))
-DELTA_DEM_PAGE_FILE=$((DEM_PAGE_FILE_AFTER - DEM_PAGE_FILE_BEFORE))
-DELTA_DEM_KSWAPD=$((DEM_KSWAPD_AFTER - DEM_KSWAPD_BEFORE))
-DELTA_DEM_DIRECT=$((DEM_DIRECT_AFTER - DEM_DIRECT_BEFORE))
-DELTA_MIG_SUCC=$((MIG_SUCC_AFTER - MIG_SUCC_BEFORE))
-DELTA_MIG_FAIL=$((MIG_FAIL_AFTER - MIG_FAIL_BEFORE))
-DELTA_MIG_DST_FULL=$((MIG_DST_FULL_AFTER - MIG_DST_FULL_BEFORE))
-DELTA_PMI=$((PMI_AFTER - PMI_BEFORE))
+DELTA_PGF=$(vm_delta "pgfault")
+DELTA_NUMA=$(vm_delta "numa_hint_faults")
+DELTA_NUMA_PAGES_MIG=$(vm_delta "numa_pages_migrated")
+DELTA_PGALLOC=$(( $(vm_delta "pgalloc_normal") + $(vm_delta "pgalloc_dma32") ))
+DELTA_NUMA_HIT=$(vm_delta "numa_hit")
+DELTA_NUMA_MISS=$(vm_delta "numa_miss")
+DELTA_NUMA_FOREIGN=$(vm_delta "numa_foreign")
+DELTA_ALLOCSTALL=$(vm_delta "allocstall_normal")
+DELTA_PROM_CAND=$(vm_delta "pgpromote_candidate")
+DELTA_PROM_TRIED=$(vm_delta "pgpromote_tried")
+DELTA_PROM_PAGE=$(vm_delta "pgpromote_anon")
+DELTA_DEM_PAGE_ANON=$(vm_delta "pgdemote_anon")
+DELTA_DEM_PAGE_FILE=$(vm_delta "pgdemote_file")
+DELTA_DEM_KSWAPD=$(vm_delta "pgdemote_kswapd")
+DELTA_DEM_DIRECT=$(vm_delta "pgdemote_direct")
+DELTA_MIG_SUCC=$(vm_delta "pgmigrate_success")
+DELTA_MIG_FAIL=$(vm_delta "pgmigrate_fail")
+DELTA_MIG_DST_FULL=$(vm_delta "pgmigrate_fail_dst_node_full")
 
-[ $DELTA_PGF -lt 0 ] && DELTA_PGF=0
-[ $DELTA_NUMA -lt 0 ] && DELTA_NUMA=0
-[ $DELTA_NUMA_PAGES_MIG -lt 0 ] && DELTA_NUMA_PAGES_MIG=0
-[ $DELTA_PGALLOC -lt 0 ] && DELTA_PGALLOC=0
-[ $DELTA_NUMA_HIT -lt 0 ] && DELTA_NUMA_HIT=0
-[ $DELTA_NUMA_MISS -lt 0 ] && DELTA_NUMA_MISS=0
-[ $DELTA_NUMA_FOREIGN -lt 0 ] && DELTA_NUMA_FOREIGN=0
-[ $DELTA_ALLOCSTALL -lt 0 ] && DELTA_ALLOCSTALL=0
-[ $DELTA_PROM_CAND -lt 0 ] && DELTA_PROM_CAND=0
-[ $DELTA_PROM_TRIED -lt 0 ] && DELTA_PROM_TRIED=0
-[ $DELTA_PROM_PAGE -lt 0 ] && DELTA_PROM_PAGE=0
-[ $DELTA_DEM_PAGE_ANON -lt 0 ] && DELTA_DEM_PAGE_ANON=0
-[ $DELTA_DEM_PAGE_FILE -lt 0 ] && DELTA_DEM_PAGE_FILE=0
-[ $DELTA_DEM_KSWAPD -lt 0 ] && DELTA_DEM_KSWAPD=0
-[ $DELTA_DEM_DIRECT -lt 0 ] && DELTA_DEM_DIRECT=0
-[ $DELTA_MIG_SUCC -lt 0 ] && DELTA_MIG_SUCC=0
-[ $DELTA_MIG_FAIL -lt 0 ] && DELTA_MIG_FAIL=0
-[ $DELTA_MIG_DST_FULL -lt 0 ] && DELTA_MIG_DST_FULL=0
-[ $DELTA_PMI -lt 0 ] && DELTA_PMI=0
+# Memtis Deltas
+DELTA_MEMTIS_PROM=$(vm_delta "htmm_nr_promoted")
+DELTA_MEMTIS_DEM=$(vm_delta "htmm_nr_demoted")
+DELTA_MEMTIS_ALLOC_DRAM=$(vm_delta "htmm_alloc_dram")
+DELTA_MEMTIS_ALLOC_NVM=$(vm_delta "htmm_alloc_nvm")
 
-# Node 1 Delta & Demotion Bandwidth
-DELTA_NODE1=$((NODE1_AFTER - NODE1_BEFORE))
-[ $DELTA_NODE1 -lt 0 ] && DELTA_NODE1=0
+# Node 1 & PMI Deltas
+DELTA_PMI=$(( PMI_AFTER > PMI_BEFORE ? PMI_AFTER - PMI_BEFORE : 0 ))
+DELTA_NODE1=$(( NODE1_AFTER > NODE1_BEFORE ? NODE1_AFTER - NODE1_BEFORE : 0 ))
+
 DEM_BW=$(awk "BEGIN {printf \"%.2f MB/s\", $DELTA_NODE1 / $WORKLOAD_RUNTIME}")
+ALLOC_GB=$(pages_to_gb "$DELTA_PGALLOC")
+ALLOC_BW=$(pages_to_bw "$DELTA_PGALLOC")
+HIT_GB=$(pages_to_gb "$DELTA_NUMA_HIT")
+MISS_GB=$(pages_to_gb "$DELTA_NUMA_MISS")
 
-# Calculate Allocation Volumes & Bandwidth
-ALLOC_GB=$(awk "BEGIN {printf \"%.2f\", ($DELTA_PGALLOC * 4096) / (1024 * 1024 * 1024)}")
-ALLOC_BW=$(awk "BEGIN {printf \"%.2f MB/s\", ($DELTA_PGALLOC * 4096) / (1024 * 1024 * $WORKLOAD_RUNTIME)}")
-HIT_GB=$(awk "BEGIN {printf \"%.2f\", ($DELTA_NUMA_HIT * 4096) / (1024 * 1024 * 1024)}")
-MISS_GB=$(awk "BEGIN {printf \"%.2f\", ($DELTA_NUMA_MISS * 4096) / (1024 * 1024 * 1024)}")
-
-# 7. Print Standard VMSTAT Output Report
+# 7. Print Standard VMSTAT Fault & Allocation Report (Shortened)
 echo ""
 echo "=========================================================="
-echo "       WORKLOAD VMSTAT TIERING & FAULT DELTA REPORT       "
+echo "          WORKLOAD VMSTAT FAULT & ALLOCATION REPORT       "
 echo "=========================================================="
 echo " Kernel Release                         : $(uname -r)"
 echo " Workload Execution Runtime             : ${WORKLOAD_RUNTIME} seconds"
 echo " Total Page Faults Delta (pgfault)      : ${DELTA_PGF}"
 echo " NUMA Hint Faults Delta (numa_hint)     : ${DELTA_NUMA}"
 echo " NUMA Pages Migrated (numa_pages_mig)   : ${DELTA_NUMA_PAGES_MIG}"
-echo " PMI Interrupts Delta (cat /proc/interrupts): ${DELTA_PMI}"
+if [ "${DELTA_PMI:-0}" -gt 0 ]; then
+    echo " PMI Interrupts Delta (interrupts)      : ${DELTA_PMI}"
+fi
 echo "----------------------------------------------------------"
 echo " Total Allocated Pages (pgalloc)        : ${DELTA_PGALLOC} (${ALLOC_GB} GB, ${ALLOC_BW})"
 echo " NUMA Local Alloc Hits (numa_hit)       : ${DELTA_NUMA_HIT} (${HIT_GB} GB)"
@@ -230,42 +263,24 @@ echo " NUMA Remote Alloc Misses (numa_miss)   : ${DELTA_NUMA_MISS} (${MISS_GB} G
 if [ $DELTA_ALLOCSTALL -gt 0 ]; then
     echo " Direct Allocation Stalls (allocstall)  : ${DELTA_ALLOCSTALL}"
 fi
-echo "----------------------------------------------------------"
-echo " Promotion Candidates Delta (pgpromote_cand) : ${DELTA_PROM_CAND}"
-if [ $DELTA_PROM_TRIED -gt 0 ]; then
-    echo " Promotion Attempts (pgpromote_tried)        : ${DELTA_PROM_TRIED}"
+echo " Total Migrated Pages Delta (pgmigrate) : ${DELTA_MIG_SUCC}"
+if [ $DELTA_MIG_FAIL -gt 0 ]; then
+    echo " Migration Failures (pgmigrate_fail)    : ${DELTA_MIG_FAIL}"
 fi
-echo " Promoted Anon Pages Delta (pgpromote_anon)  : ${DELTA_PROM_PAGE}"
-echo " Demoted Anon Pages Delta (pgdemote_anon)    : ${DELTA_DEM_PAGE_ANON}"
-echo " Demoted File Pages Delta (pgdemote_file)    : ${DELTA_DEM_PAGE_FILE}"
-if [ $DELTA_DEM_KSWAPD -gt 0 ] || [ $DELTA_DEM_DIRECT -gt 0 ]; then
-    echo " Demoted kswapd (pgdemote_kswapd)            : ${DELTA_DEM_KSWAPD}"
-    echo " Demoted direct (pgdemote_direct)            : ${DELTA_DEM_DIRECT}"
-fi
-if [ $DELTA_MIG_DST_FULL -gt 0 ]; then
-    echo " Blocked Promotions - Dst Full (dst_full)    : ${DELTA_MIG_DST_FULL}"
-fi
-echo " Total Migrated Pages Delta (pgmigrate_succ) : ${DELTA_MIG_SUCC}"
-echo " Migration Failures (pgmigrate_fail)         : ${DELTA_MIG_FAIL}"
-echo " Slow Tier Node 1 Used Memory                : ${NODE1_AFTER} MB (Growth: +${DELTA_NODE1} MB)"
-echo " Slow Tier Demotion Bandwidth                : ${DEM_BW}"
 echo "=========================================================="
 
-# 8. Print Nomad Specific Report (if running on Nomad baseline with async_promote module)
-if [ -f /proc/perfnomad ]; then
-    DELTA_TRY=$((TRY_AFTER - TRY_BEFORE))
-    [ $DELTA_TRY -lt 0 ] && DELTA_TRY=0
-
-    DELTA_SUCCESS=$((SUCCESS_AFTER - SUCCESS_BEFORE))
-    [ $DELTA_SUCCESS -lt 0 ] && DELTA_SUCCESS=0
-
-    DELTA_RETRY=$((RETRY_AFTER - RETRY_BEFORE))
-    [ $DELTA_RETRY -lt 0 ] && DELTA_RETRY=0
+# 8. Print Kernel-Specific Tiering & Migration Performance Report
+if [ -f /proc/perfnomad ] || echo "$(uname -r)" | grep -iq "nomad"; then
+    DELTA_TRY=$(pn_delta "try_to_promote_nr")
+    DELTA_SUCCESS=$(pn_delta "success_nr")
+    DELTA_RETRY=$(pn_delta "retry_nr")
+    DELTA_TX_SUCC=$(pn_delta "transactional_success_nr")
+    DELTA_TX_FAIL=$(pn_delta "transactional_fail_nr")
+    DELTA_RETREAT=$(pn_delta "retreated_page_nr")
 
     DELTA_TOTAL=$((DELTA_SUCCESS + DELTA_RETRY))
-
-    PROM_MB=$(awk "BEGIN {printf \"%.2f\", ($DELTA_SUCCESS * 4096) / (1024 * 1024)}")
-    PROM_BW=$(awk "BEGIN {printf \"%.2f MB/s\", ($DELTA_SUCCESS * 4096) / (1024 * 1024 * $WORKLOAD_RUNTIME)}")
+    PROM_MB=$(pages_to_mb "$DELTA_SUCCESS")
+    PROM_BW=$(pages_to_bw "$DELTA_SUCCESS")
 
     if [ $DELTA_TOTAL -gt 0 ]; then
         ABORT_RATE=$(awk "BEGIN {printf \"%.2f%%\", ($DELTA_RETRY / $DELTA_TOTAL) * 100}")
@@ -281,31 +296,70 @@ if [ -f /proc/perfnomad ]; then
     echo " Application Runtime       : ${WORKLOAD_RUNTIME} seconds"
     echo " Timestamp                 : $(date +%H:%M:%S)"
     echo "------------------------------------------------------------------------------------------"
-    echo " Single-Line Summary Format (Timestamp | Delta_Try | Prom_BW | Dem_BW | Abort_Rate | Node1_Used):"
-    echo "$(date +%H:%M:%S) | $DELTA_TRY | $PROM_BW | $DEM_BW | $ABORT_RATE | ${NODE1_AFTER} MB"
+    echo " Total Promotion Candidates (try_nr)      : ${DELTA_TRY}"
+    echo " Successful Async Promotions (success_nr) : ${DELTA_SUCCESS} (${PROM_MB} MB Promoted)"
+    echo " Retried/Aborted Promotions (retry_nr)    : ${DELTA_RETRY}"
+    echo " Transactional Promotions Succeeded       : ${DELTA_TX_SUCC}"
+    echo " Transactional Promotions Failed          : ${DELTA_TX_FAIL}"
+    echo " Retreated Inactive Pages                 : ${DELTA_RETREAT}"
+    echo " Average Promotion Bandwidth              : ${PROM_BW}"
+    echo " Average Demotion Bandwidth               : ${DEM_BW}"
+    echo " Overall Application Abortion Rate        : ${ABORT_RATE}"
+    echo " Slow Tier Node 1 Used Memory             : ${NODE1_AFTER} MB (Growth: +${DELTA_NODE1} MB)"
+    echo "=========================================================================================="
+elif [ $DELTA_MEMTIS_PROM -gt 0 ] || [ $DELTA_MEMTIS_DEM -gt 0 ] || echo "$(uname -r)" | grep -iqE "memtis|htmm"; then
+    # Memtis / HTMM Performance Report
+    MEMTIS_PROM_MB=$(pages_to_mb "$DELTA_MEMTIS_PROM")
+    MEMTIS_PROM_BW=$(pages_to_bw "$DELTA_MEMTIS_PROM")
+    MEMTIS_DEM_MB=$(pages_to_mb "$DELTA_MEMTIS_DEM")
+    MEMTIS_DEM_BW=$(pages_to_bw "$DELTA_MEMTIS_DEM")
+
+    echo ""
+    echo "=========================================================================================="
+    echo "                   MEMTIS (HTMM) APPLICATION-WIDE PERFORMANCE REPORT                     "
+    echo "=========================================================================================="
+    echo " Executed Command          : $@"
+    echo " Application Runtime       : ${WORKLOAD_RUNTIME} seconds"
+    echo " Timestamp                 : $(date +%H:%M:%S)"
     echo "------------------------------------------------------------------------------------------"
-    echo " Total Promotion Candidates (try_nr)  : ${DELTA_TRY}"
-    echo " Successful Migrations (success_nr)   : ${DELTA_SUCCESS} (${PROM_MB} MB Promoted)"
-    echo " Retried/Aborted Migrations (retry_nr): ${DELTA_RETRY}"
-    echo " Average Promotion Bandwidth          : ${PROM_BW}"
-    echo " Average Demotion Bandwidth           : ${DEM_BW}"
-    echo " Overall Application Abortion Rate    : ${ABORT_RATE}"
-    echo " Slow Tier Node 1 Used Memory         : ${NODE1_AFTER} MB"
+    echo " Promoted Pages (htmm_nr_promoted)   : ${DELTA_MEMTIS_PROM} (${MEMTIS_PROM_MB} MB Promoted)"
+    echo " Demoted Pages (htmm_nr_demoted)     : ${DELTA_MEMTIS_DEM} (${MEMTIS_DEM_MB} MB Demoted)"
+    echo " Direct DRAM Allocations             : ${DELTA_MEMTIS_ALLOC_DRAM}"
+    echo " Direct NVM / Slow Allocations       : ${DELTA_MEMTIS_ALLOC_NVM}"
+    echo " Average Promotion Bandwidth         : ${MEMTIS_PROM_BW}"
+    echo " Average Demotion Bandwidth          : ${MEMTIS_DEM_BW}"
+    echo " Slow Tier Node 1 Used Memory        : ${NODE1_AFTER} MB (Growth: +${DELTA_NODE1} MB)"
     echo "=========================================================================================="
 elif [ $DELTA_PROM_PAGE -gt 0 ] || [ $DELTA_MIG_SUCC -gt 0 ]; then
     # Upstream TPP / Generic Tiering Summary
     PROM_PAGES=$(( DELTA_PROM_PAGE > 0 ? DELTA_PROM_PAGE : DELTA_MIG_SUCC ))
-    PROM_MB=$(awk "BEGIN {printf \"%.2f\", ($PROM_PAGES * 4096) / (1024 * 1024)}")
-    PROM_BW=$(awk "BEGIN {printf \"%.2f MB/s\", ($PROM_PAGES * 4096) / (1024 * 1024 * $WORKLOAD_RUNTIME)}")
+    PROM_MB=$(pages_to_mb "$PROM_PAGES")
+    PROM_BW=$(pages_to_bw "$PROM_PAGES")
+
     echo ""
     echo "=========================================================================================="
     echo "                 TIERED MEMORY MIGRATION & BANDWIDTH SUMMARY                              "
     echo "=========================================================================================="
-    echo " Promoted Memory Volume    : ${PROM_MB} MB (${PROM_PAGES} pages)"
-    echo " Average Promotion Bandwidth: ${PROM_BW}"
-    echo " Average Demotion Bandwidth : ${DEM_BW}"
-    echo " Slow Tier Node 1 Used     : ${NODE1_AFTER} MB"
+    echo " Executed Command          : $@"
+    echo " Application Runtime       : ${WORKLOAD_RUNTIME} seconds"
+    echo " Timestamp                 : $(date +%H:%M:%S)"
+    echo "------------------------------------------------------------------------------------------"
+    if [ $DELTA_PROM_CAND -gt 0 ]; then
+        echo " Promotion Candidates (pgpromote_cand)    : ${DELTA_PROM_CAND}"
+    fi
+    echo " Promoted Memory Volume                   : ${PROM_MB} MB (${PROM_PAGES} pages)"
+    if [ $DELTA_DEM_PAGE_ANON -gt 0 ] || [ $DELTA_DEM_PAGE_FILE -gt 0 ]; then
+        echo " Demoted Pages (anon / file)              : ${DELTA_DEM_PAGE_ANON} anon / ${DELTA_DEM_PAGE_FILE} file"
+    fi
+    if [ $DELTA_DEM_KSWAPD -gt 0 ] || [ $DELTA_DEM_DIRECT -gt 0 ]; then
+        echo " Demoted By (kswapd / direct)             : ${DELTA_DEM_KSWAPD} kswapd / ${DELTA_DEM_DIRECT} direct"
+    fi
+    echo " Average Promotion Bandwidth              : ${PROM_BW}"
+    echo " Average Demotion Bandwidth               : ${DEM_BW}"
+    echo " Slow Tier Node 1 Used Memory             : ${NODE1_AFTER} MB (Growth: +${DELTA_NODE1} MB)"
     echo "=========================================================================================="
 fi
 echo ""
+
+exit "${STATUS:-0}"
 
