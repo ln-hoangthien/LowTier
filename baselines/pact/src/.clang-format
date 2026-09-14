@@ -1,0 +1,82 @@
+# PACT runtime clang-format config — Linux/QEMU-derived with project tweaks.
+#
+# Run `make format` to apply, `make check-format` in CI to enforce.
+# Requires clang-format 16+ for InsertBraces support.
+---
+Language: Cpp
+BasedOnStyle: LLVM
+
+# Indentation: 4 spaces (project convention; deviates from kernel 8).
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ContinuationIndentWidth: 4
+
+# Line length cap. Kernel: 80, modern style: 100. We pick 100 — many existing
+# pact lines exceed 80 for log_xxx() format strings, and 100 keeps them on one
+# line. Hard wrap above this.
+ColumnLimit: 100
+
+# Braces: K&R-ish with attached braces, NEVER omit braces around single
+# statements. This is the rule the project enforces explicitly:
+#
+#   GOOD:    if (cond) {
+#                stmt;
+#            }
+#   BAD:     if (cond) stmt;
+#   BAD:     if (cond)
+#                stmt;
+#
+# Requires clang-format >= 16.
+InsertBraces: true
+
+BreakBeforeBraces: Custom
+BraceWrapping:
+  AfterControlStatement: Never   # `if (x) {` on same line
+  AfterEnum: false
+  AfterFunction: true             # `void foo()\n{` (kernel/QEMU style)
+  AfterStruct: false
+  AfterUnion: false
+  AfterExternBlock: false
+  BeforeElse: false               # `} else {`
+  BeforeWhile: false              # `} while (...)` after do-while
+  IndentBraces: false
+  SplitEmptyFunction: false
+  SplitEmptyRecord: false
+
+# Pointer alignment: `T *p` (kernel style), not `T* p`.
+PointerAlignment: Right
+DerivePointerAlignment: false
+
+# Spaces.
+SpaceBeforeParens: ControlStatements    # `if (`, `while (`, `for (`, but `foo(`
+SpaceAfterCStyleCast: false
+SpacesInParentheses: false
+SpacesInSquareBrackets: false
+
+# Function arguments / params: prefer one-line if it fits, else align to
+# opening paren (kernel style).
+AlignAfterOpenBracket: Align
+BinPackArguments: true
+BinPackParameters: true
+
+# Includes: don't reorder. PACT has carefully-ordered include lists in some
+# files (pact.h pulls things in a specific order). Leave includes alone.
+SortIncludes: Never
+IncludeBlocks: Preserve
+
+# Misc.
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+AllowShortBlocksOnASingleLine: Never
+AllowShortFunctionsOnASingleLine: Inline   # tiny static inline accessors OK
+AllowShortCaseLabelsOnASingleLine: false
+
+KeepEmptyLinesAtTheStartOfBlocks: false
+MaxEmptyLinesToKeep: 2
+
+# Comments.
+ReflowComments: false           # don't auto-reflow doc-comments
+
+# Switch/case.
+IndentCaseLabels: false

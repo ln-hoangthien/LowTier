@@ -7,12 +7,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="${ROOT_DIR:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
 TPP_DIR="${ROOT_DIR}/baselines/tpp"
 KERNEL_DIR="${TPP_DIR}/linux"
-PATCH="${TPP_DIR}/tpp.patch"
 LOGF="${TPP_DIR}/log"
+PATCHES=("${TPP_DIR}/tpp.patch")
 
 [[ -d "$KERNEL_DIR" ]] || { echo "ERROR: kernel tree not found at $KERNEL_DIR"; exit 1; }
 
-[[ -e "$PATCH" ]] || { echo "ERROR: patch not found: $PATCH"; exit 1; }
+for p in "${PATCHES[@]}"; do
+    [[ -e "$p" ]] || { echo "ERROR: patch not found: $p"; exit 1; }
+done
 
 cd "$KERNEL_DIR"
 
@@ -27,12 +29,14 @@ make clean
 # Remove host-built fixdep binary to avoid glibc compatibility issues
 rm -f tools/objtool/fixdep scripts/basic/fixdep
 
-echo "Applying $(basename "$PATCH") ..."
-if git apply --reverse --check "$PATCH" >/dev/null 2>&1; then
-    echo "  (already applied, skipping)"
-else
-    git apply "$PATCH"
-fi
+for p in "${PATCHES[@]}"; do
+    echo "Applying $(basename "$p") ..."
+    if git apply --reverse --check "$p" >/dev/null 2>&1; then
+        echo "  (already applied, skipping)"
+    else
+        git apply "$p"
+    fi
+done
 
 # Copy configuration from generic kernel to .config
 echo "configuring (olddefconfig) ..."

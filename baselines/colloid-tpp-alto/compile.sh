@@ -9,12 +9,15 @@ COLLOID_DIR="${ROOT_DIR}/baselines/colloid-tpp-alto"
 KERNEL_DIR="${COLLOID_DIR}/linux"
 LOGF="${COLLOID_DIR}/log"
 PATCHES=("${COLLOID_DIR}/colloid-skx.patch" "${COLLOID_DIR}/colloid-skx-alto.patch")
+UBUNTU_FIXES_CONFIG="${UBUNTU_FIXES_CONFIG:-${ROOT_DIR}/baselines/scripts/ubuntu_fixes.config}"
 
 [[ -d "$KERNEL_DIR" ]] || { echo "ERROR: kernel tree not found at $KERNEL_DIR"; exit 1; }
 
 for p in "${PATCHES[@]}"; do
     [[ -e "$p" ]] || { echo "ERROR: patch not found: $p"; exit 1; }
 done
+
+[[ -f "$UBUNTU_FIXES_CONFIG" ]] || { echo "ERROR: ubuntu_fixes.config not found at $UBUNTU_FIXES_CONFIG"; exit 1; }
 
 cd "$KERNEL_DIR"
 
@@ -50,15 +53,18 @@ else
 fi
 
 # ------------------------------------------------------------------------------
-# Kernel Configuration Adjustments (scripts/config)
+# Kernel Configuration Adjustments (scripts/config & merge_config.sh)
 # ------------------------------------------------------------------------------
 # 1. Kernel Naming & Certificate Key Fixes
 scripts/config --set-str CONFIG_LOCALVERSION "-Colloid-TPP-Alto"
 scripts/config --set-str CONFIG_SYSTEM_TRUSTED_KEYS ""
 scripts/config --set-str CONFIG_SYSTEM_REVOCATION_KEYS ""
-scripts/config --disable CONFIG_DEBUG_INFO_BTF
 
-# 2. Single-Socket NUMA Emulation Configs (managed in manage_kernels.sh; will remove in real 2-socket NUMA in the future)
+# 2. Apply Ubuntu Boot Fixes & Safety Nets
+echo "Applying Ubuntu fixes configuration: $UBUNTU_FIXES_CONFIG"
+./scripts/kconfig/merge_config.sh -m .config "$UBUNTU_FIXES_CONFIG"
+
+# 3. Single-Socket NUMA Emulation Configs (managed in manage_kernels.sh; will remove in real 2-socket NUMA in the future)
 if type configure_single_socket_numa >/dev/null 2>&1; then
     configure_single_socket_numa "$KERNEL_DIR"
 fi
@@ -68,7 +74,7 @@ fi
 # ------------------------------------------------------------------------------
 make olddefconfig CC=gcc-11 HOSTCC=gcc-11 > "$LOGF" 2>&1
 echo "make ..."
-make -j "$(nproc)" CC=gcc-11 HOSTCC=gcc-11 > "$LOGF" 2>&1
+make -j "$(nproc)" CC=gcc-11 HOSTCC=gcc-11 >> "$LOGF" 2>&1
 
 # ------------------------------------------------------------------------------
 # Done

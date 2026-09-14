@@ -26,7 +26,7 @@ sudo ./compile.sh
 ```
 
 The script runs: `git checkout v6.3` → `git apply colloid-skx.patch` →
-`git apply colloid-skx-alto.patch` → `make olddefconfig` → `make -j` →
+merge `ubuntu_fixes.config` → `make olddefconfig` → `make -j` →
 `make modules_install` → `make install` → `update-grub`.
 
 Build the helper tools (`colloid-mon/`, `tierinit/`, `kswapdrst/`) with the

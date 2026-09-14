@@ -72,8 +72,8 @@ fi
 # ------------------------------------------------------------------------------
 make olddefconfig CC=gcc-11 HOSTCC=gcc-11 > "$LOGF" 2>&1
 echo "make ..."
-make -j "$(nproc)" CC=gcc-11 HOSTCC=gcc-11 > "$LOGF" 2>&1
-make -C "$SCRIPT_DIR/nomad_module" KERNEL_SRC="$KERNEL_DIR" CC=gcc-11 HOSTCC=gcc-11 > "$LOGF" 2>&1
+make -j "$(nproc)" CC=gcc-11 HOSTCC=gcc-11 >> "$LOGF" 2>&1
+(cd "$SCRIPT_DIR/nomad_module" && make KERNEL_SRC="$KERNEL_DIR" CC=gcc-11 HOSTCC=gcc-11) >> "$LOGF" 2>&1
 
 # ---------------------------------------------------------------------------
 # Done

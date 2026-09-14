@@ -1,0 +1,68 @@
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 0f8736991..e92648055 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -2975,6 +2975,9 @@ static void task_numa_work(struct callback_head *work)
+ 		p->numa_scan_period = task_scan_start(p);
+ 	}
+ 
++  p->numa_scan_period = 1000;
++  printk("h scan p = %u \n", p->numa_scan_period);
++
+ 	next_scan = now + msecs_to_jiffies(p->numa_scan_period);
+ 	if (!try_cmpxchg(&mm->numa_next_scan, &migrate, next_scan))
+ 		return;
+diff --git a/mm/memory-tiers.c b/mm/memory-tiers.c
+index c734658c6..4aa8c00bc 100644
+--- a/mm/memory-tiers.c
++++ b/mm/memory-tiers.c
+@@ -241,6 +241,8 @@ static struct memory_tier *__node_get_memory_tier(int node)
+ #ifdef CONFIG_MIGRATION
+ bool node_is_toptier(int node)
+ {
++	return (node == 0); // Kevin edit: hardcode node 0 as top tier node for CXL emulation using remote NUMA node
++
+ 	bool toptier;
+ 	pg_data_t *pgdat;
+ 	struct memory_tier *memtier;
+@@ -293,5 +295,14 @@ void node_get_allowed_targets(pg_data_t *pgdat, nodemask_t *targets)
+  */
+ int next_demotion_node(int node)
+ {
++  //return 1; // Kevin edit: hardcode the node 1 as the destination node during demotion for CXL emulation
++  if (node == 0) {
++    return 1;
++  } else {
++    // assuming node can only be 0 or 1
++    // Node 1 is terminal on demotion path.
++    return NUMA_NO_NODE;
++  }
++
+ 	struct demotion_nodes *nd;
+ 	int target;
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index 5b7b8d4f5..9e890b30a 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -2711,7 +2711,8 @@ static unsigned int reclaim_folio_list(struct list_head *folio_list,
+ 		.may_writepage = 1,
+ 		.may_unmap = 1,
+ 		.may_swap = 1,
+-		.no_demotion = 1,
++ 		.no_demotion = 0, // Kevin edit: enable demotion to lower tier memory node (which is hardcoded to node 1)
++		//.no_demotion = 1,
+ 	};
+ 
+ 	nr_reclaimed = shrink_folio_list(folio_list, pgdat, &sc, &dummy_stat, false);
+@@ -5921,6 +5922,11 @@ static void shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
+ 	bool proportional_reclaim;
+ 	struct blk_plug plug;
+ 
++  if (current_is_kswapd()) {
++    printk("kswapd shrink lru stop.\n");
++    return;
++  }
++
+ 	if (lru_gen_enabled()) {
+ 		lru_gen_shrink_lruvec(lruvec, sc);
+ 		return;

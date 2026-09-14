@@ -8,6 +8,10 @@ Source setup scripts, patches, and automated kernel management for baseline tier
 | :--- | :--- | :--- | :--- | :--- |
 | **Memtis** | Linux 5.15.19 | `5.15.19-Memtis` | [`memtis/`](memtis/) | PEBS-driven tiering (SOSP'23) |
 | **Nomad** | Linux 5.13-rc6 | `5.13.0-rc6-Nomad` | [`nomad/`](nomad/) | Non-exclusive memory tiering (OSDI'24) |
+| **TPP** | Linux 5.15.0 | `5.15.0-TPP` | [`tpp/`](tpp/) | Transparent Page Placement (ASPLOS'23) |
+| **Colloid-tpp** | Linux 6.3.0 | `6.3.0-Colloid-TPP` | [`colloid-tpp/`](colloid-tpp/) | Colloid on TPP path (SOSP'24) |
+| **PACT** | Linux 6.3.0 | `6.3.0-PACT` | [`pact/`](pact/) | Criticality-first tiered memory (ASPLOS'26) |
+| **HybridTier** | Linux 6.2.0 | `6.2.0-hybridtier+` | [`hybridtier/`](hybridtier/) | Adaptive CXL tiering system (ASPLOS'25) |
 | **Scripts** | — | — | [`scripts/`](scripts/) | Master management script `manage_kernels.sh` |
 
 ## Usage (`scripts/manage_kernels.sh`)

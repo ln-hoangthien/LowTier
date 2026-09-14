@@ -20,14 +20,14 @@ Colloid tiering baseline. As noted in the parent
 first, then build (kernel install + `update-grub` need root):
 
 ```bash
-cd colloid-tpp
+cd colloid-tpp-alto
 git clone https://github.com/torvalds/linux.git linux   # v6.3 is a mainline tag
 sudo ./compile.sh
 ```
 
 The script runs: `git checkout v6.3` → `git apply colloid-skx.patch` →
-`git apply colloid-skx-alto.patch` → `make olddefconfig` → `make -j` →
-`make modules_install` → `make install` → `update-grub`.
+`git apply colloid-skx-alto.patch` → merge `ubuntu_fixes.config` → `make olddefconfig` →
+`make -j` → `make modules_install` → `make install` → `update-grub`.
 
 Build the helper tools (`colloid-mon/`, `tierinit/`, `kswapdrst/`) with the
 `make` target in each subdirectory; see their own READMEs.
