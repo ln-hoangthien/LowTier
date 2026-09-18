@@ -23,7 +23,7 @@ if [ -z "$1" ] || [ "$1" == "-h" ] || [ "$1" == "--help" ]; then
     echo "  sudo $0 [TARGET_ALIAS] [DATASET] [TIER_RATIO: 1:1 | 1:2 | ...]"
     echo ""
     echo "Arguments:"
-    echo "  TARGET_ALIAS   Workload target (e.g. stream_hot, gapbs_pr, silo_tpcc, redis, xsbench)"
+    echo "  TARGET_ALIAS   Workload target (e.g. stream_hot, gapbs_pr, silo_tpcc, redis, xsbench, spec2026_<bench>)"
     echo "  DATASET        Graph dataset for GAPBS (kron, urand, twitter, web, road)"
     echo "  TIER_RATIO     [REGRESSION ONLY] Fast:Slow ratio tag passed by automated orchestrators"
     echo "                 (e.g., regression/run_auto_regression.sh) to label logs after reboot."
@@ -34,6 +34,8 @@ if [ -z "$1" ] || [ "$1" == "-h" ] || [ "$1" == "--help" ]; then
     echo "  sudo $0 gapbs_pr urand"
     echo "  sudo $0 silo_tpcc"
     echo "  sudo $0 redis"
+    echo "  sudo $0 spec2026_820.cloverleaf_s"
+    echo "  sudo $0 spec2026_709.cactus_r"
     echo "=========================================================================================="
     exit 0
 fi
@@ -41,7 +43,7 @@ fi
 # Ensure running with root / sudo privileges
 if [ "$EUID" -ne 0 ]; then
     echo "[!] This script requires root privileges for bpftrace. Elevating via sudo..."
-    exec sudo env PATH="$PATH" ROOT_DIR="$ROOT_DIR" TIER_RATIO="${TIER_RATIO:-}" TARGET_DIR="${TARGET_DIR:-}" \
+    exec sudo env PATH="$PATH" ROOT_DIR="$ROOT_DIR" TIER_RATIO="${TIER_RATIO:-}" RATIO="${RATIO:-}" RATIO_TAG="${RATIO_TAG:-}" TARGET_DIR="${TARGET_DIR:-}" \
         WORKLOAD_CORES="${WORKLOAD_CORES:-}" SELECTED_CPUS="${SELECTED_CPUS:-}" "$0" "$@"
 fi
 
@@ -73,6 +75,8 @@ if [ -n "$RATIO" ]; then
     RATIO_TAG="${RATIO//:/_}"
     RATIO_TAG="${RATIO_TAG#ratio_}"
 fi
+export RATIO
+export RATIO_TAG
 
 KERNEL_VER="$(uname -r)"
 TARGET_DIR="${TARGET_DIR:-${OUTPUT_DIR}/${KERNEL_VER}}"
@@ -85,6 +89,7 @@ export FILENAME_SUFFIX
 LOG_FILE="${TARGET_DIR}/bpftrace_numa_page_${FILENAME_SUFFIX}.log"
 PERF_LOG_FILE="${TARGET_DIR}/perf_bandwidth_${FILENAME_SUFFIX}.log"
 REGRESS_LOG_FILE="${TARGET_DIR}/regress_${FILENAME_SUFFIX}.log"
+export REGRESS_LOG_FILE
 
 # Remove any stale output files for this specific workload before running
 rm -f "${LOG_FILE}" "${PERF_LOG_FILE}" "${REGRESS_LOG_FILE}"
@@ -95,8 +100,8 @@ if [ -z "${TARGET_EXE_NAME:-}" ]; then
     export TARGET_EXE_NAME
 fi
 
-# Workload CPU allocation: 12 cores for workload (0..11), 4 cores for background profilers/kswapd (12..15)
-export WORKLOAD_CORES="${WORKLOAD_CORES:-12}"
+# Workload CPU allocation: 8 cores for workload (0..7), 8 cores for background profilers/kswapd (8..15)
+export WORKLOAD_CORES="${WORKLOAD_CORES:-8}"
 export SELECTED_CPUS="${SELECTED_CPUS:-$(seq -s, 0 $(( WORKLOAD_CORES - 1 )))}"
 
 OFFLINE_CPUS=($(seq 16 63))
@@ -173,7 +178,7 @@ clean_memory_caches() {
     echo "[*] Cleaning memory caches, dropping buffers, compacting memory & quiescing..."
 
     # 1. Terminate any lingering background profilers or stale benchmark processes
-    killall -9 bpftrace perf redis-server dbtest XSBench pr bc bfs cc sssp tc 2>/dev/null || true
+    killall -9 bpftrace perf redis-server dbtest XSBench pr bc bfs cc sssp tc specperl runcpu specmake 2>/dev/null || true
 
     # 2. Reclaim stale SysV IPC shared memory segments
     ipcs -m 2>/dev/null | awk '$2 ~ /^[0-9]+$/ {print $2}' | xargs -r ipcrm -m 2>/dev/null || true
@@ -239,6 +244,9 @@ configure_tiered_numa_kernel() {
         rmmod kswapdrst 2>/dev/null || true
     fi
 
+    # ------------------
+    # NOMAD Setup
+    # ------------------
     # 3. Adaptive NUMA balancing, module loading, and demotion setup based on active kernel
     if echo "${KERNEL_VER}" | grep -iq "nomad"; then
         # Nomad: load async_promote.ko, activate mode 2 (Tiered NUMA Balancing)
@@ -251,6 +259,9 @@ configure_tiered_numa_kernel() {
         sysctl -w kernel.numa_balancing=2 2>/dev/null || true
         echo true > /sys/kernel/mm/numa/demotion_enabled 2>/dev/null || true
 
+    # ------------------
+    # Memtis Setup
+    # ------------------
     elif echo "${KERNEL_VER}" | grep -iqE "memtis|htmm"; then
         # Memtis: dedicated migration daemons and cgroup memory limits
         sysctl -w kernel.numa_balancing=0 2>/dev/null || true
@@ -291,6 +302,9 @@ configure_tiered_numa_kernel() {
             echo "[!] Note: Memtis ksamplingd is not running."
         fi
 
+    # ------------------
+    # Colloid Setup
+    # ------------------
     elif echo "${KERNEL_VER}" | grep -iq "colloid"; then
         # Colloid: tierinit.ko + colloid-mon.ko + mode 6 (TIERING | COLLOID)
         local colloid_dir=""
@@ -308,17 +322,30 @@ configure_tiered_numa_kernel() {
         sysctl -w kernel.numa_balancing=6 2>/dev/null || true
         echo true > /sys/kernel/mm/numa/demotion_enabled 2>/dev/null || true
 
+    # ------------------
+    # PACT Setup
+    # ------------------
     elif echo "${KERNEL_VER}" | grep -iq "pact"; then
-        # PACT: tierinit.ko + userspace PAC daemon for proactive promotions + kernel demotion
-        local pact_dir="${ROOT_DIR}/baselines/pact"
+        # PACT / PACT-prefetch: tierinit.ko + userspace PAC daemon for proactive promotions + kernel demotion
+        local pact_dir=""
+        if echo "${KERNEL_VER}" | grep -iq "prefetch"; then
+            pact_dir="${ROOT_DIR}/baselines/pact-prefetch"
+        else
+            pact_dir="${ROOT_DIR}/baselines/pact"
+        fi
         [ ! -d "${pact_dir}" ] && pact_dir=$(ls -d ${ROOT_DIR}/baselines/pact* 2>/dev/null | head -n 1 || true)
 
         ensure_module_loaded "tierinit" "${pact_dir}" "tierinit" "PACT"
+        ensure_module_loaded "kswapdrst" "${pact_dir}" "kswapdrst" "PACT"
 
         echo "[*] Activating PACT kernel tiering environment..."
         sysctl -w kernel.numa_balancing=0 2>/dev/null || true
+        sysctl -w kernel.perf_event_paranoid=-1 2>/dev/null || true
         echo true > /sys/kernel/mm/numa/demotion_enabled 2>/dev/null || true
 
+    # ------------------
+    # HybridTier Setup
+    # ------------------
     elif echo "${KERNEL_VER}" | grep -iq "hybridtier"; then
         # HybridTier: in-process PEBS monitoring thread (hook.so) and userspace move_pages()
         local hybridtier_dir="${ROOT_DIR}/baselines/hybridtier"
@@ -351,12 +378,18 @@ configure_tiered_numa_kernel() {
             ln -sf "$(command -v perf || echo /usr/bin/perf)" /ssd1/songxin8/thesis/autonuma/linux-6.1-rc6/tools/perf/perf 2>/dev/null || true
         fi
 
+    # ------------------------------------
+    # AutoNUMA (Generic) Setup
+    # ------------------------------------
     elif echo "${KERNEL_VER}" | grep -iq "generic"; then
         # Generic kernel: activate mode 3 (0x1 NORMAL AutoNUMA | 0x2 TIERED MEMORY)
         echo "[*] Activating AutoNUMA + Tiered Balancing for generic kernel (mode 3)..."
         sysctl -w kernel.numa_balancing=3 2>/dev/null || true
         echo true > /sys/kernel/mm/numa/demotion_enabled 2>/dev/null || true
 
+    # ------------------------------------
+    # Others
+    # ------------------------------------
     else
         # Upstream TPP / generic memory tiering: mode 2 (Tiered Memory Promotion only) or fallback to 1
         echo "[*] Activating Tiered NUMA Balancing (mode 2)..."

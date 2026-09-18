@@ -82,52 +82,99 @@ TARGET_EXE_NAME="${TARGET_EXE_NAME:-*}"
 
 START_TIME=$(date +%s)
 
-# PACT autotie: Launch workload in background, record target PID, and attach PACT daemon
+# ---------------------------
+# Autotie 
+# ---------------------------
+# -------------------------------------------------------------------------------
+# PACT autotie:
+#   Launch workload in background, record target PID, and attach PACT daemon
+# -------------------------------------------------------------------------------
 if echo "${KERNEL_VER}" | grep -iq "pact"; then
     PACT_BIN="${ROOT_DIR}/baselines/pact/src/pact"
-    TARGET_PID_FILE=$(mktemp /tmp/pact_pid_XXXXXX)
+    echo "${KERNEL_VER}" | grep -iq "prefetch" && [ -x "${ROOT_DIR}/baselines/pact-prefetch/src/pact" ] && PACT_BIN="${ROOT_DIR}/baselines/pact-prefetch/src/pact"
+    [ ! -x "${PACT_BIN}" ] && PACT_BIN=$(ls -d ${ROOT_DIR}/baselines/pact*/src/pact 2>/dev/null | head -n 1 || true)
 
-    /usr/bin/time -v bash -c "echo \$\$ > '${TARGET_PID_FILE}'; exec $*" &
+    # Launch workload under GNU time
+    /usr/bin/time -v bash -c "exec $*" &
     TIME_PID=$!
 
-    TARGET_PID=""
-    for i in $(seq 1 100); do
-        if [ -s "${TARGET_PID_FILE}" ]; then
-            TARGET_PID=$(cat "${TARGET_PID_FILE}" | tr -d ' \t\n\r')
-            [ -n "${TARGET_PID}" ] && break
-        fi
-        sleep 0.02
-    done
-    rm -f "${TARGET_PID_FILE}"
-
     PACT_PID=""
-    if [ -n "${TARGET_PID}" ] && [ -x "${PACT_BIN}" ] && kill -0 "${TARGET_PID}" 2>/dev/null; then
+    if [ -x "${PACT_BIN}" ]; then
         PACT_LOG_FILE="${TARGET_DIR:-/tmp}/pact_${FILENAME_SUFFIX:-run}.log"
-        # Workload-aware warmup delay (allows manual override if PACT_WARMUP_SEC is set)
-        if [ -z "${PACT_WARMUP_SEC:-}" ]; then
-            if echo "$*" | grep -qE "sssp.*(kron|urand|web)|(kron|urand|web)\.wsg"; then
-                PACT_WARMUP_SEC=15   # Large weighted graphs take ~12s
-            elif echo "$*" | grep -qiE "xsbench"; then
-                PACT_WARMUP_SEC=15   # In-memory grid initialization takes ~12.5s
-            elif echo "$*" | grep -qE "gapbs|/pr|/bc|/bfs|/cc|/tc|/sssp"; then
-                PACT_WARMUP_SEC=7   # Standard graphs take ~6s
-            else
-                PACT_WARMUP_SEC=2
-            fi
-        fi
-        PACT_BATCH_SIZE="${PACT_BATCH_SIZE:-4096}"
         (
-            if [ "${PACT_WARMUP_SEC}" -gt 0 ]; then
-                echo "[+] Waiting ${PACT_WARMUP_SEC}s (workload ingestion delay) before activating PACT daemon..."
-                sleep "${PACT_WARMUP_SEC}"
+            # Workload-specific synchronization:
+            # 1. GAPBS: wait until graph file ingestion completes ("Read Time:")
+            # 2. Silo: wait until dataloading completes ("starting benchmark")
+            # 3. SPEC 2026: wait until dataloading completes ("Running Benchmarks")
+            # 4. Redis / Others: default sleep (2s)
+            case "${TARGET_EXE_NAME}" in
+                pr|tc|bc|cc|bfs|sssp)
+                    echo "[+] PACT sync: Waiting for GAPBS graph ingestion (Read Time) to complete..."
+                    timeout=20000
+                    until [ -n "${REGRESS_LOG_FILE}" -a -f "${REGRESS_LOG_FILE}" ] && grep -q "Read Time:" "${REGRESS_LOG_FILE}" 2>/dev/null || ! kill -0 "${TIME_PID}" 2>/dev/null || [ $((timeout--)) -le 0 ]; do
+                        sleep 0.1
+                    done
+                    ;;
+
+                dbtest)
+                    echo "[+] PACT sync: Waiting for Silo dataloading to complete..."
+                    timeout=50000
+                    until ([ -n "${REGRESS_LOG_FILE}" -a -f "${REGRESS_LOG_FILE}" ] && grep -q "starting benchmark" "${REGRESS_LOG_FILE}" 2>/dev/null) || ! kill -0 "${TIME_PID}" 2>/dev/null || [ $((timeout--)) -le 0 ]; do
+                        sleep 0.1
+                    done
+                    ;;
+
+                runcpu|specperl)
+                    echo "[+] PACT sync: Waiting for SPEC CPU 2026 setup & compilation to complete..."
+                    timeout=50000
+                    until ([ -n "${REGRESS_LOG_FILE}" -a -f "${REGRESS_LOG_FILE}" ] && grep -q "Running Benchmarks" "${REGRESS_LOG_FILE}" 2>/dev/null) || ! kill -0 "${TIME_PID}" 2>/dev/null || [ $((timeout--)) -le 0 ]; do
+                        sleep 0.1
+                    done
+                    # Brief 1s delay so specinvoke spawns the actual compute binary
+                    sleep 1
+                    ;;
+
+                *)
+                    sleep 2
+                    ;;
+            esac
+
+            # ---------------------------------------------------------------------------------------------------
+            # AutoTie: Resolve target workload PID and tie the PACT to workload
+            # ---------------------------------------------------------------------------------------------------
+            TARGET_PID=""
+            if [ -n "${TARGET_EXE_NAME}" ] && [ "${TARGET_EXE_NAME}" != "*" ]; then
+                TARGET_PID=$(pgrep -n -x "${TARGET_EXE_NAME}" 2>/dev/null || true)
             fi
-            if [ "${TARGET_EXE_NAME}" != "*" ]; then
-                MATCHED_PID=$(pgrep -n -x "${TARGET_EXE_NAME}" 2>/dev/null || true)
-                [ -n "${MATCHED_PID}" ] && TARGET_PID="${MATCHED_PID}"
+            [ -z "${TARGET_PID}" ] && TARGET_PID=$(pgrep -P "${TIME_PID}" 2>/dev/null | head -n 1 || true)
+
+            # Redis override: attach to the redis-server database daemon holding the dataset
+            if [ "${TARGET_EXE_NAME}" = "run_redis.sh" ] || [ "${TARGET_EXE_NAME}" = "redis-server" ]; then
+                for attempt in $(seq 1 30); do
+                    REDIS_PID=$(pgrep -n -x redis-server 2>/dev/null || true)
+                    [ -n "${REDIS_PID}" ] && break
+                    sleep 0.5
+                done
+                [ -n "${REDIS_PID}" ] && TARGET_PID="${REDIS_PID}"
             fi
-            if kill -0 "${TARGET_PID}" 2>/dev/null; then
-                echo "[+] PACT autotie active: Attaching PACT daemon (PID ${TARGET_PID}, batch size ${PACT_BATCH_SIZE})..."
-                exec "${PACT_BIN}" --workload "${TARGET_PID}" --max-migrations-per-cycle "${PACT_BATCH_SIZE}" > "${PACT_LOG_FILE}" 2>&1
+
+            # SPEC CPU 2026 override: attach to the actual compute binary (*_base.mytest)
+            if [ "${TARGET_EXE_NAME}" = "runcpu" ] || [ "${TARGET_EXE_NAME}" = "specperl" ]; then
+                for attempt in $(seq 1 30); do
+                    SPEC_PID=$(pgrep -n -f "_base\." 2>/dev/null || true)
+                    [ -n "${SPEC_PID}" ] && break
+                    sleep 0.5
+                done
+                [ -n "${SPEC_PID}" ] && TARGET_PID="${SPEC_PID}"
+            fi
+
+            if [ -n "${TARGET_PID}" ] && kill -0 "${TARGET_PID}" 2>/dev/null; then
+                echo "[+] PACT autotie active: Attaching PACT daemon (PID ${TARGET_PID})..."
+                # By default the "m = 0", we should set m = 1GB (--demotion-margin 250000) to active the Eager Demotion.
+                "${PACT_BIN}" --workload "${TARGET_PID}" --demotion-margin 250000 > "${PACT_LOG_FILE}" 2>&1 &
+                ACTUAL_PACT_PID=$!
+                echo "${ACTUAL_PACT_PID}" > /tmp/pact_actual_pid
+                wait "${ACTUAL_PACT_PID}"
             fi
         ) &
         PACT_PID=$!
@@ -137,23 +184,34 @@ if echo "${KERNEL_VER}" | grep -iq "pact"; then
     wait "${TIME_PID}"
     STATUS=$?
 
-    if [ -n "${PACT_PID}" ] && kill -0 "${PACT_PID}" 2>/dev/null; then
-        echo "[*] Waiting for PACT daemon (PID ${PACT_PID}) to finalize..."
+    # ---------------------------------------------------------------------------------------------------
+    # AutoTie-Completion: Terminate PACT daemon once workload completes
+    # ---------------------------------------------------------------------------------------------------
+    ACTUAL_PACT_PID=$(cat /tmp/pact_actual_pid 2>/dev/null || true)
+    TARGET_KILL_PID="${ACTUAL_PACT_PID:-${PACT_PID}}"
+    if [ -n "${TARGET_KILL_PID}" ] && kill -0 "${TARGET_KILL_PID}" 2>/dev/null; then
+        echo "[*] Waiting for PACT daemon (PID ${TARGET_KILL_PID}) to finalize..."
         for i in {1..20}; do
-            if ! kill -0 "${PACT_PID}" 2>/dev/null; then break; fi
+            kill -0 "${TARGET_KILL_PID}" 2>/dev/null || break
             sleep 0.1
         done
-        if kill -0 "${PACT_PID}" 2>/dev/null; then
-            kill -INT "${PACT_PID}" 2>/dev/null || true
+        if kill -0 "${TARGET_KILL_PID}" 2>/dev/null; then
+            kill -INT "${TARGET_KILL_PID}" 2>/dev/null || true
             sleep 0.5
         fi
-        if kill -0 "${PACT_PID}" 2>/dev/null; then
-            kill -9 "${PACT_PID}" 2>/dev/null || true
+        if kill -0 "${TARGET_KILL_PID}" 2>/dev/null; then
+            kill -9 "${TARGET_KILL_PID}" 2>/dev/null || true
         fi
     fi
+    kill -9 "${PACT_PID}" 2>/dev/null || true
+    rm -f /tmp/pact_actual_pid
+
+# -------------------------------------------------------------------------------
+# HybridTier autotie:
+#   In-process PEBS monitoring thread via LD_PRELOAD hook.so
+#   Disable kernel dynamic sample rate throttling and lock max_sample_rate to 150000
+# -------------------------------------------------------------------------------
 elif echo "${KERNEL_VER}" | grep -iq "hybridtier"; then
-    # HybridTier autotie: In-process PEBS monitoring thread via LD_PRELOAD hook.so
-    # Disable kernel dynamic sample rate throttling and lock max_sample_rate to 150000
     sysctl -w kernel.perf_event_max_sample_rate=150000 >/dev/null 2>&1 || true
     sysctl -w kernel.perf_cpu_time_max_percent=0 >/dev/null 2>&1 || true
     sysctl -w kernel.perf_event_paranoid=-1 >/dev/null 2>&1 || true
@@ -170,8 +228,11 @@ elif echo "${KERNEL_VER}" | grep -iq "hybridtier"; then
 
     # Terminate orphan background perf stat process spawned by HybridTier's hook.so
     pkill -f "perf stat -I 60000" 2>/dev/null || true
+# -------------------------------------------------------------------------------
+# Standard In-Kernel Baselines:
+#   TPP, Colloid, Nomad, Memtis, Generic (AutoNUMA)
+# -------------------------------------------------------------------------------
 else
-    # Standard In-Kernel Baselines (TPP, Colloid, Nomad, Memtis, Generic)
     /usr/bin/time -v bash -c "$*"
     STATUS=$?
 fi

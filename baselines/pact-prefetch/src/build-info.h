@@ -1,0 +1,2 @@
+#define PACT_GIT_VERSION "b79e8ae-dirty"
+#define PACT_BUILD_DATE "2026-09-16T10:41:21Z"

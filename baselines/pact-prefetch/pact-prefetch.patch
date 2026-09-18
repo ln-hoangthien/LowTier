@@ -1,0 +1,237 @@
+diff --git a/mm/migrate.c b/mm/migrate.c
+index 9c80597..47628b5 100644
+--- a/mm/migrate.c
++++ b/mm/migrate.c
+@@ -658,6 +658,196 @@ void folio_migrate_copy(struct folio *newfolio, struct folio *folio)
+ }
+ EXPORT_SYMBOL(folio_migrate_copy);
+ 
++/*
++ * PACT Prefetch-Before-Shootdown Migration Optimization
++ *
++ * Prefetch source pages before PTE unmapping and TLB shootdown.
++ * While the page is still mapped and accessible, CPU prefetching brings
++ * source cachelines into CPU cache (L2/L3) from slow tier (e.g. CXL / remote NUMA).
++ * Hardware cache coherency guarantees consistency if the application writes
++ * to the page during this period.
++ *
++ * When TLB shootdown and PTE locking subsequently occur, the destination write
++ * (copy_page via microcode rep movsq) encounters cache hits on reads,
++ * drastically shrinking the stall window in migration_entry_wait().
++ */
++#define PACT_PREFETCH_DEFAULT_BATCH      8
++#define PACT_PREFETCH_DEFAULT_STRIDE     2
++#define PACT_PREFETCH_DEFAULT_HINT       0
++
++static unsigned int pact_prefetch_enabled = 1;
++static unsigned int pact_prefetch_batch_pages = PACT_PREFETCH_DEFAULT_BATCH;
++static unsigned int pact_prefetch_stride = PACT_PREFETCH_DEFAULT_STRIDE;
++static unsigned int pact_prefetch_hint = PACT_PREFETCH_DEFAULT_HINT;
++
++static void pact_prefetch_folio(struct folio *folio)
++{
++	long nr = folio_nr_pages(folio);
++	long i;
++	size_t offset;
++	unsigned int hint = pact_prefetch_hint;
++	size_t stride = pact_prefetch_stride * SMP_CACHE_BYTES;
++
++	if (!stride)
++		stride = SMP_CACHE_BYTES;
++
++	for (i = 0; i < nr; i++) {
++		struct page *page = folio_page(folio, i);
++		char *addr = kmap_local_page(page);
++
++		for (offset = 0; offset < PAGE_SIZE; offset += stride) {
++			switch (hint) {
++			case 0:
++				__builtin_prefetch(addr + offset, 0 /* read */, 0 /* NTA */);
++				break;
++			case 1:
++				__builtin_prefetch(addr + offset, 0, 1 /* L3 */);
++				break;
++			case 2:
++				__builtin_prefetch(addr + offset, 0, 2 /* L2 */);
++				break;
++			case 3:
++			default:
++				__builtin_prefetch(addr + offset, 0, 3 /* L1/L2/L3 */);
++				break;
++			}
++		}
++		kunmap_local(addr);
++	}
++}
++
++static void pact_prefetch_folios(struct list_head *from)
++{
++	struct folio *folio;
++	unsigned int count = 0;
++	unsigned int max_pages = pact_prefetch_batch_pages;
++
++	if (!pact_prefetch_enabled)
++		return;
++
++	list_for_each_entry(folio, from, lru) {
++		pact_prefetch_folio(folio);
++		count += folio_nr_pages(folio);
++		if (max_pages && count >= max_pages)
++			break;
++	}
++}
++
++#ifdef CONFIG_SYSFS
++static ssize_t pact_prefetch_enabled_show(struct kobject *kobj,
++					   struct kobj_attribute *attr, char *buf)
++{
++	return sprintf(buf, "%u\n", pact_prefetch_enabled);
++}
++
++static ssize_t pact_prefetch_enabled_store(struct kobject *kobj,
++					    struct kobj_attribute *attr,
++					    const char *buf, size_t count)
++{
++	unsigned int val;
++	if (kstrtouint(buf, 10, &val))
++		return -EINVAL;
++	pact_prefetch_enabled = val ? 1 : 0;
++	return count;
++}
++static struct kobj_attribute pact_prefetch_enabled_attr =
++	__ATTR(enabled, 0644, pact_prefetch_enabled_show, pact_prefetch_enabled_store);
++
++static ssize_t pact_prefetch_batch_pages_show(struct kobject *kobj,
++					      struct kobj_attribute *attr, char *buf)
++{
++	return sprintf(buf, "%u\n", pact_prefetch_batch_pages);
++}
++
++static ssize_t pact_prefetch_batch_pages_store(struct kobject *kobj,
++					       struct kobj_attribute *attr,
++					       const char *buf, size_t count)
++{
++	unsigned int val;
++	if (kstrtouint(buf, 10, &val))
++		return -EINVAL;
++	if (val < 1 || val > 512)
++		return -EINVAL;
++	pact_prefetch_batch_pages = val;
++	return count;
++}
++static struct kobj_attribute pact_prefetch_batch_pages_attr =
++	__ATTR(batch_pages, 0644, pact_prefetch_batch_pages_show, pact_prefetch_batch_pages_store);
++
++static ssize_t pact_prefetch_stride_show(struct kobject *kobj,
++					 struct kobj_attribute *attr, char *buf)
++{
++	return sprintf(buf, "%u\n", pact_prefetch_stride);
++}
++
++static ssize_t pact_prefetch_stride_store(struct kobject *kobj,
++					  struct kobj_attribute *attr,
++					  const char *buf, size_t count)
++{
++	unsigned int val;
++	if (kstrtouint(buf, 10, &val))
++		return -EINVAL;
++	if (val < 1 || val > 16)
++		return -EINVAL;
++	pact_prefetch_stride = val;
++	return count;
++}
++static struct kobj_attribute pact_prefetch_stride_attr =
++	__ATTR(stride, 0644, pact_prefetch_stride_show, pact_prefetch_stride_store);
++
++static ssize_t pact_prefetch_hint_show(struct kobject *kobj,
++				       struct kobj_attribute *attr, char *buf)
++{
++	return sprintf(buf, "%u\n", pact_prefetch_hint);
++}
++
++static ssize_t pact_prefetch_hint_store(struct kobject *kobj,
++					struct kobj_attribute *attr,
++					const char *buf, size_t count)
++{
++	unsigned int val;
++	if (kstrtouint(buf, 10, &val))
++		return -EINVAL;
++	if (val > 3)
++		return -EINVAL;
++	pact_prefetch_hint = val;
++	return count;
++}
++static struct kobj_attribute pact_prefetch_hint_attr =
++	__ATTR(hint, 0644, pact_prefetch_hint_show, pact_prefetch_hint_store);
++
++static struct attribute *pact_prefetch_attrs[] = {
++	&pact_prefetch_enabled_attr.attr,
++	&pact_prefetch_batch_pages_attr.attr,
++	&pact_prefetch_stride_attr.attr,
++	&pact_prefetch_hint_attr.attr,
++	NULL,
++};
++
++static const struct attribute_group pact_prefetch_attr_group = {
++	.attrs = pact_prefetch_attrs,
++};
++
++static int __init pact_prefetch_sysfs_init(void)
++{
++	struct kobject *kobj;
++	int err;
++
++	kobj = kobject_create_and_add("pact_prefetch", mm_kobj);
++	if (!kobj)
++		return -ENOMEM;
++
++	err = sysfs_create_group(kobj, &pact_prefetch_attr_group);
++	if (err) {
++		kobject_put(kobj);
++		return err;
++	}
++	return 0;
++}
++subsys_initcall(pact_prefetch_sysfs_init);
++#endif
++
++
+ /************************************************************
+  *                    Migration functions
+  ***********************************************************/
+@@ -1436,6 +1626,9 @@ static int unmap_and_move_huge_page(new_page_t get_new_page,
+ 			ttu = TTU_RMAP_LOCKED;
+ 		}
+ 
++		if (pact_prefetch_enabled)
++			pact_prefetch_folio(src);
++
+ 		try_to_migrate(src, ttu);
+ 		page_was_mapped = 1;
+ 
+@@ -1651,6 +1844,10 @@ static int migrate_pages_batch(struct list_head *from, new_page_t get_new_page,
+ 		thp_retry = 0;
+ 		nr_retry_pages = 0;
+ 
++		/* PACT: Prefetch candidate folios before unmapping and TLB shootdown */
++		if (pact_prefetch_enabled && pass == 0)
++			pact_prefetch_folios(from);
++
+ 		list_for_each_entry_safe(folio, folio2, from, lru) {
+ 			/*
+ 			 * Large folio statistics is based on the source large
+@@ -1966,10 +2163,12 @@ again:
+ 		}
+ 
+ 		nr_pages += folio_nr_pages(folio);
+-		if (nr_pages >= NR_MAX_BATCHED_MIGRATION)
++		if (nr_pages >= (pact_prefetch_enabled && pact_prefetch_batch_pages ?
++				 pact_prefetch_batch_pages : NR_MAX_BATCHED_MIGRATION))
+ 			break;
+ 	}
+-	if (nr_pages >= NR_MAX_BATCHED_MIGRATION)
++	if (nr_pages >= (pact_prefetch_enabled && pact_prefetch_batch_pages ?
++			 pact_prefetch_batch_pages : NR_MAX_BATCHED_MIGRATION))
+ 		list_cut_before(&folios, from, &folio2->lru);
+ 	else
+ 		list_splice_init(from, &folios);

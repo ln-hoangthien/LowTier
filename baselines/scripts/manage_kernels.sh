@@ -31,6 +31,7 @@ TPP_DIR="${BASELINES_DIR}/tpp"
 COLLOID_TPP_DIR="${BASELINES_DIR}/colloid-tpp"
 COLLOID_TPP_ALTO_DIR="${BASELINES_DIR}/colloid-tpp-alto"
 PACT_DIR="${BASELINES_DIR}/pact"
+PACT_PREFETCH_DIR="${BASELINES_DIR}/pact-prefetch"
 HYBRIDTIER_DIR="${BASELINES_DIR}/hybridtier"
 
 # Formatting color definitions for terminal output
@@ -42,7 +43,7 @@ export CYAN='\033[0;36m'
 export NC='\033[0m' # No Color
 
 # Baseline kernel target list
-BASELINE_TARGETS=(memtis nomad nomad-noinline nomad-alto nomad-alto-noinline tpp colloid-tpp colloid-tpp-alto pact hybridtier)
+BASELINE_TARGETS=(memtis nomad nomad-noinline nomad-alto nomad-alto-noinline tpp colloid-tpp colloid-tpp-alto pact pact-prefetch hybridtier)
 
 # Target metadata resolver: returns "kdir|fallback_release|display_name"
 get_kernel_meta() {
@@ -57,6 +58,7 @@ get_kernel_meta() {
         colloid|colloid-tpp) echo "${COLLOID_TPP_DIR}/linux|6.3.0-Colloid-TPP|Colloid-tpp" ;;
         colloid-tpp-alto)    echo "${COLLOID_TPP_ALTO_DIR}/linux|6.3.0-Colloid-TPP-Alto|Colloid-tpp-alto" ;;
         pact)                echo "${PACT_DIR}/linux|6.3.0-PACT|PACT" ;;
+        pact-prefetch)       echo "${PACT_PREFETCH_DIR}/linux|6.3.0-PACT-prefetch|PACT-prefetch" ;;
         hybridtier)          echo "${HYBRIDTIER_DIR}/linux|6.2.0-hybridtier+|HybridTier" ;;
         generic)             echo "/boot|generic|Generic" ;;
         *)                   echo "" ;;
@@ -70,17 +72,17 @@ export -f get_kernel_meta
 get_rss() {
     case "$1" in
         # --- GAPBS PageRank (PR) ---
-        gapbs_pr_kron)        echo 18 ;;  # Measured: 17.74 GB
-        gapbs_pr_urand)       echo 18 ;;  # Measured: 18.00 GB
-        gapbs_pr_twitter)     echo 12 ;;  # Measured: 12.32 GB
-        gapbs_pr_web)         echo 16 ;;  # Measured: 15.52 GB
+        gapbs_pr_kron)        echo 18 ;;  # Measured: 17.75 GB
+        gapbs_pr_urand)       echo 18 ;;  # Measured: 18.02 GB
+        gapbs_pr_twitter)     echo 12 ;;  # Measured: 12.34 GB
+        gapbs_pr_web)         echo 16 ;;  # Measured: 15.53 GB
         gapbs_pr_road)        echo 1  ;;  # Measured:  0.97 GB
 
         # --- GAPBS Triangle Counting (TC) ---
-        gapbs_tc_kron)        echo 38 ;;  # Measured: 37.50 GB
+        gapbs_tc_kron)        echo 37 ;;  # Measured: 37.49 GB
         gapbs_tc_urand)       echo 18 ;;  # Measured: 18.00 GB
         gapbs_tc_twitter)     echo 21 ;;  # Measured: 20.72 GB
-        gapbs_tc_web)         echo 29 ;;  # Measured: 29.29 GB
+        gapbs_tc_web)         echo 29 ;;  # Measured: 29.28 GB
         gapbs_tc_road)        echo 1  ;;  # Measured:  0.58 GB
 
         # --- GAPBS Breadth-First Search (BFS) ---
@@ -91,8 +93,8 @@ get_rss() {
         gapbs_bfs_road)       echo 1  ;;  # Measured:  0.98 GB
 
         # --- GAPBS Betweenness Centrality (BC) ---
-        gapbs_bc_kron)        echo 20 ;;  # Measured: 19.47 GB
-        gapbs_bc_urand)       echo 20 ;;  # Measured: 20.01 GB
+        gapbs_bc_kron)        echo 19 ;;  # Measured: 19.46 GB
+        gapbs_bc_urand)       echo 20 ;;  # Measured: 20.00 GB
         gapbs_bc_twitter)     echo 13 ;;  # Measured: 13.08 GB
         gapbs_bc_web)         echo 16 ;;  # Measured: 16.31 GB
         gapbs_bc_road)        echo 1  ;;  # Measured:  1.24 GB
@@ -105,23 +107,80 @@ get_rss() {
         gapbs_cc_road)        echo 1  ;;  # Measured:  0.97 GB
 
         # --- GAPBS Single-Source Shortest Paths (SSSP) ---
-        gapbs_sssp_kron)      echo 34 ;;  # Measured: 33.78 GB
-        gapbs_sssp_urand)     echo 36 ;;  # Measured: 35.82 GB
+        gapbs_sssp_kron)      echo 34 ;;  # Measured: 33.77 GB
+        gapbs_sssp_urand)     echo 36 ;;  # Measured: 35.63 GB
         gapbs_sssp_twitter)   echo 23 ;;  # Measured: 23.45 GB
-        gapbs_sssp_web)       echo 30 ;;  # Measured: 30.14 GB
+        gapbs_sssp_web)       echo 30 ;;  # Measured: 30.13 GB
         gapbs_sssp_road)      echo 1  ;;  # Measured:  1.40 GB
 
         # --- Silo In-Memory OLTP Database ---
-        silo_tpcc)            echo 53 ;;  # Measured:  52.68 GB
-        silo_queue)           echo 57 ;;  # Measured:  57.11 GB
-        silo_bid)             echo 61 ;;  # Measured:  60.99 GB
-        silo_ycsb)            echo 14 ;;  # Measured:  14.10 GB
-        silo_encstress)       echo 12 ;;  # Measured:  12.29 GB
+        silo_tpcc)            echo 18 ;;  # Measured: 17.9 GB
+        silo_queue)           echo 57 ;;  # Measured: 57.13 GB
+        silo_bid)             echo 50 ;;  # Measured: 49.43 GB (range: 48.84 - 52.44 GB)
+        silo_ycsb)            echo 40 ;;  # Measured: 18.00 GB (multi-ratio: 17.29 - 18.92 GB)
+        silo_encstress)       echo 12 ;;  # Measured: 12.25 GB
 
         # --- Microbenchmarks & Other Workloads ---
-        redis)                echo 22 ;;  # Measured:  22.30 GB (4.3M keys @ 8KB payload)
-        xsbench)              echo 18 ;;  # Measured:  18.06 GB
-        stream|stream_hot|stream_phase*) echo 20 ;; # Baseline: 20 GB
+        redis)                echo 26 ;;  # Measured: 26.34 GB (4.3M keys @ 8KB payload)
+        xsbench)              echo 18 ;;  # Measured: 18.06 GB
+        stream|stream_hot|stream_phase*) echo 18 ;; # Measured: 17.88 GB
+
+        # --- SPEC CPU 2026 Rate (r) Benchmarks ---
+        spec2026_706.stockfish_r) echo 20 ;;  # Measured: 19.59 GB
+        spec2026_707.ntest_r)     echo 3  ;;  # Measured:  2.62 GB
+        spec2026_708.sqlite_r)    echo 14 ;;  # Measured: 13.90 GB
+        spec2026_709.cactus_r)    echo 19 ;;  # Measured: 19.41 GB
+        spec2026_710.omnetpp_r)   echo 9  ;;  # Measured:  8.84 GB
+        spec2026_714.cpython_r)   echo 13 ;;  # Measured: 13.25 GB
+        spec2026_721.gcc_r)       echo 15 ;;  # Measured: 14.63 GB
+        spec2026_722.palm_r)      echo 21 ;;  # Measured: 20.65 GB
+        spec2026_723.llvm_r)      echo 26 ;;  # Measured: 26.13 GB
+        spec2026_727.cppcheck_r)  echo 9  ;;  # Measured:  8.99 GB
+        spec2026_729.abc_r)       echo 17 ;;  # Measured: 17.00 GB
+        spec2026_731.astcenc_r)   echo 4  ;;  # Measured:  3.68 GB
+        spec2026_734.vpr_r)       echo 19 ;;  # Measured: 18.82 GB
+        spec2026_735.gem5_r)      echo 14 ;;  # Measured: 14.48 GB
+        spec2026_736.ocio_r)      echo 18 ;;  # Measured: 17.92 GB
+        spec2026_737.gmsh_r)      echo 30 ;;  # Measured: 30.36 GB
+        spec2026_748.flightdm_r)  echo 4  ;;  # Measured:  4.05 GB
+        spec2026_749.fotonik3d_r) echo 20 ;;  # Measured: 20.22 GB
+        spec2026_750.sealcrypto_r) echo 6 ;;  # Measured:  6.03 GB
+        spec2026_753.ns3_r)       echo 10 ;;  # Measured:  9.50 GB
+        spec2026_765.roms_r)      echo 14 ;;  # Measured: 13.63 GB
+        spec2026_766.femflow_r)   echo 4  ;;  # Measured:  3.51 GB
+        spec2026_767.nest_r)      echo 34 ;;  # Measured: 33.88 GB
+        spec2026_772.marian_r)    echo 18 ;;  # Measured: 18.14 GB
+        spec2026_777.zstd_r)      echo 5  ;;  # Measured:  5.24 GB
+        spec2026_782.lbm_r)       echo 19 ;;  # Measured: 19.19 GB
+
+        # --- SPEC CPU 2026 Speed (s) Benchmarks ---
+        spec2026_800.pot3d_s)     echo 3  ;;  # Measured:  2.81 GB
+        spec2026_801.xz_s)        echo 31 ;;  # Measured: 31.49 GB
+        spec2026_803.sph_exa_s)   echo 25 ;;  # Measured: 25.17 GB
+        spec2026_807.ntest_s)     echo 1  ;;  # Measured:  0.10 GB
+        spec2026_809.cactus_s)    echo 5  ;;  # Measured:  5.44 GB
+        spec2026_811.tealeaf_s)   echo 1  ;;  # Measured:  1.13 GB
+        spec2026_816.nab_s)       echo 1  ;;  # Measured:  0.56 GB
+        spec2026_817.flac_s)      echo 1  ;;  # Measured:  0.01 GB
+        spec2026_820.cloverleaf_s) echo 22 ;; # Measured: 22.00 GB
+        spec2026_821.gcc_s)       echo 1  ;;  # Measured:  1.45 GB
+        spec2026_822.palm_s)      echo 23 ;;  # Measured: 22.63 GB
+        spec2026_823.llvm_s)      echo 6  ;;  # Measured:  6.27 GB
+        spec2026_827.cppcheck_s)  echo 1  ;;  # Measured:  1.05 GB
+        spec2026_829.abc_s)       echo 13 ;;  # Measured: 12.71 GB
+        spec2026_834.vpr_s)       echo 3  ;;  # Measured:  3.21 GB
+        spec2026_835.gem5_s)      echo 1  ;;  # Measured:  0.59 GB
+        spec2026_838.diamond_s)   echo 7  ;;  # Measured:  6.54 GB
+        spec2026_846.minizinc_s)  echo 18 ;;  # Measured: 18.00 GB
+        spec2026_849.fotonik3d_s) echo 48 ;;  # Measured: 47.53 GB
+        spec2026_853.ns3_s)       echo 1  ;;  # Measured:  0.31 GB
+        spec2026_854.graph500_s)  echo 35 ;;  # Measured: 35.13 GB
+        spec2026_857.namd_s)      echo 2  ;;  # Measured:  2.40 GB
+        spec2026_865.roms_s)      echo 23 ;;  # Measured: 22.62 GB
+        spec2026_867.nest_s)      echo 23 ;;  # Measured: 22.65 GB
+        spec2026_872.marian_s)    echo 8  ;;  # Measured:  8.24 GB
+        spec2026_881.neutron_s)   echo 49 ;;  # Measured: 49.20 GB
+        spec_mcf|spec_cpu)        echo 18 ;;  # Default SPEC CPU fallback
 
         # --- Fallback Default ---
         *)                    echo 20 ;;  # Default: 20 GB
@@ -177,12 +236,13 @@ show_help() {
     echo "  colloid-tpp       Colloid-tpp kernel baseline (Linux 6.3.0-Colloid-TPP)"
     echo "  colloid-tpp-alto  Colloid-tpp kernel baseline with alto (Linux 6.3.0-Colloid-TPP-Alto)"
     echo "  pact              PACT kernel baseline (Linux 6.3.0-PACT)"
+    echo "  pact-prefetch     PACT with Throttled NTA Prefetch (Linux 6.3.0-PACT-prefetch)"
     echo "  hybridtier        HybridTier kernel baseline (Linux 6.2.0-hybridtier+)"
     echo "  generic           Distro generic kernel"
     echo "  all               All baseline kernels"
     echo ""
     echo "Options:"
-    echo "  -b, --benchmark <name>   Target benchmark (e.g. gapbs_bc_kron, xsbench, stream_hot) for RSS calculation"
+    echo "  -b, --benchmark <name>   Target benchmark (e.g. gapbs_bc_kron, xsbench, spec2026_*) for RSS calculation"
     echo "  -R, --ratio <ratio>      Tier ratio Fast:Slow relative to RSS (e.g. 1:1, 1:2, 1:4, 1:8, 4:1)"
     echo "  --memmap <param>         Explicit Linux memmap parameter (e.g. memmap=118G!10G)"
     echo "  -r, --reboot             Automatically reboot system after completing task"
@@ -227,6 +287,7 @@ clone_tpp() { clone_git_repo "${TPP_DIR}/linux" "TPP" "v5.15" "https://git.kerne
 clone_colloid_tpp() { clone_git_repo "${COLLOID_TPP_DIR}/linux" "Colloid-tpp" "v6.3" "https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git"; }
 clone_colloid_tpp_alto() { clone_git_repo "${COLLOID_TPP_ALTO_DIR}/linux" "Colloid-tpp-alto" "v6.3" "https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git"; }
 clone_pact() { clone_git_repo "${PACT_DIR}/linux" "PACT" "v6.3" "https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git" "${COLLOID_TPP_DIR}/linux"; }
+clone_pact_prefetch() { clone_git_repo "${PACT_PREFETCH_DIR}/linux" "PACT-prefetch" "v6.3" "https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git" "${PACT_DIR}/linux"; }
 clone_hybridtier() { clone_git_repo "${HYBRIDTIER_DIR}/linux" "HybridTier" "v6.2" "https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git" "${COLLOID_TPP_DIR}/linux"; }
 
 
@@ -280,7 +341,10 @@ resolve_kernel_release() {
                 installed=$(ls /boot/vmlinuz-* 2>/dev/null | grep -i "colloid" | grep -i "alto" | head -n 1 | sed 's|/boot/vmlinuz-||' || true)
                 ;;
             pact)
-                installed=$(ls /boot/vmlinuz-* 2>/dev/null | grep -i "pact" | head -n 1 | sed 's|/boot/vmlinuz-||' || true)
+                installed=$(ls /boot/vmlinuz-* 2>/dev/null | grep -i "pact" | grep -iv "prefetch" | head -n 1 | sed 's|/boot/vmlinuz-||' || true)
+                ;;
+            pact-prefetch)
+                installed=$(ls /boot/vmlinuz-* 2>/dev/null | grep -i "pact" | grep -i "prefetch" | head -n 1 | sed 's|/boot/vmlinuz-||' || true)
                 ;;
             hybridtier)
                 installed=$(ls /boot/vmlinuz-* 2>/dev/null | grep -i "hybridtier" | head -n 1 | sed 's|/boot/vmlinuz-||' || true)
@@ -519,6 +583,22 @@ _pact_post_install() {
     fi
 }
 
+_pact_prefetch_post_install() {
+    local kdir="$1"
+    if [ -d "${PACT_PREFETCH_DIR}/tierinit" ]; then
+        echo -e "${CYAN}Building PACT-prefetch tierinit.ko...${NC}"
+        make -C "$kdir" M="${PACT_PREFETCH_DIR}/tierinit" modules || true
+    fi
+    if [ -d "${PACT_PREFETCH_DIR}/kswapdrst" ]; then
+        echo -e "${CYAN}Building PACT-prefetch kswapdrst.ko...${NC}"
+        make -C "$kdir" M="${PACT_PREFETCH_DIR}/kswapdrst" modules || true
+    fi
+    if [ -d "${PACT_PREFETCH_DIR}/src" ]; then
+        echo -e "${CYAN}Building PACT-prefetch user-space runtime daemon...${NC}"
+        make -C "${PACT_PREFETCH_DIR}/src" || true
+    fi
+}
+
 _hybridtier_post_install() {
     local kdir="$1"
     if [ -d "${HYBRIDTIER_DIR}/hook" ]; then
@@ -536,6 +616,7 @@ set_tpp_default() { install_and_set_default "tpp"; }
 set_colloid_tpp_default() { install_and_set_default "colloid-tpp"; }
 set_colloid_tpp_alto_default() { install_and_set_default "colloid-tpp-alto"; }
 set_pact_default() { install_and_set_default "pact" _pact_post_install; }
+set_pact_prefetch_default() { install_and_set_default "pact-prefetch" _pact_prefetch_post_install; }
 set_hybridtier_default() { install_and_set_default "hybridtier" _hybridtier_post_install; }
 
 set_generic_default() {
@@ -576,6 +657,7 @@ compile_tpp() { compile_baseline_kernel "TPP" "${TPP_DIR}" "compile.sh" clone_tp
 compile_colloid_tpp() { compile_baseline_kernel "Colloid-tpp" "${COLLOID_TPP_DIR}" "compile.sh" clone_colloid_tpp; }
 compile_colloid_tpp_alto() { compile_baseline_kernel "Colloid-tpp-alto" "${COLLOID_TPP_ALTO_DIR}" "compile.sh" clone_colloid_tpp_alto; }
 compile_pact() { compile_baseline_kernel "PACT" "${PACT_DIR}" "compile.sh" clone_pact; }
+compile_pact_prefetch() { compile_baseline_kernel "PACT-prefetch" "${PACT_PREFETCH_DIR}" "compile.sh" clone_pact_prefetch; }
 compile_hybridtier() { compile_baseline_kernel "HybridTier" "${HYBRIDTIER_DIR}" "compile.sh" clone_hybridtier; }
 
 # ------------------------------------------------------------------------------
@@ -590,6 +672,7 @@ build_tpp() { compile_tpp && set_tpp_default; }
 build_colloid_tpp() { compile_colloid_tpp && set_colloid_tpp_default; }
 build_colloid_tpp_alto() { compile_colloid_tpp_alto && set_colloid_tpp_alto_default; }
 build_pact() { compile_pact && set_pact_default; }
+build_pact_prefetch() { compile_pact_prefetch && set_pact_prefetch_default; }
 build_hybridtier() { compile_hybridtier && set_hybridtier_default; }
 
 # ------------------------------------------------------------------------------
@@ -667,6 +750,10 @@ _uninstall_target_files() {
         pact)
             echo -e "${YELLOW}Uninstalling PACT kernel from /boot, /lib/modules, and removing source tree...${NC}"
             rm -rf /boot/*PACT* /boot/*pact* /lib/modules/*PACT* /lib/modules/*pact* "${PACT_DIR}/linux" "${PACT_DIR}/log" "${PACT_DIR}/tierinit"/*.ko "${PACT_DIR}/kswapdrst"/*.ko "${PACT_DIR}/src/pact" 2>/dev/null || true
+            ;;
+        pact-prefetch)
+            echo -e "${YELLOW}Uninstalling PACT-prefetch kernel from /boot, /lib/modules, and removing source tree...${NC}"
+            rm -rf /boot/*PACT-prefetch* /boot/*pact-prefetch* /lib/modules/*PACT-prefetch* /lib/modules/*pact-prefetch* "${PACT_PREFETCH_DIR}/linux" "${PACT_PREFETCH_DIR}/log" "${PACT_PREFETCH_DIR}/tierinit"/*.ko "${PACT_PREFETCH_DIR}/kswapdrst"/*.ko "${PACT_PREFETCH_DIR}/src/pact" 2>/dev/null || true
             ;;
         hybridtier)
             echo -e "${YELLOW}Uninstalling HybridTier kernel from /boot, /lib/modules, and removing source tree...${NC}"
@@ -792,7 +879,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
                 ACTION="clean"
                 shift
                 ;;
-            memtis|nomad|nomad-noinline|nomad-alto|nomad_alto|nomad-alto-noinline|nomad_alto_noinline|nomad-noinline-alto|nomad_noinline_alto|tpp|colloid-tpp|colloid_tpp|colloid|colloid-tpp-alto|colloid_tpp_alto|colloid-alto|colloid_alto|pact|hybridtier|generic|distro|default|all)
+            memtis|nomad|nomad-noinline|nomad-alto|nomad_alto|nomad-alto-noinline|nomad_alto_noinline|nomad-noinline-alto|nomad_noinline_alto|tpp|colloid-tpp|colloid_tpp|colloid|colloid-tpp-alto|colloid_tpp_alto|colloid-alto|colloid_alto|pact|pact-prefetch|pact_prefetch|hybridtier|generic|distro|default|all)
                 TARGET="${1,,}" # Convert target name to lowercase
                 if [[ "$TARGET" == "colloid_tpp" || "$TARGET" == "colloid" ]]; then
                     TARGET="colloid-tpp"
@@ -802,6 +889,8 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
                     TARGET="nomad-alto"
                 elif [[ "$TARGET" == "nomad-alto-noinline" || "$TARGET" == "nomad_alto_noinline" || "$TARGET" == "nomad-noinline-alto" || "$TARGET" == "nomad_noinline_alto" ]]; then
                     TARGET="nomad-alto-noinline"
+                elif [[ "$TARGET" == "pact_prefetch" ]]; then
+                    TARGET="pact-prefetch"
                 elif [[ "$TARGET" == "distro" || "$TARGET" == "default" ]]; then
                     TARGET="generic"
                 fi

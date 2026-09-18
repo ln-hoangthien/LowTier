@@ -46,6 +46,15 @@ export REDIS_THREADS="${REDIS_THREADS:-4}"
 export REDIS_TESTS="${REDIS_TESTS:-set,get}"
 export REDIS_EXTRA_ARGS="${REDIS_EXTRA_ARGS:-}"
 
+# Configurable SPEC CPU 2026 execution parameters
+export SPEC2026_DIR="${SPEC2026_DIR:-${WORKLOAD_DIR}/spec2026}"
+export SPEC="${SPEC:-${SPEC2026_DIR}}"
+export SPECPERLLIB="${SPECPERLLIB:-${SPEC2026_DIR}/bin/common:${SPEC2026_DIR}/bin/lib:${SPEC2026_DIR}/bin}"
+export SPEC_CONFIG="${SPEC_CONFIG:-${WORKLOAD_DIR}/scripts/gcc-linux-x86.cfg}"
+export SPEC_COPIES="${SPEC_COPIES:-${WORKLOAD_CORES}}"
+export SPEC_THREADS="${SPEC_THREADS:-${WORKLOAD_CORES}}"
+export SPEC_EXTRA_ARGS="${SPEC_EXTRA_ARGS:-}"
+
 show_help() {
     echo "=========================================================================================="
     echo " Pure Workload Execution Dispatcher"
@@ -81,12 +90,39 @@ show_help() {
     echo "  REDIS_TESTS             Benchmark tests to execute (default: set,get)"
     echo "  REDIS_EXTRA_ARGS        Additional arguments passed to redis-benchmark"
     echo ""
+    echo "Environment Variable Overrides (SPEC CPU 2026):"
+    echo "  SPEC2026_DIR            SPEC installation directory (default: <ROOT_DIR>/workloads/spec2026)"
+    echo "  SPEC_CONFIG             Config file path (default: <ROOT_DIR>/workloads/scripts/gcc-linux-x86.cfg)"
+    echo "  SPEC_COPIES             Number of rate copies (default: WORKLOAD_CORES)"
+    echo "  SPEC_THREADS            Number of threads per copy (default: WORKLOAD_CORES)"
+    echo "  SPEC_EXTRA_ARGS         Additional arguments passed to runcpu (e.g. --fake)"
+    echo ""
     echo "Available Targets:"
     echo "  stream, stream_hot, stream_phase,"
     echo "  gapbs_pr, gapbs_tc, gapbs_bfs, gapbs_bc, gapbs_cc, gapbs_sssp,"
     echo "  (supports composite aliases: gapbs_<algo>_<dataset>, e.g., gapbs_bc_kron),"
     echo "  silo_tpcc, silo_ycsb, silo_queue, silo_bid, silo_encstress,"
-    echo "  redis, xsbench"
+    echo "  redis, xsbench,"
+    echo "  SPECrate®2026 benchmarks:"
+    echo "    spec2026_706.stockfish_r, spec2026_707.ntest_r, spec2026_708.sqlite_r,"
+    echo "    spec2026_709.cactus_r, spec2026_710.omnetpp_r, spec2026_714.cpython_r,"
+    echo "    spec2026_721.gcc_r, spec2026_722.palm_r, spec2026_723.llvm_r,"
+    echo "    spec2026_727.cppcheck_r, spec2026_729.abc_r, spec2026_731.astcenc_r,"
+    echo "    spec2026_734.vpr_r, spec2026_735.gem5_r, spec2026_736.ocio_r,"
+    echo "    spec2026_737.gmsh_r, spec2026_748.flightdm_r, spec2026_749.fotonik3d_r,"
+    echo "    spec2026_750.sealcrypto_r, spec2026_753.ns3_r, spec2026_765.roms_r,"
+    echo "    spec2026_766.femflow_r, spec2026_767.nest_r, spec2026_772.marian_r,"
+    echo "    spec2026_777.zstd_r, spec2026_782.lbm_r, spec2026_999.specrand_r,"
+    echo "  SPECspeed®2026 benchmarks:"
+    echo "    spec2026_800.pot3d_s, spec2026_801.xz_s, spec2026_803.sph_exa_s,"
+    echo "    spec2026_807.ntest_s, spec2026_809.cactus_s, spec2026_811.tealeaf_s,"
+    echo "    spec2026_816.nab_s, spec2026_817.flac_s, spec2026_820.cloverleaf_s,"
+    echo "    spec2026_821.gcc_s, spec2026_822.palm_s, spec2026_823.llvm_s,"
+    echo "    spec2026_827.cppcheck_s, spec2026_829.abc_s, spec2026_834.vpr_s,"
+    echo "    spec2026_835.gem5_s, spec2026_838.diamond_s, spec2026_846.minizinc_s,"
+    echo "    spec2026_849.fotonik3d_s, spec2026_853.ns3_s, spec2026_854.graph500_s,"
+    echo "    spec2026_857.namd_s, spec2026_865.roms_s, spec2026_867.nest_s,"
+    echo "    spec2026_872.marian_s, spec2026_881.neutron_s, spec2026_998.specrand_s"
     echo "=========================================================================================="
     exit 0
 }
@@ -109,6 +145,7 @@ resolve_target_exe() {
         silo_*)         echo "dbtest" ;;
         redis)          echo "redis-server" ;;
         xsbench)        echo "XSBench" ;;
+        spec2026_*)     echo "runcpu" ;;
         *)              echo "" ;;
     esac
 }
@@ -132,6 +169,7 @@ fi
 
 TARGET="$1"
 DATASET_INPUT="${2:-kron}"
+
 
 # Decompose composite GAPBS benchmark alias if present (e.g. gapbs_bc_kron -> gapbs_bc kron)
 if [[ "$TARGET" =~ ^(gapbs_[a-z]+)_(kron|urand|twitter|web|road)$ ]]; then
@@ -175,12 +213,55 @@ resolve_preload_cmd() {
     echo "$pcmd"
 }
 
+check_spec2026() {
+    if [ ! -d "${SPEC2026_DIR}" ]; then
+        echo "==========================================================================================" >&2
+        echo " [WARNING] SPEC CPU 2026 directory not found: ${SPEC2026_DIR}" >&2
+        echo " SPEC CPU 2026 is a proprietary licensed benchmark suite and cannot be distributed" >&2
+        echo " or installed automatically with this repository." >&2
+        echo "" >&2
+        echo " You must obtain SPEC CPU 2026 manually from https://www.spec.org/cpu2026/" >&2
+        echo " and install/place it into:" >&2
+        echo "   ${SPEC2026_DIR}" >&2
+        echo "==========================================================================================" >&2
+        exit 1
+    fi
+    if [ ! -f "${SPEC2026_DIR}/shrc" ] || [ ! -f "${SPEC2026_DIR}/bin/harness/runcpu" ]; then
+        echo "==========================================================================================" >&2
+        echo " [WARNING] SPEC CPU 2026 installation incomplete in: ${SPEC2026_DIR}" >&2
+        echo " Please run './install.sh' inside ${SPEC2026_DIR} to build and install SPEC tools." >&2
+        echo "==========================================================================================" >&2
+        exit 1
+    fi
+    if [ ! -f "${SPEC_CONFIG}" ]; then
+        echo "==========================================================================================" >&2
+        echo " [WARNING] SPEC CPU 2026 configuration file not found: ${SPEC_CONFIG}" >&2
+        echo " Default configuration is located at: ${WORKLOAD_DIR}/scripts/gcc-linux-x86.cfg" >&2
+        echo "==========================================================================================" >&2
+        exit 1
+    fi
+}
+
 resolve_cmd() {
     local t="$1"
     local ds="$2"
     local graph_file=""
     local cmd=""
     local RUN_PREFIX="env OMP_NUM_THREADS=${OMP_NUM_THREADS} numactl --physcpubind=${SELECTED_CPUS}"
+    local r_tag="${RATIO_TAG:-default}"
+    local spec_kernel="${KERNEL_VER:-$(uname -r)}"
+    local SPEC_OUT_ROOT="${TARGET_DIR:-${WORKLOAD_DIR}/output/${spec_kernel}}/spec2026"
+    mkdir -p "${SPEC_OUT_ROOT}"
+
+    local spec_out_args=""
+    if [[ "${SPEC_EXTRA_ARGS:-}" != *"--output_root"* ]]; then
+        spec_out_args+=" --output_root=${SPEC_OUT_ROOT}"
+    fi
+    if [[ "${SPEC_EXTRA_ARGS:-}" != *"--expid"* ]]; then
+        spec_out_args+=" --expid=${r_tag}"
+    fi
+
+    local SPEC_BASE_CMD="${RUN_PREFIX} ${SPEC2026_DIR}/bin/runcpu --config=${SPEC_CONFIG} --copies=${SPEC_COPIES} --threads=${SPEC_THREADS} --size=ref${spec_out_args}"
 
     if [[ "$t" == gapbs_* ]]; then
         graph_file=$(resolve_graph_file "$t" "$ds")
@@ -248,6 +329,15 @@ resolve_cmd() {
             ;;
         xsbench)
             cmd="${RUN_PREFIX} ${WORKLOAD_DIR}/xsbench/openmp-threading/XSBench -g 37000 -p 5000000"
+            ;;
+        spec2026_*)
+            check_spec2026
+            local bname="${t#spec2026_}"
+            if [ ! -d "${SPEC2026_DIR}/benchspec/CPU/${bname}" ]; then
+                echo "Error: Unknown SPEC CPU 2026 benchmark '$bname'" >&2
+                exit 1
+            fi
+            cmd="${SPEC_BASE_CMD} ${bname}${SPEC_EXTRA_ARGS:+ $SPEC_EXTRA_ARGS}"
             ;;
         *)
             echo "Error: Unknown target '$t'" >&2

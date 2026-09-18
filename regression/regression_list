@@ -15,54 +15,130 @@ TIER_RATIOS=(
 
 # Benchmarks to evaluate
 BENCHMARKS=(
+    ## -----------------------------
+    ## GAPBS
+    ## -----------------------------
     gapbs_pr_kron
     gapbs_pr_urand
     gapbs_pr_twitter
-    gapbs_pr_web
+    #gapbs_pr_web
     #gapbs_pr_road
     gapbs_tc_kron
     gapbs_tc_urand
     gapbs_tc_twitter
-    gapbs_tc_web
-    #gapbs_tc_road
-    gapbs_bfs_kron
-    gapbs_bfs_urand
-    gapbs_bfs_twitter
-    gapbs_bfs_web
-    #gapbs_bfs_road
+    #gapbs_tc_web
+    ##gapbs_tc_road
+    #gapbs_bfs_kron
+    #gapbs_bfs_urand
+    #gapbs_bfs_twitter
+    #gapbs_bfs_web
+    ##gapbs_bfs_road
     gapbs_bc_kron
     gapbs_bc_urand
     gapbs_bc_twitter
-    gapbs_bc_web
+    #gapbs_bc_web
     #gapbs_bc_road
     gapbs_cc_kron
     gapbs_cc_urand
     gapbs_cc_twitter
-    gapbs_cc_web
+    #gapbs_cc_web
     #gapbs_cc_road
-    gapbs_sssp_kron
-    gapbs_sssp_urand
-    gapbs_sssp_twitter
-    gapbs_sssp_web
+    #gapbs_sssp_kron
+    #gapbs_sssp_urand
+    #gapbs_sssp_twitter
+    #gapbs_sssp_web
     ##gapbs_sssp_road
+    ## -----------------------------
+
+    ## -----------------------------
+    ## Silo
+    ## -----------------------------
     silo_tpcc
     silo_ycsb
-    #silo_queue
-    silo_bid
-    silo_encstress
+    ##silo_queue
+    ##silo_bid
+    ##silo_encstress
+    ## -----------------------------
+
+    ## -----------------------------
+    ## Redis
+    ## -----------------------------
     redis
+    ## -----------------------------
+
+    ## -----------------------------
+    ## XSBench
+    ## -----------------------------
     xsbench
+    ## -----------------------------
+
+    # -----------------------------
+    # SPEC CPU 2026
+    # -----------------------------
+    #spec2026_706.stockfish_r
+    #spec2026_707.ntest_r
+    spec2026_708.sqlite_r
+    #spec2026_709.cactus_r
+    #spec2026_710.omnetpp_r
+    #spec2026_714.cpython_r
+    #spec2026_721.gcc_r
+    #spec2026_722.palm_r
+    #spec2026_723.llvm_r
+    #spec2026_727.cppcheck_r
+    #spec2026_729.abc_r
+    #spec2026_731.astcenc_r
+    #spec2026_734.vpr_r
+    #spec2026_735.gem5_r
+    #spec2026_736.ocio_r
+    #spec2026_737.gmsh_r
+    #spec2026_748.flightdm_r
+    #spec2026_749.fotonik3d_r
+    #spec2026_750.sealcrypto_r
+    #spec2026_753.ns3_r
+    #spec2026_765.roms_r
+    #spec2026_766.femflow_r
+    #spec2026_767.nest_r
+    #spec2026_772.marian_r
+    #spec2026_777.zstd_r
+    #spec2026_782.lbm_r
+    #spec2026_800.pot3d_s
+    #spec2026_801.xz_s
+    #spec2026_803.sph_exa_s
+    #spec2026_807.ntest_s
+    #spec2026_809.cactus_s
+    #spec2026_811.tealeaf_s
+    #spec2026_816.nab_s
+    #spec2026_817.flac_s
+    spec2026_820.cloverleaf_s
+    #spec2026_821.gcc_s
+    #spec2026_822.palm_s
+    #spec2026_823.llvm_s
+    #spec2026_827.cppcheck_s
+    #spec2026_829.abc_s
+    #spec2026_834.vpr_s
+    #spec2026_835.gem5_s
+    #spec2026_838.diamond_s
+    #spec2026_846.minizinc_s
+    #spec2026_849.fotonik3d_s
+    #spec2026_853.ns3_s
+    #spec2026_854.graph500_s
+    #spec2026_857.namd_s
+    spec2026_865.roms_s
+    #spec2026_867.nest_s
+    #spec2026_872.marian_s
+    spec2026_881.neutron_s
+    # -----------------------------
 )
 
 # Baseline kernels to evaluate
 KERNELS=(
-    #pact
+    pact
     hybridtier
     generic
     colloid-tpp
-    #colloid-tpp-alto
-    #memtis
-    #nomad
-    #nomad-alto
-    #tpp
+    colloid-tpp-alto
+    memtis
+    nomad
+    nomad-alto
+    tpp
 )

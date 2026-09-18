@@ -76,6 +76,6 @@ echo -e "  ${GREEN}run_auto_regression.sh [start|status]${NC}   : Orchestrate mu
 echo -e "  ${GREEN}run_bpftrace.sh [alias|all]${NC}             : Profile do_numa_page() latency while running workload"
 echo -e "  ${GREEN}setup_workloads.sh [target]${NC}             : Setup & compile baseline workloads"
 echo -e "  ${GREEN}manage_kernels.sh [target]${NC}              : Build, install & set GRUB default kernels (auto-elevates)"
-echo -e "  ${GREEN}calc_overhead.sh [kernel|all]${NC}          : Parse regression logs and calculate handler overhead %"
+echo -e "  ${GREEN}calc_overhead.py [kernel|all]${NC}           : Parse regression logs and calculate handler overhead %"
 echo -e "  ${GREEN}clean_path${NC}                              : Clean duplicate entries from \$PATH"
 echo -e "${BLUE}================================================================================${NC}\n"
