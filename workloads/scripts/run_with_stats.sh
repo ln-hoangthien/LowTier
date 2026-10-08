@@ -15,9 +15,16 @@ ROOT_DIR="${ROOT_DIR:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
 
 # Function to dynamically calculate Node 1 (slow memory) used memory in MB
 get_node1_used_mb() {
-    if [ -f /sys/devices/system/node/node1/meminfo ]; then
-        local used_kb=$(awk '/MemUsed:/ {print $4; exit}' /sys/devices/system/node/node1/meminfo 2>/dev/null)
-        [ -n "$used_kb" ] && { echo $(( used_kb / 1024 )); return; }
+    local meminfo="/sys/devices/system/node/node1/meminfo"
+    if [ -f "$meminfo" ]; then
+        local used_mb
+        used_mb=$(awk '
+            /MemUsed:/  {u=$4; exit}
+            /MemTotal:/ {t=$4}
+            /MemFree:/  {f=$4}
+            END {if (u) print int(u/1024); else if (t && f) print int((t-f)/1024); else print 0}
+        ' "$meminfo" 2>/dev/null)
+        [ -n "$used_mb" ] && [ "$used_mb" -gt 0 ] && { echo "$used_mb"; return; }
     fi
     local n1_size n1_free
     n1_size=$(numactl -H 2>/dev/null | awk '/node 1 size:/ {print $4; exit}')
@@ -32,7 +39,7 @@ if [ "$SETTLE_SLEEP" -gt 0 ]; then
     sleep "${SETTLE_SLEEP}"
 fi
 
-# Helpers to read /proc/vmstat and /proc/perfnomad in a single in-memory pass
+# Helpers: read /proc/vmstat in a single in-memory pass
 read_vmstat() {
     local -n _arr=$1
     if [ -f /proc/vmstat ]; then
@@ -42,6 +49,7 @@ read_vmstat() {
     fi
 }
 
+# Helpers: read /proc/perfnomad in a single in-memory pass
 read_perfnomad() {
     local -n _arr=$1
     if [ -f /proc/perfnomad ]; then
@@ -51,6 +59,7 @@ read_perfnomad() {
     fi
 }
 
+# Helpers: read PMI
 get_pmi_count() {
     awk '/^[[:space:]]*PMI:/ {s=0; for(i=2;i<=NF;i++) s+=$i; print s; exit}' /proc/interrupts 2>/dev/null || echo 0
 }
@@ -89,10 +98,15 @@ START_TIME=$(date +%s)
 # PACT autotie:
 #   Launch workload in background, record target PID, and attach PACT daemon
 # -------------------------------------------------------------------------------
-if echo "${KERNEL_VER}" | grep -iq "pact"; then
+if [[ "${KERNEL_VER,,}" =~ pact ]]; then
     PACT_BIN="${ROOT_DIR}/baselines/pact/src/pact"
-    echo "${KERNEL_VER}" | grep -iq "prefetch" && [ -x "${ROOT_DIR}/baselines/pact-prefetch/src/pact" ] && PACT_BIN="${ROOT_DIR}/baselines/pact-prefetch/src/pact"
-    [ ! -x "${PACT_BIN}" ] && PACT_BIN=$(ls -d ${ROOT_DIR}/baselines/pact*/src/pact 2>/dev/null | head -n 1 || true)
+    if [[ "${KERNEL_VER,,}" =~ prefetch.*batch ]] && [ -x "${ROOT_DIR}/baselines/pact-prefetch-batch/src/pact" ]; then
+        PACT_BIN="${ROOT_DIR}/baselines/pact-prefetch-batch/src/pact"
+    elif [[ "${KERNEL_VER,,}" =~ prefetch ]] && [ -x "${ROOT_DIR}/baselines/pact-prefetch/src/pact" ]; then
+        PACT_BIN="${ROOT_DIR}/baselines/pact-prefetch/src/pact"
+    fi
+    [ ! -x "${PACT_BIN}" ] && PACT_BIN=$(ls -d "${ROOT_DIR}"/baselines/pact*/src/pact 2>/dev/null | head -n 1 || true)
+    PACT_ACTUAL_PID_FILE="/tmp/pact_actual_pid_$$"
 
     # Launch workload under GNU time
     /usr/bin/time -v bash -c "exec $*" &
@@ -171,9 +185,9 @@ if echo "${KERNEL_VER}" | grep -iq "pact"; then
             if [ -n "${TARGET_PID}" ] && kill -0 "${TARGET_PID}" 2>/dev/null; then
                 echo "[+] PACT autotie active: Attaching PACT daemon (PID ${TARGET_PID})..."
                 # By default the "m = 0", we should set m = 1GB (--demotion-margin 250000) to active the Eager Demotion.
-                "${PACT_BIN}" --workload "${TARGET_PID}" --demotion-margin 250000 > "${PACT_LOG_FILE}" 2>&1 &
+                "${PACT_BIN}" --workload "${TARGET_PID}" --demotion-margin 250000 --log-level 3 > "${PACT_LOG_FILE}" 2>&1 &
                 ACTUAL_PACT_PID=$!
-                echo "${ACTUAL_PACT_PID}" > /tmp/pact_actual_pid
+                echo "${ACTUAL_PACT_PID}" > "${PACT_ACTUAL_PID_FILE}"
                 wait "${ACTUAL_PACT_PID}"
             fi
         ) &
@@ -187,31 +201,31 @@ if echo "${KERNEL_VER}" | grep -iq "pact"; then
     # ---------------------------------------------------------------------------------------------------
     # AutoTie-Completion: Terminate PACT daemon once workload completes
     # ---------------------------------------------------------------------------------------------------
-    ACTUAL_PACT_PID=$(cat /tmp/pact_actual_pid 2>/dev/null || true)
-    TARGET_KILL_PID="${ACTUAL_PACT_PID:-${PACT_PID}}"
-    if [ -n "${TARGET_KILL_PID}" ] && kill -0 "${TARGET_KILL_PID}" 2>/dev/null; then
-        echo "[*] Waiting for PACT daemon (PID ${TARGET_KILL_PID}) to finalize..."
+    ACTUAL_PACT_PID=$(cat "${PACT_ACTUAL_PID_FILE}" 2>/dev/null || true)
+    if [ -n "${ACTUAL_PACT_PID}" ] && kill -0 "${ACTUAL_PACT_PID}" 2>/dev/null; then
+        echo "[*] Waiting for PACT daemon (PID ${ACTUAL_PACT_PID}) to finalize..."
         for i in {1..20}; do
-            kill -0 "${TARGET_KILL_PID}" 2>/dev/null || break
+            kill -0 "${ACTUAL_PACT_PID}" 2>/dev/null || break
             sleep 0.1
         done
-        if kill -0 "${TARGET_KILL_PID}" 2>/dev/null; then
-            kill -INT "${TARGET_KILL_PID}" 2>/dev/null || true
+        if kill -0 "${ACTUAL_PACT_PID}" 2>/dev/null; then
+            kill -INT "${ACTUAL_PACT_PID}" 2>/dev/null || true
             sleep 0.5
         fi
-        if kill -0 "${TARGET_KILL_PID}" 2>/dev/null; then
-            kill -9 "${TARGET_KILL_PID}" 2>/dev/null || true
+        if kill -0 "${ACTUAL_PACT_PID}" 2>/dev/null; then
+            kill -9 "${ACTUAL_PACT_PID}" 2>/dev/null || true
         fi
     fi
     kill -9 "${PACT_PID}" 2>/dev/null || true
-    rm -f /tmp/pact_actual_pid
+    wait "${PACT_PID}" 2>/dev/null || true
+    rm -f "${PACT_ACTUAL_PID_FILE}"
 
 # -------------------------------------------------------------------------------
 # HybridTier autotie:
 #   In-process PEBS monitoring thread via LD_PRELOAD hook.so
 #   Disable kernel dynamic sample rate throttling and lock max_sample_rate to 150000
 # -------------------------------------------------------------------------------
-elif echo "${KERNEL_VER}" | grep -iq "hybridtier"; then
+elif [[ "${KERNEL_VER,,}" =~ hybridtier ]]; then
     sysctl -w kernel.perf_event_max_sample_rate=150000 >/dev/null 2>&1 || true
     sysctl -w kernel.perf_cpu_time_max_percent=0 >/dev/null 2>&1 || true
     sysctl -w kernel.perf_event_paranoid=-1 >/dev/null 2>&1 || true
@@ -222,7 +236,7 @@ elif echo "${KERNEL_VER}" | grep -iq "hybridtier"; then
     if [ -f "${HYBRID_HOOK}" ]; then
         /usr/bin/time -v env LD_PRELOAD="${HYBRID_HOOK}${LD_PRELOAD:+:$LD_PRELOAD}" TARGET_EXE_NAME="${TARGET_EXE_NAME}" bash -c "$*"
     else
-        /usr/bin/time -v bash -c "$*"
+        /usr/bin/time -v bash -c "exec $*"
     fi
     STATUS=$?
 
@@ -233,7 +247,7 @@ elif echo "${KERNEL_VER}" | grep -iq "hybridtier"; then
 #   TPP, Colloid, Nomad, Memtis, Generic (AutoNUMA)
 # -------------------------------------------------------------------------------
 else
-    /usr/bin/time -v bash -c "$*"
+    /usr/bin/time -v bash -c "exec $*"
     STATUS=$?
 fi
 
@@ -298,7 +312,9 @@ DELTA_MEMTIS_ALLOC_NVM=$(vm_delta "htmm_alloc_nvm")
 DELTA_PMI=$(( PMI_AFTER > PMI_BEFORE ? PMI_AFTER - PMI_BEFORE : 0 ))
 DELTA_NODE1=$(( NODE1_AFTER > NODE1_BEFORE ? NODE1_AFTER - NODE1_BEFORE : 0 ))
 
-DEM_BW=$(awk "BEGIN {printf \"%.2f MB/s\", $DELTA_NODE1 / $WORKLOAD_RUNTIME}")
+TOTAL_DEM_PAGES=$(( DELTA_DEM_KSWAPD + DELTA_DEM_DIRECT ))
+[ "$TOTAL_DEM_PAGES" -eq 0 ] && TOTAL_DEM_PAGES=$(( DELTA_DEM_PAGE_ANON + DELTA_DEM_PAGE_FILE ))
+DEM_BW=$(pages_to_bw "$TOTAL_DEM_PAGES")
 ALLOC_GB=$(pages_to_gb "$DELTA_PGALLOC")
 ALLOC_BW=$(pages_to_bw "$DELTA_PGALLOC")
 HIT_GB=$(pages_to_gb "$DELTA_NUMA_HIT")
@@ -330,95 +346,115 @@ if [ $DELTA_MIG_FAIL -gt 0 ]; then
 fi
 echo "=========================================================="
 
-# 8. Print Kernel-Specific Tiering & Migration Performance Report
-if [ -f /proc/perfnomad ] || echo "$(uname -r)" | grep -iq "nomad"; then
-    DELTA_TRY=$(pn_delta "try_to_promote_nr")
-    DELTA_SUCCESS=$(pn_delta "success_nr")
-    DELTA_RETRY=$(pn_delta "retry_nr")
-    DELTA_TX_SUCC=$(pn_delta "transactional_success_nr")
-    DELTA_TX_FAIL=$(pn_delta "transactional_fail_nr")
-    DELTA_RETREAT=$(pn_delta "retreated_page_nr")
+print_nomad_summary() {
+    local cmd="$*"
+    local delta_try delta_success delta_retry delta_tx_succ delta_tx_fail delta_retreat delta_total
+    delta_try=$(pn_delta "try_to_promote_nr")
+    delta_success=$(pn_delta "success_nr")
+    delta_retry=$(pn_delta "retry_nr")
+    delta_tx_succ=$(pn_delta "transactional_success_nr")
+    delta_tx_fail=$(pn_delta "transactional_fail_nr")
+    delta_retreat=$(pn_delta "retreated_page_nr")
+    delta_total=$((delta_success + delta_retry))
 
-    DELTA_TOTAL=$((DELTA_SUCCESS + DELTA_RETRY))
-    PROM_MB=$(pages_to_mb "$DELTA_SUCCESS")
-    PROM_BW=$(pages_to_bw "$DELTA_SUCCESS")
+    local prom_mb prom_bw abort_rate
+    prom_mb=$(pages_to_mb "$delta_success")
+    prom_bw=$(pages_to_bw "$delta_success")
 
-    if [ $DELTA_TOTAL -gt 0 ]; then
-        ABORT_RATE=$(awk "BEGIN {printf \"%.2f%%\", ($DELTA_RETRY / $DELTA_TOTAL) * 100}")
+    if [ "$delta_total" -gt 0 ]; then
+        abort_rate=$(awk "BEGIN {printf \"%.2f%%\", ($delta_retry / $delta_total) * 100}")
     else
-        ABORT_RATE="0.00%"
+        abort_rate="0.00%"
     fi
 
     echo ""
     echo "=========================================================================================="
     echo "                   NOMAD APPLICATION-WIDE PERFORMANCE REPORT                              "
     echo "=========================================================================================="
-    echo " Executed Command          : $@"
+    echo " Executed Command          : ${cmd}"
     echo " Application Runtime       : ${WORKLOAD_RUNTIME} seconds"
     echo " Timestamp                 : $(date +%H:%M:%S)"
     echo "------------------------------------------------------------------------------------------"
-    echo " Total Promotion Candidates (try_nr)      : ${DELTA_TRY}"
-    echo " Successful Async Promotions (success_nr) : ${DELTA_SUCCESS} (${PROM_MB} MB Promoted)"
-    echo " Retried/Aborted Promotions (retry_nr)    : ${DELTA_RETRY}"
-    echo " Transactional Promotions Succeeded       : ${DELTA_TX_SUCC}"
-    echo " Transactional Promotions Failed          : ${DELTA_TX_FAIL}"
-    echo " Retreated Inactive Pages                 : ${DELTA_RETREAT}"
-    echo " Average Promotion Bandwidth              : ${PROM_BW}"
+    echo " Total Promotion Candidates (try_nr)      : ${delta_try}"
+    echo " Successful Async Promotions (success_nr) : ${delta_success} (${prom_mb} MB Promoted)"
+    echo " Retried/Aborted Promotions (retry_nr)    : ${delta_retry}"
+    echo " Transactional Promotions Succeeded       : ${delta_tx_succ}"
+    echo " Transactional Promotions Failed          : ${delta_tx_fail}"
+    echo " Retreated Inactive Pages                 : ${delta_retreat}"
+    echo " Average Promotion Bandwidth              : ${prom_bw}"
     echo " Average Demotion Bandwidth               : ${DEM_BW}"
-    echo " Overall Application Abortion Rate        : ${ABORT_RATE}"
+    echo " Overall Application Abortion Rate        : ${abort_rate}"
     echo " Slow Tier Node 1 Used Memory             : ${NODE1_AFTER} MB (Growth: +${DELTA_NODE1} MB)"
     echo "=========================================================================================="
-elif [ $DELTA_MEMTIS_PROM -gt 0 ] || [ $DELTA_MEMTIS_DEM -gt 0 ] || echo "$(uname -r)" | grep -iqE "memtis|htmm"; then
-    # Memtis / HTMM Performance Report
-    MEMTIS_PROM_MB=$(pages_to_mb "$DELTA_MEMTIS_PROM")
-    MEMTIS_PROM_BW=$(pages_to_bw "$DELTA_MEMTIS_PROM")
-    MEMTIS_DEM_MB=$(pages_to_mb "$DELTA_MEMTIS_DEM")
-    MEMTIS_DEM_BW=$(pages_to_bw "$DELTA_MEMTIS_DEM")
+}
+
+print_memtis_summary() {
+    local cmd="$*"
+    local prom_mb prom_bw dem_mb dem_bw
+    prom_mb=$(pages_to_mb "$DELTA_MEMTIS_PROM")
+    prom_bw=$(pages_to_bw "$DELTA_MEMTIS_PROM")
+    dem_mb=$(pages_to_mb "$DELTA_MEMTIS_DEM")
+    dem_bw=$(pages_to_bw "$DELTA_MEMTIS_DEM")
 
     echo ""
     echo "=========================================================================================="
     echo "                   MEMTIS (HTMM) APPLICATION-WIDE PERFORMANCE REPORT                     "
     echo "=========================================================================================="
-    echo " Executed Command          : $@"
+    echo " Executed Command          : ${cmd}"
     echo " Application Runtime       : ${WORKLOAD_RUNTIME} seconds"
     echo " Timestamp                 : $(date +%H:%M:%S)"
     echo "------------------------------------------------------------------------------------------"
-    echo " Promoted Pages (htmm_nr_promoted)   : ${DELTA_MEMTIS_PROM} (${MEMTIS_PROM_MB} MB Promoted)"
-    echo " Demoted Pages (htmm_nr_demoted)     : ${DELTA_MEMTIS_DEM} (${MEMTIS_DEM_MB} MB Demoted)"
+    echo " Promoted Pages (htmm_nr_promoted)   : ${DELTA_MEMTIS_PROM} (${prom_mb} MB Promoted)"
+    echo " Demoted Pages (htmm_nr_demoted)     : ${DELTA_MEMTIS_DEM} (${dem_mb} MB Demoted)"
     echo " Direct DRAM Allocations             : ${DELTA_MEMTIS_ALLOC_DRAM}"
     echo " Direct NVM / Slow Allocations       : ${DELTA_MEMTIS_ALLOC_NVM}"
-    echo " Average Promotion Bandwidth         : ${MEMTIS_PROM_BW}"
-    echo " Average Demotion Bandwidth          : ${MEMTIS_DEM_BW}"
+    echo " Average Promotion Bandwidth         : ${prom_bw}"
+    echo " Average Demotion Bandwidth          : ${dem_bw}"
     echo " Slow Tier Node 1 Used Memory        : ${NODE1_AFTER} MB (Growth: +${DELTA_NODE1} MB)"
     echo "=========================================================================================="
-elif [ $DELTA_PROM_PAGE -gt 0 ] || [ $DELTA_MIG_SUCC -gt 0 ]; then
-    # Upstream TPP / Generic Tiering Summary
-    PROM_PAGES=$(( DELTA_PROM_PAGE > 0 ? DELTA_PROM_PAGE : DELTA_MIG_SUCC ))
-    PROM_MB=$(pages_to_mb "$PROM_PAGES")
-    PROM_BW=$(pages_to_bw "$PROM_PAGES")
+}
+
+print_tiered_migration_summary() {
+    local cmd="$*"
+    local prom_pages=$(( DELTA_PROM_PAGE > 0 ? DELTA_PROM_PAGE : DELTA_MIG_SUCC ))
+    local prom_mb prom_bw
+    prom_mb=$(pages_to_mb "$prom_pages")
+    prom_bw=$(pages_to_bw "$prom_pages")
 
     echo ""
     echo "=========================================================================================="
     echo "                 TIERED MEMORY MIGRATION & BANDWIDTH SUMMARY                              "
     echo "=========================================================================================="
-    echo " Executed Command          : $@"
+    echo " Executed Command          : ${cmd}"
     echo " Application Runtime       : ${WORKLOAD_RUNTIME} seconds"
     echo " Timestamp                 : $(date +%H:%M:%S)"
     echo "------------------------------------------------------------------------------------------"
-    if [ $DELTA_PROM_CAND -gt 0 ]; then
+    if [ "$DELTA_PROM_CAND" -gt 0 ]; then
         echo " Promotion Candidates (pgpromote_cand)    : ${DELTA_PROM_CAND}"
     fi
-    echo " Promoted Memory Volume                   : ${PROM_MB} MB (${PROM_PAGES} pages)"
-    if [ $DELTA_DEM_PAGE_ANON -gt 0 ] || [ $DELTA_DEM_PAGE_FILE -gt 0 ]; then
+    echo " Promoted Memory Volume                   : ${prom_mb} MB (${prom_pages} pages)"
+    if [ "${TOTAL_DEM_PAGES:-0}" -gt 0 ]; then
+        echo " Demoted Memory Volume                    : $(pages_to_mb "$TOTAL_DEM_PAGES") MB (${TOTAL_DEM_PAGES} pages)"
+    fi
+    if [ "$DELTA_DEM_PAGE_ANON" -gt 0 ] || [ "$DELTA_DEM_PAGE_FILE" -gt 0 ]; then
         echo " Demoted Pages (anon / file)              : ${DELTA_DEM_PAGE_ANON} anon / ${DELTA_DEM_PAGE_FILE} file"
     fi
-    if [ $DELTA_DEM_KSWAPD -gt 0 ] || [ $DELTA_DEM_DIRECT -gt 0 ]; then
+    if [ "$DELTA_DEM_KSWAPD" -gt 0 ] || [ "$DELTA_DEM_DIRECT" -gt 0 ]; then
         echo " Demoted By (kswapd / direct)             : ${DELTA_DEM_KSWAPD} kswapd / ${DELTA_DEM_DIRECT} direct"
     fi
-    echo " Average Promotion Bandwidth              : ${PROM_BW}"
+    echo " Average Promotion Bandwidth              : ${prom_bw}"
     echo " Average Demotion Bandwidth               : ${DEM_BW}"
     echo " Slow Tier Node 1 Used Memory             : ${NODE1_AFTER} MB (Growth: +${DELTA_NODE1} MB)"
     echo "=========================================================================================="
+}
+
+# 8. Print Kernel-Specific Tiering & Migration Performance Report
+if [ -f /proc/perfnomad ] || [[ "${KERNEL_VER,,}" =~ nomad ]]; then
+    print_nomad_summary "$@"
+elif [ "$DELTA_MEMTIS_PROM" -gt 0 ] || [ "$DELTA_MEMTIS_DEM" -gt 0 ] || [[ "${KERNEL_VER,,}" =~ memtis|htmm ]]; then
+    print_memtis_summary "$@"
+elif [ "$DELTA_PROM_PAGE" -gt 0 ] || [ "$DELTA_MIG_SUCC" -gt 0 ]; then
+    print_tiered_migration_summary "$@"
 fi
 echo ""
 

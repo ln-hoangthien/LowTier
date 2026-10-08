@@ -82,6 +82,8 @@ static const pmu_platform_t platform_skx = {
     .name = "Skylake-X",
     .event_llc_miss_local = 0x01d3,
     .event_llc_miss_remote = 0x02d3,
+    .event_offcore_outstanding = 0x1060, /* OFFCORE_REQUESTS_OUTSTANDING.L3_MISS_DEMAND_DATA_RD */
+    .event_offcore_requests = 0x10b0,    /* OFFCORE_REQUESTS.L3_MISS_DEMAND_DATA_RD */
     .nr_cha_mapping = 10,
     .cha_to_core_map = skx_cha_to_core_map,
     .core_to_tid = skx_core_to_tid,
@@ -89,6 +91,7 @@ static const pmu_platform_t platform_skx = {
         {
             {0x2136, 0x2136},               /* [TOR_OCC][local], [TOR_OCC][remote] */
             {0x0100211fULL, 0x0100211fULL}, /* [TOR_CYC][local], [TOR_CYC][remote] */
+            {0x2135, 0x2135},               /* [TOR_INS][local], [TOR_INS][remote] */
         },
     .config1_base =
         {
@@ -120,6 +123,8 @@ static const pmu_platform_t platform_emr = {
     .name = "Sapphire/Emerald Rapids",
     .event_llc_miss_local = 0x01d3,
     .event_llc_miss_remote = 0x02d3,
+    .event_offcore_outstanding = 0x1020, /* OFFCORE_REQUESTS_OUTSTANDING.L3_MISS_DEMAND_DATA_RD */
+    .event_offcore_requests = 0x1021,    /* OFFCORE_REQUESTS.L3_MISS_DEMAND_DATA_RD */
     .nr_cha_mapping = 32,
     .cha_to_core_map = emr_cha_to_core_map,
     .core_to_tid = emr_core_to_tid,
@@ -129,6 +134,8 @@ static const pmu_platform_t platform_emr = {
             {0x00c816fe00000136ULL, 0x00c8177e00000136ULL},
             /* [TOR_CYC][local], [TOR_CYC][remote] — cycles with >=1 outstanding. */
             {0x00c816fe0100011fULL, 0x00c8177e0100011fULL},
+            /* [TOR_INS][local], [TOR_INS][remote] — inserts with DRD opcode in ext umask. */
+            {0x00c816fe00000135ULL, 0x00c8177e00000135ULL},
         },
     .config1_base = {0, 0}, /* opcode is in config ext umask, not config1 */
     .tid_en_bit = (1ULL << 16),
@@ -169,6 +176,10 @@ int pmu_platform_init(void)
         (event_config_t){g_pmu_platform.event_llc_miss_local, "LLC_MISS_FAST"};
     core_event_configs[CORE_EVENT_LLC_MISS_SLOW] =
         (event_config_t){g_pmu_platform.event_llc_miss_remote, "LLC_MISS_SLOW"};
+    core_event_configs[CORE_EVENT_OFFCORE_OUTSTANDING] =
+        (event_config_t){g_pmu_platform.event_offcore_outstanding, "OFFCORE_OUTSTANDING"};
+    core_event_configs[CORE_EVENT_OFFCORE_REQUESTS] =
+        (event_config_t){g_pmu_platform.event_offcore_requests, "OFFCORE_REQUESTS"};
 
     return (id == PMU_PLATFORM_UNKNOWN) ? -1 : 0;
 }

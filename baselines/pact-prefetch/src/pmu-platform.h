@@ -33,6 +33,8 @@ struct pmu_platform {
     /* Core events (PEBS + counting) */
     uint64_t event_llc_miss_local;  /* MEM_LOAD_L3_MISS_RETIRED.LOCAL_DRAM */
     uint64_t event_llc_miss_remote; /* MEM_LOAD_L3_MISS_RETIRED.REMOTE_DRAM */
+    uint64_t event_offcore_outstanding; /* OFFCORE_REQUESTS_OUTSTANDING.L3_MISS_DEMAND_DATA_RD */
+    uint64_t event_offcore_requests;    /* OFFCORE_REQUESTS.L3_MISS_DEMAND_DATA_RD */
 
     /* CHA-to-core mapping */
     int nr_cha_mapping;
@@ -42,10 +44,10 @@ struct pmu_platform {
     /*
      * CHA TOR event config data:
      * tor_base[event_idx][tier]: pre-built pe.config base value
-     *   event_idx: CHA_TOR_OCCUPANCY=0, CHA_TOR_CYCLES=1
+     *   event_idx: CHA_TOR_OCCUPANCY=0, CHA_TOR_CYCLES=1, CHA_TOR_INSERTS=2
      *   tier: 0=fast(local), 1=slow(remote)
      */
-    uint64_t tor_base[2][2];
+    uint64_t tor_base[3][2];
 
     /* config1_base[tier]: pre-built pe.config1 base value (before TID OR). */
     uint64_t config1_base[2];

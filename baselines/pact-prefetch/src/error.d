@@ -1,2 +1,0 @@
-error.o: error.c error.h
-error.h:

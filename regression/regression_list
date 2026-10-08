@@ -6,11 +6,54 @@
 TIER_RATIOS=(
     1:8
     1:4
-    1:2
-    1:1
+    #1:2
+    #1:1
     #2:1
     #4:1
     #8:1
+)
+
+# ==============================================================================
+# Prefetch Configuration (Evaluated for *-prefetch kernels)
+# ==============================================================================
+# 1. Prefetch distances (Lookahead distance: 0=No prefetch, 1..64 cache lines)
+# Format: [Promotion:Demotion] or p<prom>_d<dem> or single value (e.g. 4 is equivalent to 4:4)
+# Supports composite tags: e.g. p1_d4_min1_max12
+# When commented out: uses kernel default lookahead distance
+PREFETCH_DISTANCES=(
+    # Paired Promotion:Demotion Testing
+    p5_d2
+)
+
+# 2. Prefetch distance clamp limits (min_dist : max_dist)
+# Evaluated for *-prefetch kernels: clamp(dist, min, max)
+# Format: [Min:Max] or min<min>_max<max> or max value (default min=1)
+# Default if commented out: min=1, max=10
+PREFETCH_BOUNDS=(
+    min1_max12
+)
+
+# 3. Prefetch distance adaptation mode (Evaluated for *-prefetch kernels)
+# 0 = Static / Non-adaptive distance (fixed lookahead distance)
+# 1 = Adaptive distance enabled (scales distance dynamically based on Little's Law)
+# Uncomment / comment to select which condition(s) to evaluate:
+PREFETCH_ADAPTIVE_MODES=(
+    0    # Non-adaptive (Static)
+    1    # Adaptive
+)
+
+# ==============================================================================
+# Transparent Huge Pages (THP) Configuration
+# Evaluated for both prefetch and non-prefetch kernels
+# ==============================================================================
+# Supported THP modes:
+#   always  (1 / on)  : echo always | sudo tee /sys/kernel/mm/transparent_hugepage/enabled
+#   madvise (0 / off) : echo madvise | sudo tee /sys/kernel/mm/transparent_hugepage/enabled
+#   never             : echo never | sudo tee /sys/kernel/mm/transparent_hugepage/enabled
+# Uncomment / comment to select which THP mode(s) to evaluate:
+THP_MODES=(
+    always
+    madvise
 )
 
 # Benchmarks to evaluate
@@ -21,40 +64,46 @@ BENCHMARKS=(
     gapbs_pr_kron
     gapbs_pr_urand
     gapbs_pr_twitter
-    #gapbs_pr_web
-    #gapbs_pr_road
-    gapbs_tc_kron
-    gapbs_tc_urand
-    gapbs_tc_twitter
-    #gapbs_tc_web
+    ##gapbs_pr_web
+    ##gapbs_pr_road
+
+    ##gapbs_tc_kron
+    ##gapbs_tc_urand
+    ##gapbs_tc_twitter
+    ##gapbs_tc_web
     ##gapbs_tc_road
-    #gapbs_bfs_kron
-    #gapbs_bfs_urand
-    #gapbs_bfs_twitter
-    #gapbs_bfs_web
+
+    gapbs_bfs_kron
+    gapbs_bfs_urand
+    gapbs_bfs_twitter
+    ##gapbs_bfs_web
     ##gapbs_bfs_road
+
     gapbs_bc_kron
     gapbs_bc_urand
     gapbs_bc_twitter
     #gapbs_bc_web
     #gapbs_bc_road
+
     gapbs_cc_kron
     gapbs_cc_urand
     gapbs_cc_twitter
     #gapbs_cc_web
     #gapbs_cc_road
-    #gapbs_sssp_kron
-    #gapbs_sssp_urand
-    #gapbs_sssp_twitter
+
+    gapbs_sssp_kron
+    gapbs_sssp_urand
+    gapbs_sssp_twitter
     #gapbs_sssp_web
-    ##gapbs_sssp_road
+    #gapbs_sssp_road
+
     ## -----------------------------
 
     ## -----------------------------
     ## Silo
     ## -----------------------------
-    silo_tpcc
-    silo_ycsb
+    #silo_tpcc
+    #silo_ycsb
     ##silo_queue
     ##silo_bid
     ##silo_encstress
@@ -63,13 +112,13 @@ BENCHMARKS=(
     ## -----------------------------
     ## Redis
     ## -----------------------------
-    redis
+    #redis
     ## -----------------------------
 
     ## -----------------------------
     ## XSBench
     ## -----------------------------
-    xsbench
+    #xsbench
     ## -----------------------------
 
     # -----------------------------
@@ -77,7 +126,7 @@ BENCHMARKS=(
     # -----------------------------
     #spec2026_706.stockfish_r
     #spec2026_707.ntest_r
-    spec2026_708.sqlite_r
+    #spec2026_708.sqlite_r
     #spec2026_709.cactus_r
     #spec2026_710.omnetpp_r
     #spec2026_714.cpython_r
@@ -121,7 +170,7 @@ BENCHMARKS=(
     #spec2026_846.minizinc_s
     #spec2026_849.fotonik3d_s
     #spec2026_853.ns3_s
-    #spec2026_854.graph500_s
+    spec2026_854.graph500_s
     #spec2026_857.namd_s
     spec2026_865.roms_s
     #spec2026_867.nest_s
@@ -132,13 +181,19 @@ BENCHMARKS=(
 
 # Baseline kernels to evaluate
 KERNELS=(
+    # tpp
+    pact-prefetch
     pact
-    hybridtier
-    generic
-    colloid-tpp
-    colloid-tpp-alto
-    memtis
-    nomad
-    nomad-alto
-    tpp
+    # colloid-tpp-prefetch
+    # colloid-tpp-alto-prefetch
+    # colloid-tpp
+    # colloid-tpp-alto
+    # memtis-prefetch
+    # memtis
+    # nomad-prefetch
+    # nomad-alto-prefetch
+    # nomad
+    # nomad-alto
+    # hybridtier
+    # generic
 )

@@ -11,35 +11,32 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="${ROOT_DIR:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
 WORKLOAD_DIR="${ROOT_DIR}/workloads"
 
-# Workload cores (default 12: cores 0..11; cores 12..15 reserved for kswapd/bpftrace/perf)
-export WORKLOAD_CORES="${WORKLOAD_CORES:-12}"
+# Workload cores (default 24: cores 0..23; cores 24..32 reserved for kswapd/bpftrace/perf)
+export WORKLOAD_CORES="${WORKLOAD_CORES:-24}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-${WORKLOAD_CORES}}"
 SELECTED_CPUS="${SELECTED_CPUS:-$(seq -s, 0 $(( WORKLOAD_CORES - 1 )))}"
-
-# Silo runtime in seconds (default 100s)
-export SILO_RUNTIME="${SILO_RUNTIME:-100}"
 
 # Graph Datasets Directory
 GAPBS_DIR="${WORKLOAD_DIR}/gapbs"
 GAPBS_GRAPH_DIR="${GAPBS_DIR}/benchmark/graphs"
 
 # Configurable GAPBS execution parameters
-GAPBS_DEFAULT_TRIALS="${GAPBS_NUM_TRIALS:-5}"
-export GAPBS_BC_NUM_TRIALS="${GAPBS_BC_NUM_TRIALS:-${GAPBS_DEFAULT_TRIALS:-2}}"
-export GAPBS_TC_NUM_TRIALS="${GAPBS_TC_NUM_TRIALS:-${GAPBS_DEFAULT_TRIALS:-1}}"
-export GAPBS_PR_NUM_TRIALS="${GAPBS_PR_NUM_TRIALS:-${GAPBS_DEFAULT_TRIALS:-2}}"
-export GAPBS_BFS_NUM_TRIALS="${GAPBS_BFS_NUM_TRIALS:-${GAPBS_DEFAULT_TRIALS:-16}}"
-export GAPBS_SSSP_NUM_TRIALS="${GAPBS_SSSP_NUM_TRIALS:-${GAPBS_DEFAULT_TRIALS:-16}}"
-export GAPBS_CC_NUM_TRIALS="${GAPBS_CC_NUM_TRIALS:-${GAPBS_DEFAULT_TRIALS:-16}}"
+export GAPBS_BC_NUM_TRIALS="${GAPBS_BC_NUM_TRIALS:-10}"
+export GAPBS_BC_URAND_NUM_TRIALS="${GAPBS_BC_URAND_NUM_TRIALS:-5}"
+export GAPBS_TC_NUM_TRIALS="${GAPBS_TC_NUM_TRIALS:-5}"
+export GAPBS_PR_NUM_TRIALS="${GAPBS_PR_NUM_TRIALS:-10}"
+export GAPBS_BFS_NUM_TRIALS="${GAPBS_BFS_NUM_TRIALS:-128}"
+export GAPBS_SSSP_NUM_TRIALS="${GAPBS_SSSP_NUM_TRIALS:-64}"
+export GAPBS_CC_NUM_TRIALS="${GAPBS_CC_NUM_TRIALS:-128}"
 
 export GAPBS_PR_ITERS="${GAPBS_PR_ITERS:-100}"
-export GAPBS_PR_TOL="${GAPBS_PR_TOL:-1e-4}"
-export GAPBS_BC_ITERS="${GAPBS_BC_ITERS:-4}"
+export GAPBS_PR_TOL="${GAPBS_PR_TOL:-1e-7}"
+export GAPBS_BC_ITERS="${GAPBS_BC_ITERS:-16}"
 export GAPBS_EXTRA_ARGS="${GAPBS_EXTRA_ARGS:-}"
 
 # Configurable Redis execution parameters
 export REDIS_KEYS="${REDIS_KEYS:-4300000}"
-export REDIS_REQUESTS="${REDIS_REQUESTS:-4300000}"
+export REDIS_REQUESTS="${REDIS_REQUESTS:-35000000}"
 export REDIS_DATA_SIZE="${REDIS_DATA_SIZE:-8192}"
 export REDIS_CLIENTS="${REDIS_CLIENTS:-50}"
 export REDIS_THREADS="${REDIS_THREADS:-4}"
@@ -54,6 +51,13 @@ export SPEC_CONFIG="${SPEC_CONFIG:-${WORKLOAD_DIR}/scripts/gcc-linux-x86.cfg}"
 export SPEC_COPIES="${SPEC_COPIES:-${WORKLOAD_CORES}}"
 export SPEC_THREADS="${SPEC_THREADS:-${WORKLOAD_CORES}}"
 export SPEC_EXTRA_ARGS="${SPEC_EXTRA_ARGS:-}"
+
+# Silo runtime in seconds (default 180s = 3-min)
+export SILO_RUNTIME="${SILO_RUNTIME:-180}"
+export SILO_TPCC_RUNTIME="${SILO_TPCC_RUNTIME:-180}"
+export SILO_YCSB_RUNTIME="${SILO_YCSB_RUNTIME:-600}"
+export SILO_BID_RUNTIME="${SILO_BID_RUNTIME:-20}"
+
 
 show_help() {
     echo "=========================================================================================="
@@ -98,7 +102,7 @@ show_help() {
     echo "  SPEC_EXTRA_ARGS         Additional arguments passed to runcpu (e.g. --fake)"
     echo ""
     echo "Available Targets:"
-    echo "  stream, stream_hot, stream_phase,"
+    echo "  stream, stream_copy,"
     echo "  gapbs_pr, gapbs_tc, gapbs_bfs, gapbs_bc, gapbs_cc, gapbs_sssp,"
     echo "  (supports composite aliases: gapbs_<algo>_<dataset>, e.g., gapbs_bc_kron),"
     echo "  silo_tpcc, silo_ycsb, silo_queue, silo_bid, silo_encstress,"
@@ -134,8 +138,7 @@ resolve_target_exe() {
     fi
     case "$t" in
         stream)         echo "stream" ;;
-        stream_hot)     echo "stream_hot" ;;
-        stream_phase)   echo "stream_phase" ;;
+        stream_copy)    echo "stream_copy" ;;
         gapbs_pr)       echo "pr" ;;
         gapbs_tc)       echo "tc" ;;
         gapbs_bfs)      echo "bfs" ;;
@@ -151,14 +154,31 @@ resolve_target_exe() {
 }
 
 MODE="RUN"
-if [ "$1" == "--get-cmd" ]; then
-    MODE="GET_CMD"
-    shift
-elif [ "$1" == "--get-preload-cmd" ]; then
-    MODE="GET_PRELOAD"
-    shift
-elif [ "$1" == "--get-target-exe" ]; then
-    shift
+PARSED_OPTS=()
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --get-cmd)
+            MODE="GET_CMD"
+            shift
+            ;;
+        --get-preload-cmd)
+            MODE="GET_PRELOAD"
+            shift
+            ;;
+        --get-target-exe)
+            MODE="GET_TARGET_EXE"
+            shift
+            ;;
+        *)
+            PARSED_OPTS+=("$1")
+            shift
+            ;;
+    esac
+done
+set -- "${PARSED_OPTS[@]}"
+
+if [ "$MODE" == "GET_TARGET_EXE" ]; then
     resolve_target_exe "$1"
     exit 0
 fi
@@ -248,21 +268,6 @@ resolve_cmd() {
     local graph_file=""
     local cmd=""
     local RUN_PREFIX="env OMP_NUM_THREADS=${OMP_NUM_THREADS} numactl --physcpubind=${SELECTED_CPUS}"
-    local r_tag="${RATIO_TAG:-default}"
-    local spec_kernel="${KERNEL_VER:-$(uname -r)}"
-    local SPEC_OUT_ROOT="${TARGET_DIR:-${WORKLOAD_DIR}/output/${spec_kernel}}/spec2026"
-    mkdir -p "${SPEC_OUT_ROOT}"
-
-    local spec_out_args=""
-    if [[ "${SPEC_EXTRA_ARGS:-}" != *"--output_root"* ]]; then
-        spec_out_args+=" --output_root=${SPEC_OUT_ROOT}"
-    fi
-    if [[ "${SPEC_EXTRA_ARGS:-}" != *"--expid"* ]]; then
-        spec_out_args+=" --expid=${r_tag}"
-    fi
-
-    local SPEC_BASE_CMD="${RUN_PREFIX} ${SPEC2026_DIR}/bin/runcpu --config=${SPEC_CONFIG} --copies=${SPEC_COPIES} --threads=${SPEC_THREADS} --size=ref${spec_out_args}"
-
     if [[ "$t" == gapbs_* ]]; then
         graph_file=$(resolve_graph_file "$t" "$ds")
     fi
@@ -276,11 +281,8 @@ resolve_cmd() {
         stream)
             cmd="${RUN_PREFIX} ${WORKLOAD_DIR}/stream/stream"
             ;;
-        stream_hot)
-            cmd="${RUN_PREFIX} ${WORKLOAD_DIR}/stream/stream_hot"
-            ;;
-        stream_phase)
-            cmd="${RUN_PREFIX} ${WORKLOAD_DIR}/stream/stream_phase"
+        stream_copy)
+            cmd="${RUN_PREFIX} ${WORKLOAD_DIR}/stream/stream_copy"
             ;;
         gapbs_pr)
             cmd="${RUN_PREFIX} ${GAPBS_DIR}/pr -f ${graph_file} -i ${GAPBS_PR_ITERS} -t ${GAPBS_PR_TOL} -n ${GAPBS_PR_NUM_TRIALS} ${GAPBS_EXTRA_ARGS}"
@@ -292,7 +294,11 @@ resolve_cmd() {
             cmd="${RUN_PREFIX} ${GAPBS_DIR}/bfs -f ${graph_file} -n ${GAPBS_BFS_NUM_TRIALS} ${GAPBS_EXTRA_ARGS}"
             ;;
         gapbs_bc)
-            cmd="${RUN_PREFIX} ${GAPBS_DIR}/bc -f ${graph_file} -i ${GAPBS_BC_ITERS} -n ${GAPBS_BC_NUM_TRIALS} ${GAPBS_EXTRA_ARGS}"
+            if [ "$ds" == "urand" ]; then
+                cmd="${RUN_PREFIX} ${GAPBS_DIR}/bc -f ${graph_file} -i ${GAPBS_BC_ITERS} -n ${GAPBS_BC_NUM_TRIALS} ${GAPBS_EXTRA_ARGS}"
+            else
+                cmd="${RUN_PREFIX} ${GAPBS_DIR}/bc -f ${graph_file} -i ${GAPBS_BC_ITERS} -n ${GAPBS_BC_URAND_NUM_TRIALS} ${GAPBS_EXTRA_ARGS}"
+            fi
             ;;
         gapbs_cc)
             cmd="${RUN_PREFIX} ${GAPBS_DIR}/cc -f ${graph_file} -n ${GAPBS_CC_NUM_TRIALS} ${GAPBS_EXTRA_ARGS}"
@@ -309,20 +315,19 @@ resolve_cmd() {
             cmd="${RUN_PREFIX} ${GAPBS_DIR}/sssp -f ${graph_file} -n ${GAPBS_SSSP_NUM_TRIALS} -d ${delta} ${GAPBS_EXTRA_ARGS}"
             ;;
         silo_tpcc)
-            cmd="${RUN_PREFIX} ${SILO_BIN} --verbose --bench tpcc --num-threads ${WORKLOAD_CORES} --scale-factor 180 --parallel-loading --runtime ${SILO_RUNTIME}"
+            cmd="${RUN_PREFIX} ${SILO_BIN} --verbose --bench tpcc --num-threads ${WORKLOAD_CORES} --scale-factor 200 --parallel-loading --runtime ${SILO_TPCC_RUNTIME}"
             ;;
         silo_ycsb)
-            cmd="${RUN_PREFIX} ${SILO_BIN} --verbose --bench ycsb --num-threads ${WORKLOAD_CORES} --scale-factor 95000 --parallel-loading --runtime ${SILO_RUNTIME}"
+            cmd="${RUN_PREFIX} ${SILO_BIN} --verbose --bench ycsb --num-threads ${WORKLOAD_CORES} --scale-factor 240000 --parallel-loading --runtime ${SILO_YCSB_RUNTIME}"
             ;;
         silo_queue)
             cmd="${RUN_PREFIX} ${SILO_BIN} --verbose --bench queue --num-threads 1 --scale-factor 1 --runtime ${SILO_RUNTIME}"
             ;;
         silo_bid)
-            local bid_runtime="${SILO_BID_RUNTIME:-20}"
-            cmd="${RUN_PREFIX} ${SILO_BIN} --verbose --bench bid --num-threads ${WORKLOAD_CORES} --scale-factor 55000 --parallel-loading --runtime ${bid_runtime}"
+            cmd="${RUN_PREFIX} ${SILO_BIN} --verbose --bench bid --num-threads ${WORKLOAD_CORES} --scale-factor 55000 --parallel-loading --runtime ${SILO_BID_RUNTIME}"
             ;;
         silo_encstress)
-            cmd="${RUN_PREFIX} ${SILO_BIN} --verbose --bench encstress --num-threads ${WORKLOAD_CORES} --scale-factor 95000 --parallel-loading --runtime ${SILO_RUNTIME}"
+            cmd="${RUN_PREFIX} ${SILO_BIN} --verbose --bench encstress --num-threads ${WORKLOAD_CORES} --scale-factor 240000 --parallel-loading --runtime ${SILO_RUNTIME}"
             ;;
         redis)
             cmd="${RUN_PREFIX} ${REDIS_RUN_SCRIPT} -t ${REDIS_TESTS} -n ${REDIS_REQUESTS} -r ${REDIS_KEYS} -d ${REDIS_DATA_SIZE} -c ${REDIS_CLIENTS} --threads ${REDIS_THREADS} ${REDIS_EXTRA_ARGS}"
@@ -337,6 +342,18 @@ resolve_cmd() {
                 echo "Error: Unknown SPEC CPU 2026 benchmark '$bname'" >&2
                 exit 1
             fi
+            local r_tag="${RATIO_TAG:-default}"
+            local spec_kernel="${KERNEL_VER:-$(uname -r)}"
+            local SPEC_OUT_ROOT="${TARGET_DIR:-${WORKLOAD_DIR}/output/${spec_kernel}}/spec2026"
+            mkdir -p "${SPEC_OUT_ROOT}"
+            local spec_out_args=""
+            if [[ "${SPEC_EXTRA_ARGS:-}" != *"--output_root"* ]]; then
+                spec_out_args+=" --output_root=${SPEC_OUT_ROOT}"
+            fi
+            if [[ "${SPEC_EXTRA_ARGS:-}" != *"--expid"* ]]; then
+                spec_out_args+=" --expid=${r_tag}"
+            fi
+            local SPEC_BASE_CMD="${RUN_PREFIX} ${SPEC2026_DIR}/bin/runcpu --config=${SPEC_CONFIG} --copies=${SPEC_COPIES} --threads=${SPEC_THREADS} --size=ref${spec_out_args}"
             cmd="${SPEC_BASE_CMD} ${bname}${SPEC_EXTRA_ARGS:+ $SPEC_EXTRA_ARGS}"
             ;;
         *)

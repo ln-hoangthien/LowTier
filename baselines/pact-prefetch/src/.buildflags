@@ -1,1 +1,0 @@
--Wall -Wextra -O3 -g -D_GNU_SOURCE -I. -MMD -MP
