@@ -13,7 +13,6 @@
 #include <errno.h>
 #include <sys/syscall.h>
 #include <sys/ioctl.h>
-#include <fcntl.h>
 #include <linux/perf_event.h>
 #include <assert.h>
 #include <dirent.h>
@@ -453,7 +452,7 @@ static void read_workload_counting_events(pact_workload_t *wl)
     int bytes_read =
         read_perf_event_array(&wl->counting_leader, wl->counting_events, CORE_EVENT_COUNT);
     if (bytes_read <= 0 && wl->counting_leader.fd >= 0) {
-            log_warning("read_workload_counting_events",
+        log_warning("read_workload_counting_events",
                     "Failed to read workload PID %d: bytes_read=%d, errno=%s", wl->target_pid,
                     bytes_read, strerror(errno));
     }
@@ -670,184 +669,9 @@ static void calculate_workload_mlp(pact_workload_t *wl)
     }
 }
 
-/*
- * Calculate average uncore memory access latency in uncore clock cycles via Little's Law:
- * Uncore-Latency = sum(TOR_OCCUPANCY) / sum(TOR_INSERTS).
- * If there is no uncore traffic, default to the previous value.
- */
-static double calculate_tier_uncore_latency(pact_workload_t *wl, int tier, uint64_t *out_inserts)
-{
-    static double last_uncore_lat[2] = {0.0, 0.0};
-    uint64_t sum_occupancy = 0;
-    uint64_t sum_inserts = 0;
-    int valid_groups = 0;
-
-    for (int cha = 0; cha < wl->nr_cha; cha++) {
-        event_group_t *group =
-            (tier == 0) ? &wl->cha_pmus[cha].group_fast : &wl->cha_pmus[cha].group_slow;
-
-        uint64_t dt_ns = group->time_running - group->last_time_running;
-        if (dt_ns < 1000000) { /* Skip windows under 1 ms */
-            continue;
-        }
-        valid_groups++;
-        sum_occupancy += group->values[CHA_TOR_OCCUPANCY];
-        sum_inserts += group->values[CHA_TOR_INSERTS];
-    }
-
-    if (out_inserts) {
-        *out_inserts = sum_inserts;
-    }
-
-    if (valid_groups == 0 || sum_inserts == 0) {
-        return (tier >= 0 && tier < 2) ? last_uncore_lat[tier] : 0.0;
-    }
-
-    double lat = (double)sum_occupancy / (double)sum_inserts;
-    if (tier >= 0 && tier < 2) {
-        last_uncore_lat[tier] = lat;
-    }
-    return lat;
-}
-
-/*
- * Calculate average core memory access latency in core clock cycles via Little's Law:
- * Core-Latency = OFFCORE_OUTSTANDING / OFFCORE_REQUESTS.
- * Using MSR_OFFCORE_RSP_x with L3_MISS response mask excludes L3 hits from both
- * O_core and R_core, measuring strictly L3 miss latency.
- * If there is no core traffic, default to the previous value.
- */
-static double calculate_workload_core_latency(pact_workload_t *wl)
-{
-    uint64_t occ = wl->counting_events[CORE_EVENT_OFFCORE_OUTSTANDING].value;
-    uint64_t req = wl->counting_events[CORE_EVENT_OFFCORE_REQUESTS].value;
-
-    if (req == 0 || occ == 0) {
-        return (wl->last_core_lat == 0.0) ? 50.0 : wl->last_core_lat;
-    }
-
-    wl->last_core_lat = (double)occ / (double)req;
-    return wl->last_core_lat;
-}
-
-/*
- * Read uncore frequency in Hz from sysfs for a given socket/package.
- * Falls back to default_ghz if sysfs is not accessible.
- */
-static double get_uncore_freq_hz(int package_id, double default_ghz)
-{
-    static double cached_freq[2] = {0.0, 0.0};
-    if (package_id >= 0 && package_id < 2 && cached_freq[package_id] > 0.0) {
-        return cached_freq[package_id];
-    }
-    char path[128];
-    snprintf(path, sizeof(path),
-             "/sys/devices/system/cpu/intel_uncore_frequency/package_%02d_die_00/min_freq_khz",
-             package_id);
-    FILE *f = fopen(path, "r");
-    double freq = default_ghz * 1e9;
-    if (f != NULL) {
-        unsigned long khz = 0;
-        if (fscanf(f, "%lu", &khz) == 1 && khz > 0) {
-            freq = (double)khz * 1000.0;
-        }
-        fclose(f);
-    }
-    if (package_id >= 0 && package_id < 2) {
-        cached_freq[package_id] = freq;
-    }
-    return freq;
-}
-
-/*
- * Calculate prefetch lookahead distance for a tier based on Little's Law:
- * Distance = Uncore-Latency / T_inject
- * Latencies are in nanoseconds (ns) to properly account for differing Core
- * and Uncore clock domains (e.g. 2.5 GHz fast uncore vs 1.3 GHz slow uncore).
- */
-static double calculate_prefetch_distance(double uncore_lat, double t_injection, double min_dist)
-{
-    double dist = uncore_lat / t_injection;
-    return (dist < min_dist) ? min_dist : dist;
-}
-
-/* Fast integer-to-string + newline without snprintf overhead */
-static inline int format_dist_buf(char buf[8], unsigned int dist)
-{
-    int len = 0;
-    if (dist >= 10) {
-        buf[len++] = (char)('0' + (dist / 10));
-        buf[len++] = (char)('0' + (dist % 10));
-    } else {
-        buf[len++] = (char)('0' + dist);
-    }
-    buf[len++] = '\n';
-    buf[len]   = '\0';
-    return len;
-}
-
-/* Update kernel page prefetch lookahead distance via sysfs */
-static void pact_update_prefetch_distance(unsigned int demote_dist, unsigned int promote_dist)
-{
-    static int is_adaptive = -1;
-    static int demote_fd = -2;
-    static int promote_fd = -2;
-    static unsigned int last_demote = 0;
-    static unsigned int last_promote = 0;
-    char buf[8];
-
-    /* 1. Fast zero-cost exit if static mode is configured */
-    if (__builtin_expect(is_adaptive == -1, 0)) {
-        const char *env_adapt = getenv("PREFETCH_ADAPTIVE");
-        if (env_adapt && strcmp(env_adapt, "0") == 0) {
-            is_adaptive = 0;
-        } else {
-            /* Fallback: verify kernel sysfs adaptive toggle */
-            int fd = open("/sys/kernel/mm/page_prefetch/adaptive", O_RDONLY | O_CLOEXEC);
-            if (fd >= 0) {
-                char ch = '1';
-                if (read(fd, &ch, 1) > 0 && ch == '0')
-                    is_adaptive = 0;
-                else
-                    is_adaptive = 1;
-                close(fd);
-            } else {
-                is_adaptive = 1; /* Default to adaptive if sysfs not found */
-            }
-        }
-    }
-    if (__builtin_expect(is_adaptive == 0, 0))
-        return;
-
-    /* 2. Lazy one-time file descriptor setup with O_CLOEXEC */
-    if (__builtin_expect(demote_fd == -2, 0)) {
-        demote_fd = open("/sys/kernel/mm/page_prefetch/demote_distance", O_WRONLY | O_CLOEXEC);
-        if (demote_fd < 0)
-            demote_fd = -1;
-    }
-    if (__builtin_expect(promote_fd == -2, 0)) {
-        promote_fd = open("/sys/kernel/mm/page_prefetch/promote_distance", O_WRONLY | O_CLOEXEC);
-        if (promote_fd < 0)
-            promote_fd = -1;
-    }
-
-    /* 3. Fast-path writes only when value changes */
-    if (demote_fd >= 0 && demote_dist > 0 && demote_dist != last_demote) {
-        int len = format_dist_buf(buf, demote_dist);
-        if (pwrite(demote_fd, buf, (size_t)len, 0) > 0)
-            last_demote = demote_dist;
-    }
-
-    if (promote_fd >= 0 && promote_dist > 0 && promote_dist != last_promote) {
-        int len = format_dist_buf(buf, promote_dist);
-        if (pwrite(promote_fd, buf, (size_t)len, 0) > 0)
-            last_promote = promote_dist;
-    }
-}
-
 /* Read the per-PID counting group (single fd with inherit=1, aggregating
  * across all child threads of the workload) and roll up into workload
- * stats. MLP and prefetch distance are computed from CHA TOR counters. */
+ * stats. MLP is computed from CHA TOR ratios (Algorithm 1). */
 void read_pmu_counting_events(pact_context_t *ctx)
 {
     pact_workload_t *wl = ctx->workload;
@@ -867,96 +691,8 @@ void read_pmu_counting_events(pact_context_t *ctx)
 
     read_pmu_cha_perf_events(wl->cha_pmus, wl->nr_cha);
     calculate_workload_mlp(wl);
-
-    /*
-     * Calculate prefetch lookahead distance using Little's Law:
-     * - Uncore-Latency = sum(TOR_OCCUPANCY) / sum(TOR_INSERTS) (uncore cycles)
-     * - Core-Latency   = OFFCORE_OUTSTANDING / OFFCORE_REQUESTS (core cycles)
-     *
-     * Convert cycles to nanoseconds (ns) using respective clock frequencies:
-     * - Fast Tier (Pkg 0) uncore: 2.5 GHz
-     * - Slow Tier (Pkg 1) uncore: 1.3 GHz (throttled in run_workloads.sh)
-     * - Core clock: calibrated TSC frequency (ctx->tsc_freq_hz)
-     */
-    double uncore_freq_fast_hz = get_uncore_freq_hz(0, 2.5);
-    double uncore_freq_slow_hz = get_uncore_freq_hz(1, 1.3);
-    double core_freq_hz = (ctx->tsc_freq_hz > 0) ? (double)ctx->tsc_freq_hz : 2.1e9;
-
-    uint64_t inserts_fast = 0;
-    uint64_t inserts_slow = 0;
-    double uncore_lat_fast_cycles = calculate_tier_uncore_latency(wl, 0, &inserts_fast);
-    double uncore_lat_slow_cycles = calculate_tier_uncore_latency(wl, 1, &inserts_slow);
-    double core_lat_cycles = calculate_workload_core_latency(wl);
-
-    double uncore_lat_fast_ns = (uncore_lat_fast_cycles * 1e9) / uncore_freq_fast_hz;
-    double uncore_lat_slow_ns = (uncore_lat_slow_cycles * 1e9) / uncore_freq_slow_hz;
-    double core_lat_ns = (core_lat_cycles * 1e9) / core_freq_hz;
-
-    // /* Weight Slow and Fast tier request shares:
-    //  * p_slow = sum(TOR_INSERTS_slow) / sum(TOR_INSERTS_total), p_fast = 1 - p_slow
-    //  * L_uncore_aggregate = p_fast * L_uncore_fast + p_slow * L_uncore_slow
-    //  * T_inject = max(0, L_core_aggregate - L_uncore_aggregate)
-    //  */
-    // double dist_fast = 0.0;
-    // double dist_slow = 0.0;
-
-    /* Aggressive Latency */
-    uint64_t total_inserts = inserts_fast + inserts_slow;
-    double p_slow = (total_inserts > 0) ? ((double)inserts_slow / (double)total_inserts) : 0.0;
-    double p_fast = 1.0 - p_slow;
-    double uncore_lat_agg_ns = p_fast * uncore_lat_fast_ns + p_slow * uncore_lat_slow_ns;
-
-    /* Injection delay by removing aggregate uncore memory service time */
-    double t_inject_ns = core_lat_ns - uncore_lat_agg_ns;
-
-    if (wl->last_valid_t_inject <= 0.0) {
-        wl->last_valid_t_inject = 20.0; /* Architectural nominal baseline */
-    }
-
-    if (t_inject_ns < 5.0) {
-        t_inject_ns = wl->last_valid_t_inject; /* Architectural baseline when unloaded or jittered */
-    } else {
-        wl->last_valid_t_inject = t_inject_ns;
-    }
-
-    double dist_demote = calculate_prefetch_distance(uncore_lat_fast_ns, t_inject_ns, 1.0);
-    double dist_promote = calculate_prefetch_distance(uncore_lat_slow_ns, t_inject_ns, 1.0);
-
-    /* Avoiding a long recovery time in the EMA */
-    if (dist_demote < 1.0)  dist_demote = 1.0;
-    if (dist_demote > 16.0) dist_demote = 16.0;
-
-    if (dist_promote < 1.0)  dist_promote = 1.0;
-    if (dist_promote > 16.0) dist_promote = 16.0;
-
-    /* EMA smoothing filter */
-    const double alpha = 0.5;
-
-    if (wl->smooth_demote < 0.0) {
-        wl->smooth_demote = dist_demote;
-        wl->smooth_promote = dist_promote;
-    } else {
-        wl->smooth_demote = alpha * dist_demote + (1.0 - alpha) * wl->smooth_demote;
-        wl->smooth_promote = alpha * dist_promote + (1.0 - alpha) * wl->smooth_promote;
-    }
-
-    unsigned int d_demote = (unsigned int)(wl->smooth_demote);
-    unsigned int d_promote = (unsigned int)(wl->smooth_promote);
-
-    pact_update_prefetch_distance(d_demote, d_promote);
-
-    /* Log information */
-    log_debug("read_pmu_counting_events",
-              "Workload (PID %d) MLP: fast=%.2f, slow=%.2f",
+    log_debug("read_pmu_counting_events", "Workload (PID %d) MLP: fast=%.2f, slow=%.2f",
               wl->target_pid, wl->workload_mlp_fast, wl->workload_mlp_slow);
-    log_debug("read_pmu_counting_events",
-              "Workload (PID %d) Latency (ns): core=%.1f, t_inject=%.1f uncore_fast=%.1f (%.1fGHz), uncore_slow=%.1f (%.1fGHz)",
-              wl->target_pid, core_lat_ns, t_inject_ns,
-              uncore_lat_fast_ns, uncore_freq_fast_hz / 1e9,
-              uncore_lat_slow_ns, uncore_freq_slow_hz / 1e9);
-    log_debug("read_pmu_counting_events",
-              "Workload (PID %d) Prefetch Distance: demote=%.1f (smooth=%u), promote=%.1f (smooth=%u)",
-              wl->target_pid, d_demote, wl->smooth_demote, d_promote, wl->smooth_promote);
 }
 
 /* Open one counting group per workload: dummy SW leader + LLC-miss events,

@@ -48,8 +48,6 @@ typedef struct cha_pmu_info {
 typedef enum {
     CORE_EVENT_LLC_MISS_FAST = 0,
     CORE_EVENT_LLC_MISS_SLOW,
-    CORE_EVENT_OFFCORE_OUTSTANDING,
-    CORE_EVENT_OFFCORE_REQUESTS,
     CORE_EVENT_COUNT /* Total number of core counting events */
 } core_event_index_t;
 

@@ -58,10 +58,11 @@ fi
 PREFETCH_ENABLED="${PREFETCH_ENABLED:-${PREFETCH_ENABLE:-${prefetch_enabled:-${prefetch_enable:-1}}}}"
 PREFETCH_ADAPTIVE="${PREFETCH_ADAPTIVE:-${prefetch_adaptive:-1}}"
 PREFETCH_HINT="${PREFETCH_HINT:-${prefetch_hint:-0}}"
-PREFETCH_PROMOTE_DISTANCE="${PREFETCH_PROMOTE_DISTANCE:-${prefetch_promote_distance:-4}}"
-PREFETCH_DEMOTE_DISTANCE="${PREFETCH_DEMOTE_DISTANCE:-${prefetch_demote_distance:-1}}"
+PREFETCH_PROMOTE_DISTANCE="${PREFETCH_PROMOTE_DISTANCE:-${prefetch_promote_distance:-5}}"
+PREFETCH_DEMOTE_DISTANCE="${PREFETCH_DEMOTE_DISTANCE:-${prefetch_demote_distance:-2}}"
 PREFETCH_MIN_DISTANCE="${PREFETCH_MIN_DISTANCE:-${prefetch_min_distance:-1}}"
 PREFETCH_MAX_DISTANCE="${PREFETCH_MAX_DISTANCE:-${prefetch_max_distance:-12}}"
+THP_MODE="${THP_MODE:-${thp_mode:-madvise}}"
 
 # Shorthand format parsers:
 # 1) Distance: p<prom>_d<dem> or <prom>:<dem>
@@ -154,11 +155,10 @@ export FILENAME_SUFFIX
 LOG_FILE="${TARGET_DIR}/bpftrace_numa_page_${FILENAME_SUFFIX}.log"
 PERF_LOG_FILE="${TARGET_DIR}/perf_bandwidth_${FILENAME_SUFFIX}.log"
 REGRESS_LOG_FILE="${TARGET_DIR}/regress_${FILENAME_SUFFIX}.log"
-DMESG_LOG_FILE="${TARGET_DIR}/dmesg_${FILENAME_SUFFIX}.log"
-export REGRESS_LOG_FILE DMESG_LOG_FILE
+export REGRESS_LOG_FILE
 
 # Remove any stale output files for this specific workload before running
-rm -f "${LOG_FILE}" "${PERF_LOG_FILE}" "${REGRESS_LOG_FILE}" "${DMESG_LOG_FILE}"
+rm -f "${LOG_FILE}" "${PERF_LOG_FILE}" "${REGRESS_LOG_FILE}"
 
 # Export target executable name for baselines requiring process hooking/attachment (HybridTier / PACT)
 if [ -z "${TARGET_EXE_NAME:-}" ]; then
@@ -318,10 +318,12 @@ ensure_module_loaded() {
 
 # Evict all background user processes from Node 0 to Node 1
 evict_background_to_node1() {
-    local target_user="${SUDO_USER:-}"
-    if [ -n "$target_user" ] && [ "$target_user" != "root" ] && command -v migratepages >/dev/null 2>&1; then
-        for pid in $(pgrep -u "$target_user"); do
-            [ "$pid" -eq "$$" ] && continue
+    if command -v migratepages >/dev/null 2>&1; then
+        # Migrate all user-space processes (except current script and sub-shells) from Node 0 to Node 1
+        for pid in $(ps -eo pid= | awk '$1 ~ /^[0-9]+$/ && $1 > 1 {print $1}'); do
+            if [ "$pid" -eq "$$" ] || [ "$pid" -eq "$PPID" ]; then
+                continue
+            fi
             migratepages "$pid" 0 1 2>/dev/null || true
         done
     fi
@@ -346,18 +348,19 @@ clean_memory_caches() {
     # Evict background user processes (IDE, language server, shells) from Node 0 to Node 1
     evict_background_to_node1
 
-    # Quiesce and drop caches across multiple iterations
-    local max_attempts=2
+    # Quiesce, drop caches, and compact memory across iterations
+    local max_attempts=3
     for attempt in $(seq 1 $max_attempts); do
         sync
-        sysctl -w vm.drop_caches="${drop_mode}" >/dev/null 2>&1 || echo "${drop_mode}" > /proc/sys/vm/drop_caches 2>/dev/null || true
-        sleep 2
+        echo "${drop_mode}" > /proc/sys/vm/drop_caches 2>/dev/null || true
+        sleep 3
+        echo 1 > /proc/sys/vm/compact_memory 2>/dev/null || true
+        sleep 3
         log_echo "[+] Headroom at Attempt=${attempt}: Node 0=$(get_node0_free_mb) MB | Node 1=$(get_node1_free_mb) MB free"
     done
-
-    # Compact memory to reduce external fragmentation
-    sysctl -w vm.compact_memory=1 >/dev/null 2>&1 || echo 1 > /proc/sys/vm/compact_memory 2>/dev/null || true
-    sleep 3
+    local free0_mb=$(get_node0_free_mb)
+    local free1_mb=$(get_node1_free_mb)
+    log_echo "[+] Clean Headroom at T=0: Node 0 = ${free0_mb} MB free | Node 1 = ${free1_mb} MB free"
 
     # Re-sweep background processes and drop residual slab at T=0 to guarantee fresh headroom
     evict_background_to_node1
@@ -610,10 +613,13 @@ configure_tiered_numa_kernel() {
     # ------------------------------------------------------------------------------------------
     # Transparent Huge Pages (THP) Online Configuration
     # ------------------------------------------------------------------------------------------
+    # Allow opportunistic THP or restrict to madvised regions
     echo "${THP_MODE}" > /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null || true
-    [ "${THP_MODE}" == "always" ] && echo "always" > /sys/kernel/mm/transparent_hugepage/defrag 2>/dev/null || true
+    # Defer synchronous compaction to background daemons to avoid latency cliffs
+    [ "${THP_MODE}" == "always" ] && echo "defer" > /sys/kernel/mm/transparent_hugepage/defrag 2>/dev/null || true
     cur_thp="$(read_sysfs /sys/kernel/mm/transparent_hugepage/enabled)"
-    log_echo "[*] Transparent Huge Pages (THP): enabled=${cur_thp:-N/A} (target=${THP_MODE})"
+    cur_defrag="$(read_sysfs /sys/kernel/mm/transparent_hugepage/defrag)"
+    log_echo "[*] Transparent Huge Pages (THP): enabled=${cur_thp:-N/A} (target=${THP_MODE}), defrag=${cur_defrag:-N/A}"
 
     # Log active demotion target and watermark state
     local demote_en="$(read_sysfs /sys/kernel/mm/numa/demotion_enabled)"
@@ -646,7 +652,6 @@ configure_tiered_numa_kernel
     echo " THP Mode       : ${THP_MODE} ($(read_sysfs /sys/kernel/mm/transparent_hugepage/enabled))"
     echo " Current Memmap : $(grep -oE 'memmap=[^ ]+' /proc/cmdline 2>/dev/null || echo 'none')"
     echo " Regression Log : ${REGRESS_LOG_FILE}"
-    echo " dmesg Log      : ${DMESG_LOG_FILE}"
     echo "=========================================================================================="
 } | tee -a "${REGRESS_LOG_FILE:-/dev/null}"
 
@@ -683,9 +688,6 @@ log_echo "[run_workloads] Running stats-monitored workload: $WORKLOAD_CMD"
 log_echo "------------------------------------------------------------------------------------------"
 log_echo "[+] Workload completed. Compiling final statistics..."
 
-# Step 6: Capture kernel dmesg ring buffer (including prefetch and migration logs)
-dmesg -T > "${DMESG_LOG_FILE}" 2>/dev/null || dmesg > "${DMESG_LOG_FILE}" 2>/dev/null || true
-
 # Append prefetch hardware stats to PACT and regression log files if available
 [ -f "/sys/kernel/mm/page_prefetch/stats" ] && prefetch_stats_sysfs="/sys/kernel/mm/page_prefetch/stats"
 [ -f "/sys/kernel/mm/pact_prefetch/stats" ] && prefetch_stats_sysfs="/sys/kernel/mm/pact_prefetch/stats"
@@ -702,11 +704,10 @@ if [ -n "${prefetch_stats_sysfs}" ]; then
     } | tee -a "${REGRESS_LOG_FILE}" >/dev/null 2>&1 || true
 fi
 
-# Step 7: Clean up and restore system configuration (CPUs, background daemons, ownership)
+# Step 6: Clean up and restore system configuration (CPUs, background daemons, ownership)
 cleanup
 
 echo "=========================================================================================="
 echo " Workload Execution Completed."
 echo " Regression Summary saved to : ${REGRESS_LOG_FILE}"
-echo " dmesg Kernel Log saved to   : ${DMESG_LOG_FILE}"
 echo "=========================================================================================="

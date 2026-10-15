@@ -18,6 +18,7 @@
 #include "constants.h"
 #include "error.h"
 #include "pmu.h"
+#include "mig_telemetry.h"
 #include "pact.h"
 #include <immintrin.h> /* _mm_pause */
 #include "obj-pool.h"
@@ -364,8 +365,8 @@ void update_pac_entry(pact_context_t *pact, uint64_t page_addr, uint64_t stalls,
 /* Process per-page numa_move_pages results — must be thread-safe vs main thread.
  * Every entry in the migration ring is a promotion (target_node=0); demotion
  * is handled by the kernel's demotion_enabled toggle, not numa_move_pages. */
-static void process_migration_batch_results(pact_context_t *ctx, pac_metadata_t **metas,
-                                            int *status, int count, long result, int errno_val)
+static int process_migration_batch_results(pact_context_t *ctx, pac_metadata_t **metas, int *status,
+                                           int count, long result, int errno_val)
 {
     if (result < 0 && !(result == -1 && errno_val == ENOMEM)) {
         log_error("migration_thread", "numa_move_pages failed: %ld, errno=%d", result, errno_val);
@@ -438,6 +439,7 @@ static void process_migration_batch_results(pact_context_t *ctx, pac_metadata_t 
 
     log_debug("migration_thread", "Batch processed: %lu promotions, %lu demotions, %d total",
               promotion_success, demotion_success, count);
+    return (int)(promotion_success + demotion_success);
 }
 
 /*
@@ -445,12 +447,13 @@ static void process_migration_batch_results(pact_context_t *ctx, pac_metadata_t 
  * Executes numa_move_pages() directly without coroutine overhead
  */
 /* Dispatch one already-assembled batch via synchronous numa_move_pages. */
-static void mig_dispatch_batch(pact_context_t *ctx, pid_t target_pid, void **pages, int *nodes,
-                               int *status, pac_metadata_t **metas, int batch_count)
+static int mig_dispatch_batch(pact_context_t *ctx, pid_t target_pid, void **pages, int *nodes,
+                              int *status, pac_metadata_t **metas, int batch_count)
 {
     long result = numa_move_pages(target_pid, batch_count, pages, nodes, status, MPOL_MF_MOVE);
     int errno_val = errno;
-    process_migration_batch_results(ctx, metas, status, batch_count, result, errno_val);
+
+    return process_migration_batch_results(ctx, metas, status, batch_count, result, errno_val);
 }
 
 /* Add one entry to the in-flight batch arrays. Returns false if the page
@@ -473,7 +476,8 @@ static bool mig_add_entry_to_batch(const migration_entry_t *entry, void **pages,
 
 /* Drain the workload's migration ring. */
 static int mig_drain_workload_ring(pact_context_t *ctx, void **pages, int *nodes, int *status,
-                                   pac_metadata_t **metas, int max_batch)
+                                   pac_metadata_t **metas, int max_batch,
+                                   struct mig_telemetry *telem)
 {
     pact_workload_t *wl = ctx->workload;
     ring_buffer_migration_entry_t *ring = wl->migration_ring;
@@ -493,8 +497,26 @@ static int mig_drain_workload_ring(pact_context_t *ctx, void **pages, int *nodes
             break;
         }
 
-        mig_dispatch_batch(ctx, wl_pid, pages, nodes, status, metas, batch_count);
-        wl_migrated += batch_count;
+        /* 1. Start isolated PMU window strictly around kernel batch execution */
+        mig_telemetry_start_window(telem);
+
+        /* 2. Execute migration (stops PMU window immediately after numa_move_pages) */
+        int migrated = mig_dispatch_batch(ctx, wl_pid, pages, nodes, status, metas, batch_count);
+
+        /* 3. Stop PMU window immediately after kernel numa_move_pages completes */
+        mig_telemetry_stop_window(telem);
+
+        /* 4. Update pacing using actual success count */
+        if ((uint64_t)migrated >= MIN_MIG_PAGES_GATE && ((double)migrated / batch_count >= 0.85)) {
+            /* The bulk memory copy instructions heavily dominate the PMU hardware 
+             * window. The small 0–15% non-copy is negligible.*/
+            mig_telemetry_update_pacing(ctx, telem, (uint64_t)migrated);
+            wl_migrated += migrated;
+        } else if (migrated > 0) {
+            /* Still track the total migrated count, but skip updating PMU pacing 
+            * because page-walk failures would contaminate T_interval. */
+            wl_migrated += migrated;
+        }
     }
     return wl_migrated;
 }
@@ -503,8 +525,19 @@ static void *migration_thread_fn(void *arg)
 {
     pact_context_t *ctx = (pact_context_t *)arg;
 
-    if (ctx->migration_cpu >= 0) {
-        pact_pin_to_cpu(ctx->migration_cpu);
+    struct mig_telemetry telem;
+    double core_freq = DEFAULT_CORE_FREQ_GHZ;
+    if (ctx->tsc_freq_hz > 0) {
+        core_freq = (double)ctx->tsc_freq_hz / 1e9;
+    }
+    int telem_rc = mig_telemetry_init_caller(&telem, ctx->migration_cpu, core_freq);
+    if (telem_rc < 0) {
+        log_warning("migration_thread",
+                    "Failed to initialize telemetry (rc=%d), continuing without PMU pacing",
+                    telem_rc);
+        if (ctx->migration_cpu >= 0) {
+            pact_pin_to_cpu(ctx->migration_cpu);
+        }
     }
 
     int max_batch = ctx->max_migrations_per_cycle;
@@ -514,6 +547,7 @@ static void *migration_thread_fn(void *arg)
     pac_metadata_t **metas = malloc(max_batch * sizeof(pac_metadata_t *));
     if (!pages || !nodes || !status || !metas) {
         log_error("migration_thread", "Failed to allocate batch arrays");
+        mig_telemetry_close(&telem);
         free(pages);
         free(nodes);
         free(status);
@@ -535,12 +569,13 @@ static void *migration_thread_fn(void *arg)
 
         ring_buffer_migration_entry_t *ring = ctx->workload->migration_ring;
         if (ring_buffer_migration_entry_size(ring) > 0) {
-            (void)mig_drain_workload_ring(ctx, pages, nodes, status, metas, max_batch);
+            (void)mig_drain_workload_ring(ctx, pages, nodes, status, metas, max_batch, &telem);
         } else {
             _mm_pause(); /* CPU hint vs 100µs kernel sleep */
         }
     }
 
+    mig_telemetry_close(&telem);
     free(pages);
     free(nodes);
     free(status);

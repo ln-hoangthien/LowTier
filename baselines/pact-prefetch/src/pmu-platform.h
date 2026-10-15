@@ -33,8 +33,6 @@ struct pmu_platform {
     /* Core events (PEBS + counting) */
     uint64_t event_llc_miss_local;  /* MEM_LOAD_L3_MISS_RETIRED.LOCAL_DRAM */
     uint64_t event_llc_miss_remote; /* MEM_LOAD_L3_MISS_RETIRED.REMOTE_DRAM */
-    uint64_t event_offcore_outstanding; /* OFFCORE_REQUESTS_OUTSTANDING.L3_MISS_DEMAND_DATA_RD */
-    uint64_t event_offcore_requests;    /* OFFCORE_REQUESTS.L3_MISS_DEMAND_DATA_RD */
 
     /* CHA-to-core mapping */
     int nr_cha_mapping;

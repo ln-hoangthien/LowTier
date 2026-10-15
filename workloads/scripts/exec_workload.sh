@@ -295,9 +295,9 @@ resolve_cmd() {
             ;;
         gapbs_bc)
             if [ "$ds" == "urand" ]; then
-                cmd="${RUN_PREFIX} ${GAPBS_DIR}/bc -f ${graph_file} -i ${GAPBS_BC_ITERS} -n ${GAPBS_BC_NUM_TRIALS} ${GAPBS_EXTRA_ARGS}"
-            else
                 cmd="${RUN_PREFIX} ${GAPBS_DIR}/bc -f ${graph_file} -i ${GAPBS_BC_ITERS} -n ${GAPBS_BC_URAND_NUM_TRIALS} ${GAPBS_EXTRA_ARGS}"
+            else
+                cmd="${RUN_PREFIX} ${GAPBS_DIR}/bc -f ${graph_file} -i ${GAPBS_BC_ITERS} -n ${GAPBS_BC_NUM_TRIALS} ${GAPBS_EXTRA_ARGS}"
             fi
             ;;
         gapbs_cc)
