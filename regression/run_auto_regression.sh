@@ -22,6 +22,7 @@ STATE_FILE="${SCRIPT_DIR}/.regression_state"
 SERVICE_NAME="lowtier-regression.service"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}"
 LOG_FILE="${SCRIPT_DIR}/auto_regression_orchestrator.log"
+RUN_WORKLOADS="${ROOT_DIR}/workloads/scripts/run_workloads.sh"
 
 # Formatting Colors
 RED='\033[0;31m'
@@ -34,7 +35,7 @@ NC='\033[0m'
 # Guard root check when script is executed directly vs sourced
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     ACTION="${1:-start}"
-    if [[ "$ACTION" != "status" && "$ACTION" != "check" && "$ACTION" != "dry-run" && "$ACTION" != "-h" && "$ACTION" != "--help" && "$ACTION" != "help" ]]; then
+    if [[ "$ACTION" != "status" && "$ACTION" != "check" && "$ACTION" != "-h" && "$ACTION" != "--help" && "$ACTION" != "help" ]]; then
         if [ "$EUID" -ne 0 ]; then
             echo -e "${YELLOW}Notice: Root privileges are required to manage GRUB, reboots, and services.${NC}"
             exec sudo env PATH="$PATH" ROOT_DIR="$ROOT_DIR" bash "$0" "$@"
@@ -42,6 +43,9 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     fi
 fi
 
+# ------------------------------------------------------------------------------
+# Log message with timestamp to stdout and orchestrator log file
+# ------------------------------------------------------------------------------
 log() {
     local timestamp="[$(date '+%Y-%m-%d %H:%M:%S')]"
     local raw_msg="$1"
@@ -52,7 +56,7 @@ log() {
 }
 
 # ------------------------------------------------------------------------------
-# Helpers: CPU & Prefetch Verification
+# Ensure all logical CPU cores are brought online
 # ------------------------------------------------------------------------------
 ensure_cpus_online() {
     for cpu in /sys/devices/system/cpu/cpu[0-9]*/online; do
@@ -60,154 +64,100 @@ ensure_cpus_online() {
     done
 }
 
+# ------------------------------------------------------------------------------
+# Check if kernel name contains prefetch support
+# ------------------------------------------------------------------------------
 is_prefetch_kernel() {
     [[ "${1,,}" =~ prefetch ]]
 }
 
-parse_prefetch_params() {
-    local dist="${1:-}"
-    local bound="${2:-}"
-    [ $# -ge 3 ] && [ -n "${3:-}" ] && bound="$3"
-
-    # Reset / unset previous environment values
-    unset PREFETCH_DISTANCE PREFETCH_PROMOTE_DISTANCE PREFETCH_DEMOTE_DISTANCE \
-          PREFETCH_MIN_DISTANCE PREFETCH_MAX_DISTANCE || true
-
-    # 1. Parse Distance (promote / demote lookahead)
-    if [ -n "$dist" ]; then
-        if [[ "$dist" =~ p([0-9]+)_d([0-9]+) ]]; then
-            export PREFETCH_PROMOTE_DISTANCE="${BASH_REMATCH[1]}"
-            export PREFETCH_DEMOTE_DISTANCE="${BASH_REMATCH[2]}"
-            export PREFETCH_DISTANCE="${PREFETCH_PROMOTE_DISTANCE}"
-        elif [[ "$dist" =~ ^([0-9]+):([0-9]+)$ ]]; then
-            export PREFETCH_PROMOTE_DISTANCE="${BASH_REMATCH[1]}"
-            export PREFETCH_DEMOTE_DISTANCE="${BASH_REMATCH[2]}"
-            export PREFETCH_DISTANCE="${PREFETCH_PROMOTE_DISTANCE}"
-        elif [[ "$dist" =~ ^([0-9]+)$ ]]; then
-            export PREFETCH_DISTANCE="$dist"
-            export PREFETCH_PROMOTE_DISTANCE="$dist"
-            export PREFETCH_DEMOTE_DISTANCE="$dist"
-        fi
-    fi
-
-    # 2. Parse Bounds (min/max clamp)
-    local raw_bound="${bound}"
-    if [ -z "$raw_bound" ] && [[ "$dist" =~ min[0-9]+|max[0-9]+ ]]; then
-        raw_bound="$dist"
-    fi
-    if [ -n "$raw_bound" ]; then
-        if [[ "$raw_bound" =~ min([0-9]+)_max([0-9]+) || "$raw_bound" =~ ^([0-9]+):([0-9]+)$ ]]; then
-            export PREFETCH_MIN_DISTANCE="${BASH_REMATCH[1]}"
-            export PREFETCH_MAX_DISTANCE="${BASH_REMATCH[2]}"
-        else
-            [[ "$raw_bound" =~ min([0-9]+) ]] && export PREFETCH_MIN_DISTANCE="${BASH_REMATCH[1]}"
-            [[ "$raw_bound" =~ max([0-9]+) ]] && export PREFETCH_MAX_DISTANCE="${BASH_REMATCH[1]}"
-            if [[ "$raw_bound" =~ ^([0-9]+)$ ]]; then
-                export PREFETCH_MIN_DISTANCE=1
-                export PREFETCH_MAX_DISTANCE="$raw_bound"
-            fi
-        fi
-    fi
-}
-
-parse_prefetch_distance() {
-    parse_prefetch_params "$@"
-}
-
+# ------------------------------------------------------------------------------
+# Resolve required memmap boot parameter for benchmark and tier ratio
+# ------------------------------------------------------------------------------
 resolve_memmap() {
     local bench="$1" ratio="${2:-1:1}"
     bash "${ROOT_DIR}/baselines/scripts/manage_kernels.sh" resolve_memmap "$bench" "$ratio"
 }
 
 # ------------------------------------------------------------------------------
-# Helpers: Kernel Identification & State Matching (Unified Single Source of Truth)
+# Match target kernel alias against uname or vmlinuz release string
 # ------------------------------------------------------------------------------
 matches_kernel_target() {
     local target="$1"
     local k_str="${2,,}"
     case "$target" in
-        generic|distro|default)
+        generic)
             [[ "$k_str" =~ generic ]]
             ;;
-        memtis-prefetch|memtis_prefetch)
+        pact-prefetch)
+            [[ "$k_str" =~ pact && "$k_str" =~ prefetch ]]
+            ;;
+        pact)
+            [[ "$k_str" =~ pact && ! "$k_str" =~ prefetch ]]
+            ;;
+        colloid-tpp-alto-prefetch)
+            [[ "$k_str" =~ colloid && "$k_str" =~ alto && "$k_str" =~ prefetch ]]
+            ;;
+        colloid-tpp-prefetch)
+            [[ "$k_str" =~ colloid && ! "$k_str" =~ alto && "$k_str" =~ prefetch ]]
+            ;;
+        colloid-tpp-alto)
+            [[ "$k_str" =~ colloid && "$k_str" =~ alto && ! "$k_str" =~ prefetch ]]
+            ;;
+        colloid-tpp)
+            [[ "$k_str" =~ colloid && ! "$k_str" =~ alto && ! "$k_str" =~ prefetch ]]
+            ;;
+        memtis-prefetch)
             [[ "$k_str" =~ memtis && "$k_str" =~ prefetch ]]
             ;;
         memtis)
             [[ "$k_str" =~ memtis && ! "$k_str" =~ prefetch ]]
             ;;
-        nomad-alto-prefetch|nomad_alto_prefetch)
+        nomad-alto-prefetch)
             [[ "$k_str" =~ nomad && "$k_str" =~ alto && "$k_str" =~ prefetch ]]
             ;;
-        nomad-prefetch|nomad_prefetch)
+        nomad-prefetch)
             [[ "$k_str" =~ nomad && ! "$k_str" =~ alto && "$k_str" =~ prefetch ]]
             ;;
-        nomad-alto-noinline|nomad_alto_noinline|nomad-noinline-alto|nomad_noinline_alto)
-            [[ "$k_str" =~ nomad && "$k_str" =~ alto && "$k_str" =~ noinline ]]
-            ;;
-        nomad-noinline)
-            [[ "$k_str" =~ nomad && ! "$k_str" =~ alto && "$k_str" =~ noinline ]]
-            ;;
-        nomad-alto|nomad_alto)
-            [[ "$k_str" =~ nomad && "$k_str" =~ alto && ! "$k_str" =~ noinline && ! "$k_str" =~ prefetch ]]
+        nomad-alto)
+            [[ "$k_str" =~ nomad && "$k_str" =~ alto && ! "$k_str" =~ prefetch ]]
             ;;
         nomad)
-            [[ "$k_str" =~ nomad && ! "$k_str" =~ alto && ! "$k_str" =~ noinline && ! "$k_str" =~ prefetch ]]
-            ;;
-        colloid-tpp-alto-prefetch|colloid_tpp_alto_prefetch)
-            [[ "$k_str" =~ colloid && "$k_str" =~ alto && "$k_str" =~ prefetch ]]
-            ;;
-        colloid-tpp-prefetch|colloid_tpp_prefetch)
-            [[ "$k_str" =~ colloid && ! "$k_str" =~ alto && "$k_str" =~ prefetch ]]
-            ;;
-        colloid-tpp-alto|colloid-alto|colloid_tpp_alto|colloid_alto)
-            [[ "$k_str" =~ colloid && "$k_str" =~ alto && ! "$k_str" =~ prefetch ]]
-            ;;
-        colloid-tpp|colloid|colloid_tpp)
-            [[ "$k_str" =~ colloid && ! "$k_str" =~ alto && ! "$k_str" =~ prefetch ]]
-            ;;
-        pact-prefetch-batch|pact_prefetch_batch)
-            [[ "$k_str" =~ prefetch-batch ]]
-            ;;
-        pact-prefetch|pact_prefetch)
-            [[ "$k_str" =~ pact && "$k_str" =~ prefetch && ! "$k_str" =~ prefetch-batch ]]
-            ;;
-        pact)
-            [[ "$k_str" =~ pact && ! "$k_str" =~ prefetch ]]
-            ;;
-        tpp)
-            [[ "$k_str" =~ tpp && ! "$k_str" =~ colloid ]]
+            [[ "$k_str" =~ nomad && ! "$k_str" =~ alto && ! "$k_str" =~ prefetch ]]
             ;;
         hybridtier)
             [[ "$k_str" =~ hybridtier ]]
             ;;
+        tpp)
+            [[ "$k_str" =~ tpp && ! "$k_str" =~ colloid ]]
+            ;;
         *)
-            [[ "$k_str" =~ $(echo "$target" | tr '[:upper:]' '[:lower:]') ]]
+            [[ "$k_str" =~ ${target,,} ]]
             ;;
     esac
 }
 
+# ------------------------------------------------------------------------------
+# Check if compiled kernel binary exists in baseline source tree
+# ------------------------------------------------------------------------------
 is_kernel_ready() {
     local target="$1"
-    case "$target" in
-        generic|distro|default) return 0 ;;
-    esac
+    [ "$target" == "generic" ] && return 0
 
-    local norm="${target,,}"
-    norm="${norm//_/-}"
-    case "$norm" in
-        colloid|colloid-tpp)           norm="colloid-tpp" ;;
-        colloid-alto|colloid-tpp-alto) norm="colloid-tpp-alto" ;;
-        nomad-noinline-alto)           norm="nomad-alto-noinline" ;;
-    esac
-
-    local kdir="${ROOT_DIR}/baselines/${norm}/linux"
+    local kdir="${ROOT_DIR}/baselines/${target}/linux"
     [ -d "$kdir" ] && ([ -f "$kdir/arch/x86/boot/bzImage" ] || [ -f "$kdir/vmlinux" ])
 }
 
+# ------------------------------------------------------------------------------
+# Check if current running kernel matches target kernel alias
+# ------------------------------------------------------------------------------
 is_kernel_running() {
     matches_kernel_target "$1" "$(uname -r)"
 }
 
+# ------------------------------------------------------------------------------
+# Check if kernel image is installed in /boot
+# ------------------------------------------------------------------------------
 is_kernel_installed() {
     local target="$1"
     for vmlinuz in /boot/vmlinuz-*; do
@@ -216,6 +166,9 @@ is_kernel_installed() {
     return 1
 }
 
+# ------------------------------------------------------------------------------
+# Verify both target kernel and required memmap are currently active
+# ------------------------------------------------------------------------------
 is_target_and_memmap_running() {
     local target_kernel="$1" target_memmap="$2"
     is_kernel_running "$target_kernel" || return 1
@@ -226,7 +179,7 @@ is_target_and_memmap_running() {
 }
 
 # ------------------------------------------------------------------------------
-# Helpers: Service & Target Parsing
+# Install systemd service for automated regression resume on reboot
 # ------------------------------------------------------------------------------
 install_service() {
     log "${CYAN}Installing systemd autostart service: ${SERVICE_FILE}...${NC}"
@@ -242,7 +195,7 @@ TimeoutStartSec=infinity
 TimeoutSec=infinity
 Environment="PATH=${PATH}"
 Environment="ROOT_DIR=${ROOT_DIR}"
-ExecStart=/bin/bash ${SCRIPT_DIR}/run_auto_regression.sh --step
+ExecStart=/bin/bash ${SCRIPT_DIR}/run_auto_regression.sh resume
 StandardOutput=journal+console
 StandardError=journal+console
 
@@ -253,6 +206,9 @@ EOF
     systemctl enable "${SERVICE_NAME}" >/dev/null 2>&1 || true
 }
 
+# ------------------------------------------------------------------------------
+# Disable and remove autostart systemd service
+# ------------------------------------------------------------------------------
 remove_service() {
     if [ -f "$SERVICE_FILE" ]; then
         log "${CYAN}Disabling and removing systemd autostart service...${NC}"
@@ -262,6 +218,9 @@ remove_service() {
     fi
 }
 
+# ------------------------------------------------------------------------------
+# Parse regression_list and construct the execution target matrix
+# ------------------------------------------------------------------------------
 load_targets() {
     [ ! -f "$REGRESSION_LIST" ] && { echo -e "${RED}Error: regression_list not found at ${REGRESSION_LIST}${NC}"; exit 1; }
     [ ! -s "$REGRESSION_LIST" ] && { echo -e "${RED}Error: regression_list at ${REGRESSION_LIST} is empty${NC}"; exit 1; }
@@ -291,50 +250,58 @@ load_targets() {
     [ ${#PREFETCH_ADAPTIVE_MODES[@]} -eq 0 ] && PREFETCH_ADAPTIVE_MODES=(1)
     [ ${#THP_MODES[@]} -eq 0 ] && THP_MODES=(madvise)
 
-    # Execution matrix: Kernel -> Benchmark -> Ratio -> THP -> (Mode -> Distance -> Bounds)
+    # Pre-build prefetch evaluation configurations: "adaptive_mode|distance|bounds"
+    local prefetch_configs=()
+    for a in "${PREFETCH_ADAPTIVE_MODES[@]}"; do
+        if [ "$a" == "1" ]; then
+            # Adaptive mode: evaluates dynamically adjusted lookahead within bounds
+            if [ ${#PREFETCH_BOUNDS[@]} -gt 0 ]; then
+                for bound in "${PREFETCH_BOUNDS[@]}"; do
+                    prefetch_configs+=("1||${bound}")
+                done
+            else
+                prefetch_configs+=("1||")
+            fi
+        elif [ "$a" == "0" ]; then
+            # Static mode: evaluates fixed lookahead distances (clamp bounds do not apply)
+            if [ ${#PREFETCH_DISTANCES[@]} -gt 0 ]; then
+                for d in "${PREFETCH_DISTANCES[@]}"; do
+                    prefetch_configs+=("0|${d}|")
+                done
+            else
+                prefetch_configs+=("0|p5_d2|")
+            fi
+        fi
+    done
+    [ ${#prefetch_configs[@]} -eq 0 ] && prefetch_configs+=("1||")
+
+    # Execution matrix: Kernel -> Benchmark -> Ratio -> THP -> PrefetchConfig
+    # Grouping THP and prefetch configs under the same (Kernel, Benchmark, Ratio) minimizes reboots
     TARGET_ITEMS=()
     for k in "${KERNELS[@]}"; do
+        local configs=()
+        if is_prefetch_kernel "$k"; then
+            configs=("${prefetch_configs[@]}")
+        else
+            configs=("||")
+        fi
+
         for b in "${BENCHMARKS[@]}"; do
             for r in "${TIER_RATIOS[@]}"; do
                 for thp in "${THP_MODES[@]}"; do
-                    if is_prefetch_kernel "$k"; then
-                        for a in "${PREFETCH_ADAPTIVE_MODES[@]}"; do
-                            local eval_d=()
-                            if [ "$a" == "1" ]; then
-                                # Adaptive mode dynamically adapts distance; default distance is taken
-                                eval_d=("")
-                            elif [ "$a" == "0" ]; then
-                                # Static mode sweeps prefetch distances
-                                if [ ${#PREFETCH_DISTANCES[@]} -gt 0 ]; then
-                                    eval_d=("${PREFETCH_DISTANCES[@]}")
-                                else
-                                    eval_d=(0:0 1:1 2:2 4:4 8:8 10:10 12:12 14:14 16:16)
-                                fi
-                            fi
-
-                            local eval_bounds=()
-                            if [ ${#PREFETCH_BOUNDS[@]} -gt 0 ]; then
-                                eval_bounds=("${PREFETCH_BOUNDS[@]}")
-                            else
-                                eval_bounds=("")
-                            fi
-
-                            for d in "${eval_d[@]}"; do
-                                for bound in "${eval_bounds[@]}"; do
-                                    TARGET_ITEMS+=("${k}|${b}|${r}|${d}|${a}|${bound}|${thp}")
-                                done
-                            done
-                        done
-                    else
-                        # Non-prefetch kernels: prefetch characteristics are empty, but THP is evaluated!
-                        TARGET_ITEMS+=("${k}|${b}|${r}||||${thp}")
-                    fi
+                    for cfg in "${configs[@]}"; do
+                        IFS='|' read -r a d bound <<< "$cfg"
+                        TARGET_ITEMS+=("${k}|${b}|${r}|${d}|${a}|${bound}|${thp}")
+                    done
                 done
             done
         done
     done
 }
 
+# ------------------------------------------------------------------------------
+# Print summary of regression configuration and parameter sweeps
+# ------------------------------------------------------------------------------
 print_regression_config() {
     echo -e " Configured Kernels : ${KERNELS[*]}"
     echo -e " Benchmarks         : ${BENCHMARKS[*]}"
@@ -362,7 +329,7 @@ print_regression_config() {
 }
 
 # ------------------------------------------------------------------------------
-# Helpers: Kernel switch & benchmark runner
+# Update GRUB default boot entry to target kernel and trigger system reboot
 # ------------------------------------------------------------------------------
 switch_kernel_and_reboot() {
     local target_kernel="$1" target_memmap="$2"
@@ -389,22 +356,26 @@ switch_kernel_and_reboot() {
     reboot
 }
 
+# ------------------------------------------------------------------------------
+# Execute workload with inline prefetch, ratio, and THP environment options
+# ------------------------------------------------------------------------------
 run_target_benchmark() {
-    local bench="$1" ratio="${2:-${TIER_RATIO:-}}" dist="${3:-}" adaptive="${4:-}" bound="${5:-}" thp="${6:-}"
-    local run_sh="${ROOT_DIR}/workloads/scripts/run_workloads.sh"
+    local bench="$1" ratio="${2:-}" dist="${3:-}" adaptive="${4:-}" bound="${5:-}" thp="${6:-}"
 
-    parse_prefetch_params "$dist" "$bound"
-    [ -n "$adaptive" ] && export PREFETCH_ADAPTIVE="$adaptive" || unset PREFETCH_ADAPTIVE || true
-
-    if [[ "$bench" =~ ^(gapbs_[a-z]+)_(kron|urand|twitter|web|road)$ ]]; then
-        bash "$run_sh" "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "$ratio"
-    else
-        bash "$run_sh" "$bench" "" "$ratio"
-    fi
+    TIER_RATIO="${ratio}" \
+    THP_MODE="${thp}" \
+    THP="${thp}" \
+    PREFETCH_PROMOTE_DISTANCE="${dist}" \
+    PREFETCH_DEMOTE_DISTANCE="${dist}" \
+    PREFETCH_DISTANCE="${dist}" \
+    PREFETCH_MIN_DISTANCE="${bound}" \
+    PREFETCH_MAX_DISTANCE="${bound}" \
+    PREFETCH_ADAPTIVE="${adaptive}" \
+    bash "$RUN_WORKLOADS" "$bench"
 }
 
 # ------------------------------------------------------------------------------
-# Action: Step Execution
+# Iterate through regression matrix, manage reboots, and execute benchmarks
 # ------------------------------------------------------------------------------
 execute_step() {
     load_targets
@@ -412,11 +383,11 @@ execute_step() {
 
     # shellcheck source=/dev/null
     source "$STATE_FILE"
-    CURRENT_INDEX="${CURRENT_INDEX:-0}"
-    TOTAL_ITEMS="${#TARGET_ITEMS[@]}"
+    local total="${#TARGET_ITEMS[@]}"
+    local start_idx="${CURRENT_INDEX:-0}"
 
-    while [ "$CURRENT_INDEX" -lt "$TOTAL_ITEMS" ]; do
-        IFS='|' read -r CURRENT_KERNEL CURRENT_BENCHMARK CURRENT_RATIO CURRENT_DIST CURRENT_ADAPTIVE CURRENT_BOUND CURRENT_THP <<< "${TARGET_ITEMS[$CURRENT_INDEX]}"
+    for ((idx = start_idx; idx < total; idx++)); do
+        IFS='|' read -r CURRENT_KERNEL CURRENT_BENCHMARK CURRENT_RATIO CURRENT_DIST CURRENT_ADAPTIVE CURRENT_BOUND CURRENT_THP <<< "${TARGET_ITEMS[$idx]}"
         CURRENT_THP="${CURRENT_THP:-}"
         CURRENT_MEMMAP=$(resolve_memmap "$CURRENT_BENCHMARK" "$CURRENT_RATIO")
 
@@ -449,116 +420,27 @@ execute_step() {
         LAST_REBOOT_MEMMAP=""
         REBOOT_ATTEMPTS=0
 
-        local mode_name=""
-        if is_prefetch_kernel "$CURRENT_KERNEL"; then
-            [ "$CURRENT_ADAPTIVE" == "1" ] && mode_name="Adaptive"
-            [ "$CURRENT_ADAPTIVE" == "0" ] && mode_name="Static"
-        fi
+        # Build informative logging tag for prefetch and THP parameters
         local dist_tag=""
         if is_prefetch_kernel "$CURRENT_KERNEL"; then
+            [ "$CURRENT_ADAPTIVE" == "1" ] && dist_tag+=" | Mode: Adaptive"
+            [ "$CURRENT_ADAPTIVE" == "0" ] && dist_tag+=" | Mode: Static"
             [ -n "$CURRENT_DIST" ] && dist_tag+=" | Distance: ${CURRENT_DIST}"
             [ -n "${CURRENT_BOUND:-}" ] && dist_tag+=" | Bounds: ${CURRENT_BOUND}"
-            [ -n "$mode_name" ] && dist_tag+=" | Mode: ${mode_name}"
         fi
         [ -n "$CURRENT_THP" ] && dist_tag+=" | THP: ${CURRENT_THP}"
 
         log "${CYAN}================================================================================${NC}"
-        log "${CYAN} [Step $((CURRENT_INDEX + 1))/${TOTAL_ITEMS}] Kernel: ${CURRENT_KERNEL} | Workload: ${CURRENT_BENCHMARK} | Ratio: ${CURRENT_RATIO}${dist_tag} (${CURRENT_MEMMAP})${NC}"
+        log "${CYAN} [Step $((idx + 1))/${total}] Kernel: ${CURRENT_KERNEL} | Workload: ${CURRENT_BENCHMARK} | Ratio: ${CURRENT_RATIO}${dist_tag} (${CURRENT_MEMMAP})${NC}"
         log "${CYAN}================================================================================${NC}"
 
-        # Configure Transparent Huge Pages (THP) online (for both prefetch and non-prefetch kernels)
-        local thp_file="/sys/kernel/mm/transparent_hugepage/enabled"
-        cur_thp=$(cat "$thp_file" 2>/dev/null || echo "N/A")
-        log "${GREEN}[*] Configured THP (/sys/kernel/mm/transparent_hugepage/enabled): ${cur_thp} (requested=${CURRENT_THP})${NC}"
-
-        # If prefetch kernel, configure online sysfs parameters
-        if is_prefetch_kernel "$CURRENT_KERNEL"; then
-            parse_prefetch_params "${CURRENT_DIST:-}" "${CURRENT_BOUND:-}"
-            [ -n "$CURRENT_ADAPTIVE" ] && export PREFETCH_ADAPTIVE="$CURRENT_ADAPTIVE" || export PREFETCH_ADAPTIVE=1
-
-            local prefetch_sysfs=""
-            [ -d "/sys/kernel/mm/page_prefetch" ] && prefetch_sysfs="/sys/kernel/mm/page_prefetch"
-            [ -d "/sys/kernel/mm/pact_prefetch" ] && prefetch_sysfs="/sys/kernel/mm/pact_prefetch"
-
-            if [ -n "$prefetch_sysfs" ]; then
-                local is_zero=0
-                if [ -n "${CURRENT_DIST:-}" ]; then
-                    [ "${PREFETCH_DISTANCE:-0}" == "0" ] && [ "${PREFETCH_DEMOTE_DISTANCE:-0}" == "0" ] && is_zero=1
-                fi
-
-                [ -f "${prefetch_sysfs}/enabled" ] && echo "$(( 1 - is_zero ))" > "${prefetch_sysfs}/enabled" 2>/dev/null || true
-                [ -n "$CURRENT_ADAPTIVE" ] && [ -f "${prefetch_sysfs}/adaptive" ] && echo "$CURRENT_ADAPTIVE" > "${prefetch_sysfs}/adaptive" 2>/dev/null || true
-                if [ -n "${PREFETCH_PROMOTE_DISTANCE:-}" ]; then
-                    [ -f "${prefetch_sysfs}/promote_distance" ] && echo "$PREFETCH_PROMOTE_DISTANCE" > "${prefetch_sysfs}/promote_distance" 2>/dev/null || true
-                    [ -f "${prefetch_sysfs}/distance" ] && echo "$PREFETCH_DISTANCE" > "${prefetch_sysfs}/distance" 2>/dev/null || true
-                fi
-                if [ -n "${PREFETCH_DEMOTE_DISTANCE:-}" ]; then
-                    [ -f "${prefetch_sysfs}/demote_distance" ] && echo "$PREFETCH_DEMOTE_DISTANCE" > "${prefetch_sysfs}/demote_distance" 2>/dev/null || true
-                fi
-                if [ -n "${PREFETCH_MIN_DISTANCE:-}" ]; then
-                    [ -f "${prefetch_sysfs}/min_distance" ] && echo "$PREFETCH_MIN_DISTANCE" > "${prefetch_sysfs}/min_distance" 2>/dev/null || true
-                fi
-                if [ -n "${PREFETCH_MAX_DISTANCE:-}" ]; then
-                    [ -f "${prefetch_sysfs}/max_distance" ] && echo "$PREFETCH_MAX_DISTANCE" > "${prefetch_sysfs}/max_distance" 2>/dev/null || true
-                fi
-
-                local cur_d cur_p cur_m cur_a cur_min cur_max tier_info=""
-                cur_d=$(cat "${prefetch_sysfs}/distance" 2>/dev/null || echo "${PREFETCH_DISTANCE:-}")
-                cur_p=$(cat "${prefetch_sysfs}/promote_distance" 2>/dev/null || echo "")
-                cur_m=$(cat "${prefetch_sysfs}/demote_distance" 2>/dev/null || echo "")
-                cur_a=$(cat "${prefetch_sysfs}/adaptive" 2>/dev/null || echo "$CURRENT_ADAPTIVE")
-                cur_min=$(cat "${prefetch_sysfs}/min_distance" 2>/dev/null || echo "${PREFETCH_MIN_DISTANCE:-}")
-                cur_max=$(cat "${prefetch_sysfs}/max_distance" 2>/dev/null || echo "${PREFETCH_MAX_DISTANCE:-}")
-
-                local extra_details=""
-                [ -n "$cur_min" ] && extra_details+=", min_dist=${cur_min}"
-                [ -n "$cur_max" ] && extra_details+=", max_dist=${cur_max}"
-
-                if [ -n "$cur_p" ] || [ -n "$cur_m" ]; then
-                    tier_info=" (promote=${cur_p:-$cur_d}, demote=${cur_m:-$cur_d}${cur_a:+, adaptive=${cur_a}}${extra_details})"
-                elif [ -n "$cur_a" ]; then
-                    tier_info=" (adaptive=${cur_a}${extra_details})"
-                fi
-                log "${GREEN}[*] Configured ${prefetch_sysfs}: enabled=$(( 1 - is_zero ))${tier_info}${NC}"
-            fi
-        else
-            parse_prefetch_params ""
-            unset PREFETCH_ADAPTIVE || true
-        fi
-
+        # Settle system before running benchmark
         log "Allowing system to settle for 10 seconds before starting benchmark..."
         sleep 10
 
+        # Execute targeted workload
         log "${GREEN}Executing targeted benchmark: ${CURRENT_BENCHMARK} (Ratio: ${CURRENT_RATIO}${dist_tag})...${NC}"
-        export TIER_RATIO="$CURRENT_RATIO"
-        export THP_MODE="${CURRENT_THP:-}"
-        export THP="${CURRENT_THP:-}"
-        if is_prefetch_kernel "$CURRENT_KERNEL"; then
-            run_target_benchmark "$CURRENT_BENCHMARK" "$CURRENT_RATIO" "$CURRENT_DIST" "$CURRENT_ADAPTIVE" "${CURRENT_BOUND:-}" "${CURRENT_THP:-}" || log "${RED}[WARNING] Benchmark ${CURRENT_BENCHMARK} exited with status $?${NC}"
-        else
-            run_target_benchmark "$CURRENT_BENCHMARK" "$CURRENT_RATIO" "" "" "" "${CURRENT_THP:-}" || log "${RED}[WARNING] Benchmark ${CURRENT_BENCHMARK} exited with status $?${NC}"
-        fi
-
-        # Safety check: if run_workloads.sh output without distance/adaptive suffix exists, rename it (for *-prefetch* kernels only)
-        if [ -n "$CURRENT_DIST" ] && is_prefetch_kernel "$CURRENT_KERNEL"; then
-            local out_base="${ROOT_DIR}/workloads/output/$(uname -r)"
-            local plain_log="${out_base}/regress_${CURRENT_BENCHMARK}_${CURRENT_RATIO//:/_}.log"
-            local adapt_suffix=""
-            [ "$CURRENT_ADAPTIVE" == "1" ] && adapt_suffix="_adapt"
-            [ "$CURRENT_ADAPTIVE" == "0" ] && adapt_suffix="_static"
-            adapt_suffix+="_${CURRENT_THP}"
-
-            local dist_suffix=""
-            if [ "${PREFETCH_DISTANCE:-0}" == "0" ] && [ "${PREFETCH_DEMOTE_DISTANCE:-0}" == "0" ]; then
-                dist_suffix="_0"
-            elif [ -n "${PREFETCH_PROMOTE_DISTANCE:-}" ] && [ -n "${PREFETCH_DEMOTE_DISTANCE:-}" ] && [ "${PREFETCH_PROMOTE_DISTANCE}" != "${PREFETCH_DEMOTE_DISTANCE}" ]; then
-                dist_suffix="_p${PREFETCH_PROMOTE_DISTANCE}_d${PREFETCH_DEMOTE_DISTANCE}${adapt_suffix}"
-            else
-                dist_suffix="_${PREFETCH_DISTANCE}${adapt_suffix}"
-            fi
-            local dist_log="${out_base}/regress_${CURRENT_BENCHMARK}_${CURRENT_RATIO//:/_}${dist_suffix}.log"
-            [ -f "$plain_log" ] && [ ! -f "$dist_log" ] && mv "$plain_log" "$dist_log"
-        fi
+        run_target_benchmark "$CURRENT_BENCHMARK" "$CURRENT_RATIO" "$CURRENT_DIST" "$CURRENT_ADAPTIVE" "${CURRENT_BOUND:-}" "${CURRENT_THP:-}" || log "${RED}[WARNING] Benchmark ${CURRENT_BENCHMARK} exited with status $?${NC}"
 
         log "${GREEN}Completed benchmark: ${CURRENT_BENCHMARK} (Ratio: ${CURRENT_RATIO}${dist_tag}).${NC}"
 
@@ -568,31 +450,20 @@ execute_step() {
         echo "STARTED_TIME=${STARTED_TIME:-$(date +%s)}" >> "$STATE_FILE"
     done
 
+    # Clean up state and service upon completing all execution steps
     log "${GREEN}================================================================================${NC}"
-    log "${GREEN} ALL MULTI-KERNEL & MULTI-RATIO REGRESSIONS COMPLETED (${TOTAL_ITEMS}/${TOTAL_ITEMS})! ${NC}"
+    log "${GREEN} ALL MULTI-KERNEL & MULTI-RATIO REGRESSIONS COMPLETED (${total}/${total})! ${NC}"
     log "${GREEN}================================================================================${NC}"
     remove_service
     rm -f "$STATE_FILE"
 }
 
 # ------------------------------------------------------------------------------
-# Action: Start Regression Suite
+# Initialize state and start regression suite from step 0
 # ------------------------------------------------------------------------------
 start_regression() {
     load_targets
     local total="${#TARGET_ITEMS[@]}"
-
-    if [ -f "$STATE_FILE" ]; then
-        # shellcheck source=/dev/null
-        source "$STATE_FILE"
-        if [ "${CURRENT_INDEX:-0}" -gt 0 ] && [ "${CURRENT_INDEX:-0}" -lt "$total" ]; then
-            echo -e "${YELLOW}[!] Existing regression state found at Step $((CURRENT_INDEX + 1))/${total}.${NC}"
-            echo -e "${YELLOW}[!] Resuming from current step. (To restart from Step 1, run 'sudo $0 reset' first).${NC}"
-            install_service
-            execute_step
-            return 0
-        fi
-    fi
 
     echo -e "${CYAN}================================================================================${NC}"
     echo -e "${CYAN} Starting Automated Multi-Kernel & Multi-Ratio Regression Suite (${total} Steps) ${NC}"
@@ -602,12 +473,11 @@ start_regression() {
     echo "CURRENT_INDEX=0" > "$STATE_FILE"
     echo "STARTED_TIME=$(date +%s)" >> "$STATE_FILE"
     install_service
-
     execute_step
 }
 
 # ------------------------------------------------------------------------------
-# Action: Check Status
+# Display current regression progress, system status, and active target
 # ------------------------------------------------------------------------------
 show_status() {
     load_targets
@@ -661,27 +531,8 @@ show_status() {
     echo -e "${CYAN}================================================================================${NC}"
 }
 
-show_dry_run() {
-    load_targets
-    print_regression_config
-    echo -e "\n Planned Execution Steps (${#TARGET_ITEMS[@]} total):"
-    local idx=1
-    for item in "${TARGET_ITEMS[@]}"; do
-        local k b r d a bound thp mode_tag=""
-        IFS='|' read -r k b r d a bound thp <<< "$item"
-        if is_prefetch_kernel "$k"; then
-            [ "$a" == "1" ] && mode_tag=" Mode=Adaptive"
-            [ "$a" == "0" ] && mode_tag=" Mode=Static"
-            [ -n "$d" ] && mode_tag+=", Dist=${d}"
-            [ -n "$bound" ] && mode_tag+=", Bounds=${bound}"
-        fi
-        echo "  [$idx] Kernel=${k}, Bench=${b}, Ratio=${r}${mode_tag:+,${mode_tag}}${thp:+, THP=${thp}}"
-        idx=$((idx + 1))
-    done
-}
-
 # ------------------------------------------------------------------------------
-# Action: Stop / Abort
+# Cancel running regression, bring CPUs online, and reset state
 # ------------------------------------------------------------------------------
 abort_regression() {
     log "${YELLOW}Aborting automated regression and cleaning up...${NC}"
@@ -692,7 +543,7 @@ abort_regression() {
 }
 
 # ------------------------------------------------------------------------------
-# CLI Router
+# CLI Router and Entry Point
 # ------------------------------------------------------------------------------
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     ACTION="${1:-start}"
@@ -704,14 +555,8 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
         resume)
             execute_step
             ;;
-        --step|step)
-            execute_step
-            ;;
         status|check)
             show_status
-            ;;
-        dry-run|plan|list)
-            show_dry_run
             ;;
         stop|abort|cancel|reset)
             abort_regression

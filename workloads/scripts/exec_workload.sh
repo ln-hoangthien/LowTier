@@ -14,6 +14,8 @@ WORKLOAD_DIR="${ROOT_DIR}/workloads"
 # Workload cores (default 24: cores 0..23; cores 24..32 reserved for kswapd/bpftrace/perf)
 export WORKLOAD_CORES="${WORKLOAD_CORES:-24}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-${WORKLOAD_CORES}}"
+export OMP_PROC_BIND="${OMP_PROC_BIND:-true}"
+export OMP_PLACES="${OMP_PLACES:-cores}"
 SELECTED_CPUS="${SELECTED_CPUS:-$(seq -s, 0 $(( WORKLOAD_CORES - 1 )))}"
 
 # Graph Datasets Directory
@@ -267,7 +269,7 @@ resolve_cmd() {
     local ds="$2"
     local graph_file=""
     local cmd=""
-    local RUN_PREFIX="env OMP_NUM_THREADS=${OMP_NUM_THREADS} numactl --physcpubind=${SELECTED_CPUS}"
+    local RUN_PREFIX="env OMP_NUM_THREADS=${OMP_NUM_THREADS} OMP_PROC_BIND=${OMP_PROC_BIND} OMP_PLACES=${OMP_PLACES} numactl --physcpubind=${SELECTED_CPUS}"
     if [[ "$t" == gapbs_* ]]; then
         graph_file=$(resolve_graph_file "$t" "$ds")
     fi
