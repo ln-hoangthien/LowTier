@@ -233,7 +233,8 @@ int discover_cha_pmus(cha_pmu_info_t *cha_pmus, int *nr_cha, uint64_t cpu_mask)
 int setup_tor_events(event_group_t *event_group, int pmu_type, int tier, int core_id)
 {
     const pmu_platform_t *plat = &g_pmu_platform;
-    static const char *event_names[CHA_EVENT_COUNT] = {"TOR_OCCUPANCY", "TOR_CYCLES", "TOR_INSERTS"};
+    static const char *event_names[CHA_EVENT_COUNT] = {"TOR_OCCUPANCY", "TOR_CYCLES",
+                                                       "TOR_INSERTS"};
     int leader_fd = -1;
 
     for (int i = 0; i < CHA_EVENT_COUNT; i++) {
@@ -533,7 +534,7 @@ int setup_pebs_event(per_cpu_state_t *cpu_state, pid_t pid, int cpu)
 }
 
 int setup_counting_event(perf_event_t *perf_event, pid_t pid, int cpu, perf_event_t *leader,
-                         uint64_t config, const char *name)
+                         uint64_t config, uint64_t ocr_mask, const char *name)
 {
     struct perf_event_attr pe;
 
@@ -541,6 +542,7 @@ int setup_counting_event(perf_event_t *perf_event, pid_t pid, int cpu, perf_even
     pe.type = PERF_TYPE_RAW;
     pe.size = sizeof(pe);
     pe.config = config;                      /* event config */
+    pe.config1 = ocr_mask;                   /* OCR response mask if any */
     pe.sample_type = PERF_SAMPLE_IDENTIFIER; /* key for counting mode */
     pe.sample_period = 0;
     pe.exclude_kernel = 1;
@@ -558,12 +560,13 @@ int setup_counting_event(perf_event_t *perf_event, pid_t pid, int cpu, perf_even
 
     perf_event->fd = perf_event_open(&pe, pid, cpu, (leader == NULL ? -1 : leader->fd), 0x8);
     if (perf_event->fd < 0) {
-        log_error("setup_counting_event", "Failed to open counting event config=0x%llx", config);
+        log_error("setup_counting_event", "Failed to open counting event config=0x%llx ocr_mask=0x%llx",
+                  config, ocr_mask);
         perf_event->fd = -1;
         exit(EXIT_FAILURE);
     } else {
-        log_info("setup_counting_event", "thread [%d] counting event %s (config=0x%llx) fd:%d", pid,
-                 name, config, perf_event->fd);
+        log_info("setup_counting_event", "thread [%d] counting event %s (config=0x%llx, ocr_mask=0x%llx) fd:%d", pid,
+                 name, config, ocr_mask, perf_event->fd);
     }
     ioctl(perf_event->fd, PERF_EVENT_IOC_ID, &perf_event->id);
 
@@ -713,7 +716,8 @@ void setup_workload_counting_events(pact_workload_t *wl)
     }
     for (int j = 0; j < CORE_EVENT_COUNT; j++) {
         if (setup_counting_event(&wl->counting_events[j], wl->target_pid, -1, &wl->counting_leader,
-                                 core_event_configs[j].config, core_event_configs[j].name) < 0) {
+                                 core_event_configs[j].config, core_event_configs[j].ocr_mask,
+                                 core_event_configs[j].name) < 0) {
             log_error("setup_workload_counting_events",
                       "Failed to setup %s event for workload PID %d", core_event_configs[j].name,
                       wl->target_pid);
@@ -723,4 +727,17 @@ void setup_workload_counting_events(pact_workload_t *wl)
     log_info("setup_workload_counting_events",
              "Workload PID %d: per-workload counting events setup (1 fd per event, inherit=1)",
              wl->target_pid);
+}
+
+/*
+ * Get the current Memory-Level Parallelism (MLP) for a tier.
+ */
+double pmu_get_tier_mlp(const pact_context_t *ctx, int tier)
+{
+    const pact_context_t *p = ctx ? ctx : g_pact_ctx;
+    if (!p || !p->workload) {
+        return 1.0;
+    }
+    double mlp = (tier == 0) ? p->workload->workload_mlp_fast : p->workload->workload_mlp_slow;
+    return (mlp >= 1.0) ? mlp : 1.0;
 }

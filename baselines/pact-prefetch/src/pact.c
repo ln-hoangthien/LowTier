@@ -441,16 +441,15 @@ static int process_migration_batch_results(pact_context_t *ctx, pac_metadata_t *
               promotion_success, demotion_success, count);
     return (int)(promotion_success + demotion_success);
 }
-
 /*
- * Dedicated migration thread - busy-waits on per-workload ring buffers
- * Executes numa_move_pages() directly without coroutine overhead
+ * Dispatch batch via numa_move_pages with encoded prefetch flags.
+ * Passes dynamic promote and demote distances directly inside the syscall flags.
  */
-/* Dispatch one already-assembled batch via synchronous numa_move_pages. */
 static int mig_dispatch_batch(pact_context_t *ctx, pid_t target_pid, void **pages, int *nodes,
                               int *status, pac_metadata_t **metas, int batch_count)
 {
-    long result = numa_move_pages(target_pid, batch_count, pages, nodes, status, MPOL_MF_MOVE);
+    int flags = mig_telemetry_get_move_pages_flags();
+    long result = numa_move_pages(target_pid, batch_count, pages, nodes, status, flags);
     int errno_val = errno;
 
     return process_migration_batch_results(ctx, metas, status, batch_count, result, errno_val);

@@ -81,6 +81,7 @@ static const pmu_platform_t platform_skx = {
     .id = PMU_PLATFORM_SKX,
     .name = "Skylake-X",
     .event_llc_miss_local = 0x01d3,
+    .event_llc_miss_local_ocr_mask = 0, // Unused
     .event_llc_miss_remote = 0x02d3,
     .nr_cha_mapping = 10,
     .cha_to_core_map = skx_cha_to_core_map,
@@ -119,8 +120,12 @@ static const pmu_platform_t platform_skx = {
 static const pmu_platform_t platform_emr = {
     .id = PMU_PLATFORM_EMR,
     .name = "Sapphire/Emerald Rapids",
-    .event_llc_miss_local = 0x01d3,
-    .event_llc_miss_remote = 0x02d3,
+    /* On Sapphire/Emerald Rapids, multi-tile SNC mesh distributes DRAM across IMCs.
+     * Core counting for local DRAM uses Offcore Response (ocr.reads_to_core.local_socket_dram).
+     * Remote DRAM retains original 0x02d3 for BOTH counting and PEBS sampling. */
+    .event_llc_miss_local = 0x12a,
+    .event_llc_miss_local_ocr_mask = 0x70c004477ULL,  /* ocr.reads_to_core.local_socket_dram */
+    .event_llc_miss_remote = 0x02d3,                 /* MEM_LOAD_L3_MISS_RETIRED.REMOTE_DRAM */
     .nr_cha_mapping = 32,
     .cha_to_core_map = emr_cha_to_core_map,
     .core_to_tid = emr_core_to_tid,
@@ -169,9 +174,10 @@ int pmu_platform_init(void)
 
     extern event_config_t core_event_configs[CORE_EVENT_COUNT];
     core_event_configs[CORE_EVENT_LLC_MISS_FAST] =
-        (event_config_t){g_pmu_platform.event_llc_miss_local, "LLC_MISS_FAST"};
+        (event_config_t){g_pmu_platform.event_llc_miss_local,
+                         g_pmu_platform.event_llc_miss_local_ocr_mask, "LLC_MISS_FAST"};
     core_event_configs[CORE_EVENT_LLC_MISS_SLOW] =
-        (event_config_t){g_pmu_platform.event_llc_miss_remote, "LLC_MISS_SLOW"};
+        (event_config_t){g_pmu_platform.event_llc_miss_remote, 0, "LLC_MISS_SLOW"};
 
     return (id == PMU_PLATFORM_UNKNOWN) ? -1 : 0;
 }

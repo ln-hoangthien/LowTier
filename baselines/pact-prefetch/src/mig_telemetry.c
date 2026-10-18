@@ -11,15 +11,14 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <unistd.h>
-#include <math.h>
 #include <errno.h>
 #include <sched.h>
 #include <fcntl.h>
-#include <time.h>
 #include <sys/types.h>
 #include <sys/syscall.h>
 #include <sys/ioctl.h>
 #include <linux/perf_event.h>
+#include <numaif.h>
 
 #include "pmu.h"
 #include "pact.h"
@@ -30,13 +29,45 @@
  * Thread-Scoped PMU Telemetry and CPU Pinning for Migration Pacing
  * ========================================================================= */
 
-static unsigned int prefetch_enabled = 1;
-static unsigned int prefetch_adaptive = 1;
-static unsigned int prefetch_promote_distance = PREFETCH_DEFAULT_PROMOTE_DISTANCE;
-static unsigned int prefetch_demote_distance = PREFETCH_DEFAULT_DEMOTE_DISTANCE;
-static unsigned int prefetch_min_distance = PREFETCH_DEFAULT_MIN_DISTANCE;
-static unsigned int prefetch_max_distance = PREFETCH_DEFAULT_MAX_DISTANCE;
-static bool thp_always = false;
+/*
+ * Read-Mostly Configuration: initialized once during startup and unchanged during benchmark.
+ * Kept compact (8 bytes aligned) and isolated from hot write variables.
+ */
+struct prefetch_config {
+    bool enabled;
+    bool adaptive;
+    uint8_t min_distance;
+    uint8_t max_distance;
+    bool thp_always;
+};
+
+static struct prefetch_config prefetch_cfg __attribute__((aligned(8))) = {
+    .enabled = true,
+    .adaptive = true,
+    .min_distance = PREFETCH_DEFAULT_MIN_DISTANCE,
+    .max_distance = PREFETCH_DEFAULT_MAX_DISTANCE,
+    .thp_always = false,
+};
+
+/*
+ * Hot Read/Write State: updated by pacing logic and read by migration worker.
+ * Isolated on a dedicated cache line to eliminate false sharing.
+ * Stored as uint8_t values packed in a uint16_t union so:
+ * - promote (bits 0..7) and demote (bits 8..15) can be read atomically in a single 16-bit instruction.
+ * - (uint32_t)val << 16 directly maps into MPOL_MF_PREFETCH flags.
+ */
+union pact_prefetch_distances {
+    struct {
+        uint8_t promote;
+        uint8_t demote;
+    };
+    uint16_t val;
+};
+
+static union pact_prefetch_distances prefetch_distances __attribute__((aligned(64))) = {
+    .promote = PREFETCH_DEFAULT_PROMOTE_DISTANCE,
+    .demote = PREFETCH_DEFAULT_DEMOTE_DISTANCE,
+};
 
 static const char *get_prefetch_sysfs_dir(void)
 {
@@ -89,19 +120,20 @@ static void init_prefetch_sysfs_params(void)
     }
     is_sysfs_init = 1;
 
-    prefetch_enabled = read_prefetch_sysfs_uint("enabled", 1);
-    prefetch_adaptive = read_prefetch_sysfs_uint("adaptive", 1);
-    prefetch_min_distance = read_prefetch_sysfs_uint("min_distance", PREFETCH_DEFAULT_MIN_DISTANCE);
-    prefetch_max_distance = read_prefetch_sysfs_uint("max_distance", PREFETCH_DEFAULT_MAX_DISTANCE);
-    prefetch_promote_distance =
-        read_prefetch_sysfs_uint("promote_distance", PREFETCH_DEFAULT_PROMOTE_DISTANCE);
-    prefetch_demote_distance =
-        read_prefetch_sysfs_uint("demote_distance", PREFETCH_DEFAULT_DEMOTE_DISTANCE);
+    prefetch_cfg.enabled = (read_prefetch_sysfs_uint("enabled", 1) != 0);
+    prefetch_cfg.adaptive = (read_prefetch_sysfs_uint("adaptive", 1) != 0);
+    prefetch_cfg.min_distance =
+        (uint8_t)read_prefetch_sysfs_uint("min_distance", PREFETCH_DEFAULT_MIN_DISTANCE);
+    prefetch_cfg.max_distance =
+        (uint8_t)read_prefetch_sysfs_uint("max_distance", PREFETCH_DEFAULT_MAX_DISTANCE);
+    prefetch_distances.promote =
+        (uint8_t)read_prefetch_sysfs_uint("promote_distance", PREFETCH_DEFAULT_PROMOTE_DISTANCE);
+    prefetch_distances.demote =
+        (uint8_t)read_prefetch_sysfs_uint("demote_distance", PREFETCH_DEFAULT_DEMOTE_DISTANCE);
 
-    if (prefetch_enabled == 0) {
-        prefetch_adaptive = 0;
-        prefetch_promote_distance = 0;
-        prefetch_demote_distance = 0;
+    if (!prefetch_cfg.enabled) {
+        prefetch_cfg.adaptive = false;
+        prefetch_distances.val = 0;
     }
 
     /*
@@ -112,14 +144,14 @@ static void init_prefetch_sysfs_params(void)
      * Note: Per-batch heterogeneous mixture decomposition in mig_telemetry_compute_interval
      * dynamically handles runtime mixtures of 4KB and 2MB pages.
      */
-    thp_always = false;
+    prefetch_cfg.thp_always = false;
     int fd_thp = open("/sys/kernel/mm/transparent_hugepage/enabled", O_RDONLY | O_CLOEXEC);
     if (fd_thp >= 0) {
         char thp_buf[64] = {0};
         if (read(fd_thp, thp_buf, sizeof(thp_buf) - 1) > 0) {
             if (strstr(thp_buf, "[always]") != NULL || strcmp(thp_buf, "always\n") == 0 ||
                 strcmp(thp_buf, "always") == 0) {
-                thp_always = true;
+                prefetch_cfg.thp_always = true;
             }
         }
         close(fd_thp);
@@ -141,11 +173,12 @@ static void init_prefetch_sysfs_params(void)
     log_info("init_prefetch_sysfs_params",
              "Migration Prefetch Parameters (%s): enabled=%u (adaptive=%u, promote=%u, demote=%u, "
              "min_dist=%u, max_dist=%u), %s",
-             sysfs_dir ? sysfs_dir : "N/A", prefetch_enabled, prefetch_adaptive,
-             prefetch_promote_distance, prefetch_demote_distance, prefetch_min_distance,
-             prefetch_max_distance,
-             thp_always ? (defrag_always ? "THP enabled" : "THP enabled (defrag defer)")
-                        : "THP disabled/4KB");
+             sysfs_dir ? sysfs_dir : "N/A", prefetch_cfg.enabled, prefetch_cfg.adaptive,
+             prefetch_distances.promote, prefetch_distances.demote, prefetch_cfg.min_distance,
+             prefetch_cfg.max_distance,
+             prefetch_cfg.thp_always
+                 ? (defrag_always ? "THP enabled" : "THP enabled (defrag defer)")
+                 : "THP disabled/4KB");
 }
 
 int mig_telemetry_init_caller(struct mig_telemetry *telem, int target_cpu, double core_freq_ghz)
@@ -242,15 +275,24 @@ double mig_telemetry_compute_interval(struct mig_telemetry *telem, uint64_t page
     double uops_total = (double)uops_retired;
     double p_total = (double)pages_migrated;
 
-    /*
-     * If THP is turned off (madvise or never), no 2MB pages can exist; n_2m is strictly 0.
-     * Only when THP is enabled as [always] do we solve for the number of 2MB pages in the batch.
-     */
-    double n_2m = 0.0;
-    if (thp_always) {
-        n_2m = (uops_total - p_total * UOPS_PER_4KB) / (UOPS_PER_2MB - UOPS_PER_4KB);
-        n_2m = clamp(n_2m, 0.0, p_total);
+    /* Fast-path for homogeneous 4KB pages (standard non-THP [always] workloads) */
+    if (!prefetch_cfg.thp_always) {
+        uint64_t total_cachelines = pages_migrated << 6; /* pages * 64 */
+        double active_cycles_per_line = uops_total / (CORE_WIDTH_4KB * (double)total_cachelines);
+        double t_interval_ns = active_cycles_per_line / telem->core_freq_ghz;
+        telem->last_valid_t_int = t_interval_ns;
+        log_debug("mig_telemetry_compute_interval",
+                  "Uops: %lu, Pages: %lu (4KB only), Lines: %lu, Active/line: %.2f, T_int: %.2f ns",
+                  uops_retired, pages_migrated, total_cachelines, active_cycles_per_line,
+                  t_interval_ns);
+        return t_interval_ns;
     }
+
+    /*
+     * If THP is turned on as [always], solve for the number of 2MB pages in the batch.
+     */
+    double n_2m = (uops_total - p_total * UOPS_PER_4KB) / (UOPS_PER_2MB - UOPS_PER_4KB);
+    n_2m = clamp(n_2m, 0.0, p_total);
     double n_4k = p_total - n_2m;
 
     /* Compute exact cachelines moved across the heterogeneous mix */
@@ -301,28 +343,31 @@ void mig_telemetry_close(struct mig_telemetry *telem)
     telem->is_initialized = false;
 }
 
-double read_loaded_latency_tier_ns(pact_context_t *ctx, bool is_slow_tier)
+static void read_loaded_latency_both_tiers(pact_context_t *ctx, double *out_l_slow,
+                                           double *out_l_fast)
 {
-    static double s_smoothed_lat_slow_ns =
-        190.0; /* Initial calibrated baseline (~771 cyc / 2.4 GHz) */
-    static double s_smoothed_lat_fast_ns = 80.0; /* Initial calibrated local DRAM baseline */
+    static double s_smoothed_lat_slow_ns = 190.0;
+    static double s_smoothed_lat_fast_ns = 80.0;
 
-    double *p_lat = is_slow_tier ? &s_smoothed_lat_slow_ns : &s_smoothed_lat_fast_ns;
-
-    /* Native PACT CHA TOR Dynamic Measurement (Little's Law) */
+    /* Native PACT CHA TOR Dynamic Measurement (Little's Law) in a single pass */
     if (ctx && ctx->workload && ctx->workload->nr_cha > 0) {
         pact_workload_t *wl = ctx->workload;
-        uint64_t sum_occupancy = 0;
-        uint64_t sum_inserts = 0;
-        int valid_chas = 0;
+        uint64_t sum_occ_slow = 0, sum_ins_slow = 0;
+        uint64_t sum_occ_fast = 0, sum_ins_fast = 0;
+        int valid_chas_slow = 0, valid_chas_fast = 0;
 
         for (int i = 0; i < wl->nr_cha; i++) {
-            event_group_t *g =
-                is_slow_tier ? &wl->cha_pmus[i].group_slow : &wl->cha_pmus[i].group_fast;
-            if (g->time_running - g->last_time_running >= 1000000) {
-                sum_occupancy += g->values[CHA_TOR_OCCUPANCY];
-                sum_inserts += g->values[CHA_TOR_INSERTS];
-                valid_chas++;
+            event_group_t *gs = &wl->cha_pmus[i].group_slow;
+            if (gs->time_running - gs->last_time_running >= 1000000) {
+                sum_occ_slow += gs->values[CHA_TOR_OCCUPANCY];
+                sum_ins_slow += gs->values[CHA_TOR_INSERTS];
+                valid_chas_slow++;
+            }
+            event_group_t *gf = &wl->cha_pmus[i].group_fast;
+            if (gf->time_running - gf->last_time_running >= 1000000) {
+                sum_occ_fast += gf->values[CHA_TOR_OCCUPANCY];
+                sum_ins_fast += gf->values[CHA_TOR_INSERTS];
+                valid_chas_fast++;
             }
         }
 
@@ -330,13 +375,29 @@ double read_loaded_latency_tier_ns(pact_context_t *ctx, bool is_slow_tier)
             (ctx->tsc_freq_hz > 0) ? ((double)ctx->tsc_freq_hz / 1e9) : DEFAULT_CORE_FREQ_GHZ;
 
         /* Little's Law: Average Latency = TOR_OCCUPANCY / TOR_INSERTS */
-        if (valid_chas > 0 && sum_inserts >= 16 && sum_occupancy > 0) {
-            double dwell_time_uncore_cyc = (double)sum_occupancy / (double)sum_inserts;
-            *p_lat = dwell_time_uncore_cyc / core_freq_ghz;
+        if (valid_chas_slow > 0 && sum_ins_slow >= 16 && sum_occ_slow > 0) {
+            double dwell_time_uncore_cyc = (double)sum_occ_slow / (double)sum_ins_slow;
+            s_smoothed_lat_slow_ns = dwell_time_uncore_cyc / core_freq_ghz;
+        }
+        if (valid_chas_fast > 0 && sum_ins_fast >= 16 && sum_occ_fast > 0) {
+            double dwell_time_uncore_cyc = (double)sum_occ_fast / (double)sum_ins_fast;
+            s_smoothed_lat_fast_ns = dwell_time_uncore_cyc / core_freq_ghz;
         }
     }
 
-    return *p_lat;
+    if (out_l_slow) {
+        *out_l_slow = s_smoothed_lat_slow_ns;
+    }
+    if (out_l_fast) {
+        *out_l_fast = s_smoothed_lat_fast_ns;
+    }
+}
+
+double read_loaded_latency_tier_ns(pact_context_t *ctx, bool is_slow_tier)
+{
+    double l_slow, l_fast;
+    read_loaded_latency_both_tiers(ctx, &l_slow, &l_fast);
+    return is_slow_tier ? l_slow : l_fast;
 }
 
 unsigned int get_migration_prefetch_distance(int source_id, double l_slow_ns, double l_fast_ns,
@@ -345,34 +406,40 @@ unsigned int get_migration_prefetch_distance(int source_id, double l_slow_ns, do
     bool is_promote = is_tiered_promotion(source_id);
 
     /* Return default distance if adaptive prefetching is disabled */
-    if (!READ_ONCE(prefetch_adaptive)) {
-        return is_promote ? READ_ONCE(prefetch_promote_distance)
-                          : READ_ONCE(prefetch_demote_distance);
+    if (!READ_ONCE(prefetch_cfg.adaptive)) {
+        return is_promote ? READ_ONCE(prefetch_distances.promote)
+                          : READ_ONCE(prefetch_distances.demote);
     }
 
-    unsigned int min_dist = READ_ONCE(prefetch_min_distance);
-    unsigned int max_dist = READ_ONCE(prefetch_max_distance);
+    uint8_t min_dist = READ_ONCE(prefetch_cfg.min_distance);
+    uint8_t max_dist = READ_ONCE(prefetch_cfg.max_distance);
     if (min_dist > max_dist) {
         min_dist = max_dist;
     }
 
-    static unsigned int s_promote_ema = 0;
-    static unsigned int s_demote_ema = 0;
-    unsigned int *p_ema = is_promote ? &s_promote_ema : &s_demote_ema;
+    /* Packed 16-bit EMA state: Byte 0 = promote EMA, Byte 1 = demote EMA */
+    static union pact_prefetch_distances s_ema_distances = {
+        .promote = PREFETCH_DEFAULT_PROMOTE_DISTANCE,
+        .demote = PREFETCH_DEFAULT_DEMOTE_DISTANCE,
+    };
+    uint8_t *p_ema = is_promote ? &s_ema_distances.promote : &s_ema_distances.demote;
 
     /* Primary source-tier latency used for Little's Law pacing */
     double primary_latency_ns = is_promote ? l_slow_ns : l_fast_ns;
 
-    unsigned int effective_min_dist = min_dist;
-    unsigned int raw_dist = 0;
-    unsigned int final_dist = 0;
+    uint8_t effective_min_dist = min_dist;
+    uint8_t raw_dist = 0;
+    uint8_t final_dist = *p_ema;
 
     /* 
      * Global Saturation Check:
      * Trigger shutdown if Slow tier breaches SLOW threshold OR Fast tier breaches FAST threshold.
+     * Slow tier latency is normalized by Memory-Level Parallelism (MLP) from pmu.c.
      */
-    bool is_slow_saturated = (l_slow_ns > PREFETCH_LATENCY_SLOW_THRESHOLD_NS);
-    bool is_fast_saturated = (l_fast_ns > PREFETCH_LATENCY_FAST_THRESHOLD_NS);
+    double mlp_slow = pmu_get_tier_mlp(NULL, 1);
+    double mlp_fast = pmu_get_tier_mlp(NULL, 0);
+    bool is_slow_saturated = ((l_slow_ns / mlp_slow) > PREFETCH_LATENCY_SLOW_THRESHOLD_NS);
+    bool is_fast_saturated = ((l_fast_ns / mlp_fast) > PREFETCH_LATENCY_FAST_THRESHOLD_NS);
     bool is_saturated = is_slow_saturated || is_fast_saturated;
 
     /* Dual-alpha unscaled EMA smoothing */
@@ -391,9 +458,9 @@ unsigned int get_migration_prefetch_distance(int source_id, double l_slow_ns, do
                       PREFETCH_LATENCY_FAST_THRESHOLD_NS, is_promote ? "Promotion" : "Demotion");
             raw_dist = 0;
         } else {
-            /* Pacing via Little's Law using the read-source tier's latency */
-            double calculated_dist = primary_latency_ns / interval_ns;
-            raw_dist = (unsigned int)round(calculated_dist);
+            /* Pacing via Little's Law with fast integer rounding */
+            double calculated_dist = (primary_latency_ns / interval_ns) + 0.5;
+            raw_dist = (calculated_dist > (double)max_dist) ? max_dist : (uint8_t)calculated_dist;
         }
 
         /* Clamp raw_dist */
@@ -406,100 +473,33 @@ unsigned int get_migration_prefetch_distance(int source_id, double l_slow_ns, do
         }
 
         ema_dist = clamp(ema_dist, effective_min_dist, max_dist);
-        *p_ema = ema_dist;
-        final_dist = ema_dist;
-    } else if (*p_ema == 0) {
-        log_warning("get_migration_prefetch_distance", "Fallback to default distance for %s.",
-                    is_promote ? "Promotion" : "Demotion");
-        *p_ema = is_promote ? PREFETCH_DEFAULT_PROMOTE_DISTANCE : PREFETCH_DEFAULT_DEMOTE_DISTANCE;
-        final_dist = *p_ema;
-    } else {
-        final_dist = *p_ema;
+        *p_ema = (uint8_t)ema_dist;
+        final_dist = (uint8_t)ema_dist;
     }
 
     final_dist = clamp(final_dist, effective_min_dist, max_dist);
 
-    log_debug("get_migration_prefetch_distance",
-              "%s : raw_dist: %u, ema_dist: %u (alpha: %d), final_dist: %u",
-              is_promote ? "Promotion" : "Demotion", raw_dist, *p_ema, alpha, final_dist);
-
     if (is_promote) {
-        prefetch_promote_distance = final_dist;
+        WRITE_ONCE(prefetch_distances.promote, final_dist);
     } else {
-        prefetch_demote_distance = final_dist;
+        WRITE_ONCE(prefetch_distances.demote, final_dist);
     }
 
     return final_dist;
 }
 
-int write_sysfs_distances(unsigned int dist_promote, unsigned int dist_demote, double lat_slow_ns,
-                          double lat_fast_ns, double interval_ns)
+/*
+ * Encode prefetch distances into numa_move_pages flags.
+ * Eliminates pwrite() sysfs latency and avoids kernfs lock contention.
+ */
+int mig_telemetry_get_move_pages_flags(void)
 {
-    static int fd_promote = -2;
-    static int fd_demote = -2;
-    static unsigned int last_promote = (unsigned int)-1;
-    static unsigned int last_demote = (unsigned int)-1;
-    static time_t last_log_time = 0;
-    time_t now = time(NULL);
-    char buf[16];
-
-    unsigned int final_promote = dist_promote;
-    unsigned int final_demote = dist_demote;
-
-    /* Log status if distance changed or periodically (~1Hz) */
-    if (final_promote != last_promote || final_demote != last_demote || now - last_log_time >= 1) {
-        last_log_time = now;
-        log_debug("write_sysfs_distances",
-                  "Status: lat_slow=%.1f ns, lat_fast=%.1f ns, interval=%.2f ns, dist_promote=%u, "
-                  "dist_demote=%u",
-                  lat_slow_ns, lat_fast_ns, interval_ns, final_promote, final_demote);
+    int flags = MPOL_MF_MOVE;
+    if (READ_ONCE(prefetch_cfg.enabled)) {
+        uint16_t dists = READ_ONCE(prefetch_distances.val);
+        flags |= MPOL_MF_PREFETCH_ENABLE | ((uint32_t)dists << MPOL_MF_PREFETCH_PROMOTE_SHIFT);
     }
-
-    if (!prefetch_adaptive) {
-        return 0;
-    }
-
-    /* 1. Update promote_distance sysfs (allow 0 to be written if it changes from non-zero) */
-    if (final_promote != last_promote) {
-        if (__builtin_expect(fd_promote == -2, 0)) {
-            const char *dir = get_prefetch_sysfs_dir();
-            if (dir) {
-                char path[128];
-                snprintf(path, sizeof(path), "%s/promote_distance", dir);
-                fd_promote = open(path, O_WRONLY | O_CLOEXEC);
-            } else {
-                fd_promote = -1;
-            }
-        }
-        if (fd_promote >= 0) {
-            int len = snprintf(buf, sizeof(buf), "%u\n", final_promote);
-            if (len > 0 && pwrite(fd_promote, buf, (size_t)len, 0) > 0) {
-                last_promote = final_promote;
-            }
-        }
-    }
-
-    /* 2. Update demote_distance sysfs (allow 0 to be written if it changes from non-zero) */
-    if (final_demote != last_demote) {
-        if (__builtin_expect(fd_demote == -2, 0)) {
-            const char *dir = get_prefetch_sysfs_dir();
-            if (dir) {
-                char path[128];
-                snprintf(path, sizeof(path), "%s/demote_distance", dir);
-                fd_demote = open(path, O_WRONLY | O_CLOEXEC);
-            } else {
-                fd_demote = -1;
-            }
-        }
-        if (fd_demote >= 0) {
-            int len = snprintf(buf, sizeof(buf), "%u\n", final_demote);
-            if (len > 0 && pwrite(fd_demote, buf, (size_t)len, 0) > 0) {
-                last_demote = final_demote;
-            }
-        }
-    }
-
-    return 0;
+    return flags;
 }
 
 void mig_telemetry_update_pacing(pact_context_t *ctx, struct mig_telemetry *telem,
@@ -511,11 +511,15 @@ void mig_telemetry_update_pacing(pact_context_t *ctx, struct mig_telemetry *tele
 
     double t_interval = mig_telemetry_compute_interval(telem, pages_migrated);
 
-    double l_slow = read_loaded_latency_tier_ns(ctx, true);
-    double l_fast = read_loaded_latency_tier_ns(ctx, false);
+    double l_slow, l_fast;
+    read_loaded_latency_both_tiers(ctx, &l_slow, &l_fast);
 
-    unsigned int dist_promote = get_migration_prefetch_distance(1, l_slow, l_fast, t_interval);
-    unsigned int dist_demote = get_migration_prefetch_distance(0, l_slow, l_fast, t_interval);
+    /* Updates prefetch_promote_distance and prefetch_demote_distance directly */
+    get_migration_prefetch_distance(1, l_slow, l_fast, t_interval);
+    get_migration_prefetch_distance(0, l_slow, l_fast, t_interval);
 
-    write_sysfs_distances(dist_promote, dist_demote, l_slow, l_fast, t_interval);
+    log_debug("mig_telemetry_update_pacing",
+              "Pacing : L_slow: %.1f ns, L_fast: %.1f ns, Interval: %.1f ns => "
+              "Prefetch: promote=%u, demote=%u",
+              l_slow, l_fast, t_interval, prefetch_distances.promote, prefetch_distances.demote);
 }

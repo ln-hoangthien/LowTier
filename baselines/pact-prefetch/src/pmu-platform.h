@@ -31,8 +31,9 @@ struct pmu_platform {
     const char *name;
 
     /* Core events (PEBS + counting) */
-    uint64_t event_llc_miss_local;  /* MEM_LOAD_L3_MISS_RETIRED.LOCAL_DRAM */
-    uint64_t event_llc_miss_remote; /* MEM_LOAD_L3_MISS_RETIRED.REMOTE_DRAM */
+    uint64_t event_llc_miss_local;          /* Local LLC miss counting event config */
+    uint64_t event_llc_miss_local_ocr_mask; /* Local LLC miss OCR mask */
+    uint64_t event_llc_miss_remote;         /* Remote LLC miss counting & PEBS event config */
 
     /* CHA-to-core mapping */
     int nr_cha_mapping;

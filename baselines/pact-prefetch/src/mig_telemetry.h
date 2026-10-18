@@ -15,7 +15,7 @@
 #define MIN_MIG_PAGES_GATE 32ULL
 #define CALIBRATED_ACTIVE_CYCLES 25.0 /* Intrinsic ERMS copy rate (~18 cycles/line) */
 #define DEFAULT_CORE_WIDTH 2.875
-#define DEFAULT_CORE_FREQ_GHZ 2.4
+#define DEFAULT_CORE_FREQ_GHZ 2.1
 #define DEFAULT_FALLBACK_T_INT 8.5
 
 /* Prefetch Distance Configuration & Defaults */
@@ -42,8 +42,8 @@
  * Fast (Node 0): Baseline ~104 ns, Knee ~173 ns, Cliff >1400 ns
  * Slow (Node 1): Baseline ~172 ns, Knee ~223 ns, Cliff >760 ns
  */
-#define PREFETCH_LATENCY_FAST_THRESHOLD_NS 350.0
-#define PREFETCH_LATENCY_SLOW_THRESHOLD_NS 500.0
+#define PREFETCH_LATENCY_FAST_THRESHOLD_NS 500.0
+#define PREFETCH_LATENCY_SLOW_THRESHOLD_NS 700.0
 
 #ifndef clamp
 #define clamp(val, min_val, max_val)                                                               \
@@ -52,6 +52,10 @@
 
 #ifndef READ_ONCE
 #define READ_ONCE(x) (*(const volatile __typeof__(x) *)&(x))
+#endif
+
+#ifndef WRITE_ONCE
+#define WRITE_ONCE(x, val) (*(volatile __typeof__(x) *)&(x) = (val))
 #endif
 
 static inline bool is_tiered_promotion(int source_id)
@@ -86,12 +90,15 @@ void mig_telemetry_close(struct mig_telemetry *telem);
 struct pact_context;
 typedef struct pact_context pact_context_t;
 
-/* Prefetch Distance & Sysfs helpers */
+/* Prefetch Distance & numa_move_pages flags helpers */
+#define MPOL_MF_PREFETCH_ENABLE (1U << 15)
+#define MPOL_MF_PREFETCH_PROMOTE_SHIFT 16
+#define MPOL_MF_PREFETCH_DEMOTE_SHIFT 24
+
 double read_loaded_latency_tier_ns(pact_context_t *ctx, bool is_slow_tier);
 void log_mig_telemetry_status(double latency_ns, double interval_ns, unsigned int dist);
-int write_sysfs_distances(unsigned int dist_promote, unsigned int dist_demote, double lat_slow_ns,
-                          double lat_fast_ns, double interval_ns);
 void mig_telemetry_update_pacing(pact_context_t *ctx, struct mig_telemetry *telem,
                                  uint64_t pages_migrated);
+int mig_telemetry_get_move_pages_flags(void);
 
 #endif /* MIG_TELEMETRY_H */

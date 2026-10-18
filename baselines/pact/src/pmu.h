@@ -61,6 +61,7 @@ typedef enum {
 /* Event configuration for mapping enum to hardware config */
 typedef struct event_config {
     uint64_t config;
+    uint64_t ocr_mask;
     const char *name;
 } event_config_t;
 
@@ -106,7 +107,7 @@ int setup_pebs_event(per_cpu_state_t *cpu_state, pid_t pid, int cpu);
 extern event_config_t core_event_configs[CORE_EVENT_COUNT];
 
 int setup_counting_event(perf_event_t *perf_event, pid_t pid, int cpu, perf_event_t *leader,
-                         uint64_t config, const char *name);
+                         uint64_t config, uint64_t ocr_mask, const char *name);
 void ioctl_pmu_cha_perf_events(cha_pmu_info_t *cha_pmus, int nr_cha, int request);
 void ioctl_pmu_core_perf_events(per_cpu_state_t *cpu_states, int nr_target_cpus, int request);
 void start_pmu_perf_events(pact_context_t *ctx);
