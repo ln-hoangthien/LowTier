@@ -14,6 +14,7 @@ KERNEL_VER="$(uname -r)"
 # Default parameter resolution
 THP_MODE="${THP_MODE:-madvise}"
 PREFETCH_ENABLED="${PREFETCH_ENABLED:-1}"
+PREFETCH_NAIVE="${PREFETCH_NAIVE:-0}"
 PREFETCH_ADAPTIVE="${PREFETCH_ADAPTIVE:-1}"
 PREFETCH_HINT="${PREFETCH_HINT:-0}"
 PREFETCH_PROMOTE_DISTANCE="${PREFETCH_PROMOTE_DISTANCE:-5}"
@@ -61,30 +62,115 @@ write_sysfs_verified() {
 }
 
 # ------------------------------------------------------------------------------
+# Helper: Detect active migration prefetch sysfs interface
+# ------------------------------------------------------------------------------
+get_prefetch_sysfs() {
+    if [ -d "/sys/kernel/mm/page_prefetch" ]; then
+        echo "/sys/kernel/mm/page_prefetch"
+    elif [ -d "/sys/kernel/mm/pact_prefetch" ]; then
+        echo "/sys/kernel/mm/pact_prefetch"
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# Helper: Compute usable Node 0 byte quota for Memtis cgroup
+# ------------------------------------------------------------------------------
+compute_memtis_node0_quota() {
+    local node0_total_kb=$(awk '/MemTotal:/ {print $4}' /sys/devices/system/node/node0/meminfo 2>/dev/null || echo 0)
+    local node0_free_kb=$(awk '/MemFree:/ {print $4}' /sys/devices/system/node/node0/meminfo 2>/dev/null || echo 0)
+
+    # Always reserve at least 1.5 GB of actual free Node 0 memory for OS, page tables, and pginfo slabs
+    # so Memtis switches allocations to Node 1 (mempolicy.c) before Node 0 hits __GFP_THISNODE OOM or direct reclaim.
+    local reserve_kb=1572864
+    local quota_kb=0
+    if [ "${node0_free_kb}" -gt $(( reserve_kb + 524288 )) ]; then
+        quota_kb=$(( node0_free_kb - reserve_kb ))
+    else
+        quota_kb=$(( node0_free_kb * 65 / 100 ))
+    fi
+
+    if [ "${node0_total_kb}" -gt 6291456 ]; then
+        local total_cap_kb=$(( node0_total_kb - reserve_kb ))
+        [ "${total_cap_kb}" -lt "${quota_kb}" ] && quota_kb="${total_cap_kb}"
+    fi
+
+    [ "${quota_kb}" -lt 131072 ] && quota_kb=131072
+    echo $(( quota_kb * 1024 ))
+}
+
+# ------------------------------------------------------------------------------
+# Helper: Safely drain and reset Memtis workload cgroup
+# ------------------------------------------------------------------------------
+reset_memtis_cgroup() {
+    local memtis_cgroup="/sys/fs/cgroup/memtis_workload"
+    rm -f /tmp/memtis_node0_quota_bytes
+    [ -d "${memtis_cgroup}" ] || return 0
+
+    # Disable HTMM first to restore kswapd and stop kmigraterd cleanly before migrating PIDs out
+    # Do not write "max" to memory.max_at_node0 (page_counter_memparse maps "max" to PAGE_COUNTER_MAX != ULONG_MAX, triggering __GFP_THISNODE OOMs)
+    [ -f "${memtis_cgroup}/memory.htmm_enabled" ] && echo "disabled" > "${memtis_cgroup}/memory.htmm_enabled" 2>/dev/null || true
+    if [ -f "${memtis_cgroup}/cgroup.procs" ]; then
+        for pid in $(cat "${memtis_cgroup}/cgroup.procs" 2>/dev/null); do
+            echo "$pid" > /sys/fs/cgroup/cgroup.procs 2>/dev/null || true
+        done
+    fi
+    rmdir "${memtis_cgroup}" 2>/dev/null || true
+}
+
+# ------------------------------------------------------------------------------
+# Helper: Stop Memtis ksamplingd and disable HTMM migration mode
+# ------------------------------------------------------------------------------
+stop_memtis_ksamplingd() {
+    if pgrep -x ksamplingd >/dev/null 2>&1; then
+        python3 -c "import ctypes; ctypes.CDLL(None).syscall(450, -1)" 2>/dev/null || true
+    fi
+    [ -f /sys/kernel/mm/htmm/htmm_mode ] && echo 0 > /sys/kernel/mm/htmm/htmm_mode 2>/dev/null || true
+}
+
+# ------------------------------------------------------------------------------
+# Helper: Start Memtis ksamplingd daemon (syscall 449)
+# ------------------------------------------------------------------------------
+start_memtis_ksamplingd() {
+    if pgrep -x ksamplingd >/dev/null 2>&1; then
+        log_echo "[+] Memtis ksamplingd daemon is already active (PID $(pgrep -x ksamplingd))."
+        return 0
+    fi
+    python3 -c "import ctypes; ctypes.CDLL(None).syscall(449, -1, 0)" 2>/dev/null || true
+    sleep 0.5
+    if pgrep -x ksamplingd >/dev/null 2>&1; then
+        log_echo "[+] Memtis ksamplingd daemon is active (PID $(pgrep -x ksamplingd))."
+    else
+        log_echo "\033[1;31m[ERROR] Memtis ksamplingd failed to start or is not running!\033[0m"
+    fi
+}
+
+# ------------------------------------------------------------------------------
 # Helper: Ensure kernel module is compiled and loaded
 # ------------------------------------------------------------------------------
 ensure_module_loaded() {
     local mod_name="$1" base_dir="$2" sub_dir="$3" label="$4"
     local mod_id="${mod_name//-/_}"
-
-    grep -q "^${mod_id}[[:space:]]" /proc/modules 2>/dev/null && return 0
-
     local target_dir="${base_dir}${sub_dir:+/${sub_dir}}"
+
+    [ -d "${target_dir}" ] || return 1
+
+    if grep -q "^${mod_id}[[:space:]]" /proc/modules 2>/dev/null; then
+        rmmod "${mod_id}" 2>/dev/null || true
+    fi
+
+    local kdir="${base_dir}/linux"
+    [ ! -d "${kdir}" ] && kdir="/lib/modules/${KERNEL_VER}/build"
+
+    log_echo "[*] Cleaning and compiling ${label} ${mod_name}.ko for ${KERNEL_VER}..."
+    if [ -d "${kdir}" ]; then
+        make -C "${kdir}" M="${target_dir}" clean >/dev/null 2>&1 || true
+        make -C "${kdir}" M="${target_dir}" modules CC=gcc-11 HOSTCC=gcc-11 >/dev/null 2>&1 || true
+    else
+        make -C "${target_dir}" clean >/dev/null 2>&1 || true
+        make -C "${target_dir}" CC=gcc-11 HOSTCC=gcc-11 >/dev/null 2>&1 || true
+    fi
+
     local mod_file="${target_dir}/${mod_name}.ko"
-    if [ ! -f "${mod_file}" ]; then
-        mod_file=$(ls "${ROOT_DIR}"/baselines/*/${sub_dir:+${sub_dir}/}${mod_name}.ko 2>/dev/null | head -n 1 || true)
-    fi
-
-    if [ ! -f "${mod_file}" ] && [ -d "${target_dir}" ]; then
-        log_echo "[*] Compiling ${label} ${mod_name}.ko..."
-        if [ -d "${base_dir}/linux" ]; then
-            make -C "${base_dir}/linux" M="${target_dir}" modules >/dev/null 2>&1 || true
-        else
-            make -C "${target_dir}" >/dev/null 2>&1 || true
-        fi
-        mod_file="${target_dir}/${mod_name}.ko"
-    fi
-
     if [ -f "${mod_file}" ]; then
         log_echo "[*] Loading ${label} ${mod_name} module (${mod_file})..."
         insmod "${mod_file}" 2>/dev/null || true
@@ -100,12 +186,21 @@ ensure_module_loaded() {
 }
 
 # ------------------------------------------------------------------------------
+# Helper: Log active Node 0 tiering status and watermark buffer
+# ------------------------------------------------------------------------------
+log_tiering_status() {
+    local demote_en="$(read_sysfs /sys/kernel/mm/numa/demotion_enabled)"
+    local numa_bal="$(sysctl -n kernel.numa_balancing 2>/dev/null || true)"
+    local tiers="$(ls -d /sys/devices/virtual/memory_tiering/memory_tier* 2>/dev/null | xargs -n 1 basename 2>/dev/null | tr '\n' ' ' || true)"
+    log_echo "[*] Node 0 Tiering Status: demotion_enabled=${demote_en:-false}, numa_balancing=${numa_bal}${tiers:+, tiers=[${tiers% }]}"
+    log_echo "[*] Node 0 Watermark Buffer: min_free_kbytes=$(sysctl -n vm.min_free_kbytes 2>/dev/null), watermark_scale_factor=$(sysctl -n vm.watermark_scale_factor 2>/dev/null)"
+}
+
+# ------------------------------------------------------------------------------
 # Show current kernel tiering, prefetch, and THP configuration status
 # ------------------------------------------------------------------------------
 show_status() {
-    local prefetch_sysfs=""
-    [ -d "/sys/kernel/mm/page_prefetch" ] && prefetch_sysfs="/sys/kernel/mm/page_prefetch"
-    [ -d "/sys/kernel/mm/pact_prefetch" ] && prefetch_sysfs="/sys/kernel/mm/pact_prefetch"
+    local prefetch_sysfs="$(get_prefetch_sysfs)"
 
     log_echo "=========================================================================================="
     log_echo " Kernel Tiering & Prefetch Configuration Status (${KERNEL_VER})"
@@ -127,11 +222,7 @@ show_status() {
     local cur_defrag="$(read_sysfs /sys/kernel/mm/transparent_hugepage/defrag)"
     log_echo "[*] Transparent Huge Pages (THP): enabled=${cur_thp:-N/A}, defrag=${cur_defrag:-N/A}"
 
-    local demote_en="$(read_sysfs /sys/kernel/mm/numa/demotion_enabled)"
-    local numa_bal="$(sysctl -n kernel.numa_balancing 2>/dev/null || true)"
-    local tiers="$(ls -d /sys/devices/virtual/memory_tiering/memory_tier* 2>/dev/null | xargs -n 1 basename 2>/dev/null | tr '\n' ' ' || true)"
-    log_echo "[*] Node 0 Tiering Status: demotion_enabled=${demote_en:-false}, numa_balancing=${numa_bal}${tiers:+, tiers=[${tiers% }]}"
-    log_echo "[*] Node 0 Watermark Buffer: min_free_kbytes=$(sysctl -n vm.min_free_kbytes 2>/dev/null), watermark_scale_factor=$(sysctl -n vm.watermark_scale_factor 2>/dev/null)"
+    log_tiering_status
     log_echo "=========================================================================================="
 }
 
@@ -140,16 +231,19 @@ show_status() {
 # ------------------------------------------------------------------------------
 configure_kernel() {
     log_echo "[*] Starting kernel setup for: ${KERNEL_VER}..."
+    sysctl -w kernel.perf_event_paranoid=-1 >/dev/null 2>&1 || true
 
-    # Unload kswapdrst if active to allow normal allocation fallback
     if grep -q "^kswapdrst[[:space:]]" /proc/modules 2>/dev/null; then
         log_echo "[*] Unloading kswapdrst module to allow direct allocation fallback to Node 1..."
         rmmod kswapdrst 2>/dev/null || true
     fi
 
-    # Unified Little's Law Memory Latency Monitor
-    if [[ "${KERNEL_VER,,}" =~ prefetch ]] && [[ ! "${KERNEL_VER,,}" =~ colloid|pact ]]; then
-        ensure_module_loaded "tier_latency_mon" "${ROOT_DIR}/baselines/tier-latency-mon" "" "Tier Latency Monitor"
+    if [[ "${KERNEL_VER,,}" =~ prefetch ]]; then
+        local mon_bin="${ROOT_DIR}/baselines/tier-prefetch-mon/tier-prefetch-mon"
+        if [ ! -x "${mon_bin}" ] && [ -d "${ROOT_DIR}/baselines/tier-prefetch-mon" ]; then
+            make -C "${ROOT_DIR}/baselines/tier-prefetch-mon" >/dev/null 2>&1 || true
+        fi
+        killall -9 tier-prefetch-mon 2>/dev/null || true
     fi
 
     # ------------------
@@ -158,52 +252,47 @@ configure_kernel() {
     if [[ "${KERNEL_VER,,}" =~ nomad ]]; then
         local nomad_dir="${ROOT_DIR}/baselines/nomad"
         [[ "${KERNEL_VER,,}" =~ alto ]] && nomad_dir+="-alto"
-        [[ "${KERNEL_VER,,}" =~ prefetch ]] && nomad_dir+="-prefetch"
         [ ! -d "${nomad_dir}" ] && nomad_dir=$(ls -d ${ROOT_DIR}/baselines/nomad* 2>/dev/null | head -n 1 || true)
         ensure_module_loaded "async_promote" "${nomad_dir}" "nomad_module" "Nomad"
 
-        log_echo "[*] Activating Nomad Tiered NUMA Balancing (mode 2)..."
-        sysctl -w kernel.numa_balancing=2 2>/dev/null || true
+        log_echo "[*] Activating Nomad Tiered NUMA Balancing (mode 2) and demotion..."
+        sysctl -w kernel.numa_balancing=2 >/dev/null 2>&1 || true
         echo true > /sys/kernel/mm/numa/demotion_enabled 2>/dev/null || true
 
     # ------------------
     # Memtis Setup
     # ------------------
     elif [[ "${KERNEL_VER,,}" =~ memtis|htmm ]]; then
-        sysctl -w kernel.numa_balancing=0 2>/dev/null || true
+        log_echo "[*] Activating Memtis kernel tiering environment (htmm_mode=2 from T=0)..."
+        sysctl -w kernel.numa_balancing=0 >/dev/null 2>&1 || true
         echo false > /sys/kernel/mm/numa/demotion_enabled 2>/dev/null || true
 
-        [ -f /sys/kernel/mm/htmm/htmm_mode ] && echo 2 > /sys/kernel/mm/htmm/htmm_mode 2>/dev/null || true
         [ -f /sys/kernel/mm/htmm/htmm_cxl_mode ] && echo "enabled" > /sys/kernel/mm/htmm/htmm_cxl_mode 2>/dev/null || true
 
-        echo "${THP_MODE}" > /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null || true
-        echo "defer" > /sys/kernel/mm/transparent_hugepage/defrag 2>/dev/null || true
+        # Attach caller shell before workload fork/exec so mm->htmm_enabled and pginfo initialize cleanly
+        local memtis_cgroup="/sys/fs/cgroup/memtis_workload"
+        reset_memtis_cgroup
+        mkdir -p "${memtis_cgroup}" 2>/dev/null || true
 
         echo "+memory" > /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null || true
         echo "+cpuset" > /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null || true
-        local memtis_cgroup="/sys/fs/cgroup/memtis_workload"
-        mkdir -p "${memtis_cgroup}" 2>/dev/null || true
         [ -f "${memtis_cgroup}/memory.htmm_enabled" ] && echo "enabled" > "${memtis_cgroup}/memory.htmm_enabled" 2>/dev/null || true
-        [ -f "${memtis_cgroup}/cgroup.procs" ] && { echo "${PPID}" > "${memtis_cgroup}/cgroup.procs" 2>/dev/null || true; echo $$ > "${memtis_cgroup}/cgroup.procs" 2>/dev/null || true; }
+        if [ -f "${memtis_cgroup}/cgroup.procs" ]; then
+            echo "${PPID}" > "${memtis_cgroup}/cgroup.procs" 2>/dev/null || true
+            echo $$ > "${memtis_cgroup}/cgroup.procs" 2>/dev/null || true
+        fi
 
-        local node0_total_kb=$(awk '/MemTotal:/ {print $4}' /sys/devices/system/node/node0/meminfo 2>/dev/null || echo 0)
-        local reserved_kb=2097152  # 2.0 GB reserve
-        local node0_usable_bytes=$(( (node0_total_kb - reserved_kb) * 1024 ))
-
+        # Apply memory.max_at_node0 immediately so Memtis manages Node 0 from T=0
+        local node0_usable_bytes=$(compute_memtis_node0_quota)
+        echo "${node0_usable_bytes}" > /tmp/memtis_node0_quota_bytes
         if [ -f "${memtis_cgroup}/memory.max_at_node0" ]; then
             echo "${node0_usable_bytes}" > "${memtis_cgroup}/memory.max_at_node0" 2>/dev/null || true
-            log_echo "[*] Memtis Node 0 Memory Quota set to: $(cat "${memtis_cgroup}/memory.max_at_node0" 2>/dev/null || echo "${node0_usable_bytes}")"
+            log_echo "[*] Memtis Node 0 Memory Quota set to: $(cat "${memtis_cgroup}/memory.max_at_node0" 2>/dev/null || echo "${node0_usable_bytes}") bytes"
         fi
 
-        if ! pgrep -x ksamplingd >/dev/null 2>&1; then
-            python3 -c "import ctypes; ctypes.CDLL(None).syscall(449, -1, 0)" 2>/dev/null || true
-            sleep 1
-        fi
-        if pgrep -x ksamplingd >/dev/null 2>&1; then
-            log_echo "[+] Memtis ksamplingd daemon is active (PID $(pgrep -x ksamplingd))."
-        else
-            log_echo "[!] Note: Memtis ksamplingd is not running."
-        fi
+        # Activate HTMM sampling & migration immediately (no autotie deferral)
+        [ -f /sys/kernel/mm/htmm/htmm_mode ] && echo 2 > /sys/kernel/mm/htmm/htmm_mode 2>/dev/null || true
+        start_memtis_ksamplingd
 
     # ------------------
     # Colloid Setup
@@ -211,14 +300,13 @@ configure_kernel() {
     elif [[ "${KERNEL_VER,,}" =~ colloid ]]; then
         local colloid_dir="${ROOT_DIR}/baselines/colloid-tpp"
         [[ "${KERNEL_VER,,}" =~ alto ]] && colloid_dir+="-alto"
-        [[ "${KERNEL_VER,,}" =~ prefetch ]] && colloid_dir+="-prefetch"
         [ ! -d "${colloid_dir}" ] && colloid_dir=$(ls -d ${ROOT_DIR}/baselines/colloid* 2>/dev/null | head -n 1 || true)
 
         ensure_module_loaded "tierinit" "${colloid_dir}" "tierinit" "Colloid"
         ensure_module_loaded "colloid-mon" "${colloid_dir}" "colloid-mon" "Colloid"
 
-        log_echo "[*] Activating Colloid Tiered NUMA Balancing (mode 6: TIERING | COLLOID)..."
-        sysctl -w kernel.numa_balancing=6 2>/dev/null || true
+        log_echo "[*] Activating Colloid Tiered NUMA Balancing (mode 6: TIERING | COLLOID) and demotion..."
+        sysctl -w kernel.numa_balancing=6 >/dev/null 2>&1 || true
         echo true > /sys/kernel/mm/numa/demotion_enabled 2>/dev/null || true
 
     # ------------------
@@ -236,10 +324,13 @@ configure_kernel() {
         ensure_module_loaded "tierinit" "${pact_dir}" "tierinit" "PACT"
         ensure_module_loaded "kswapdrst" "${pact_dir}" "kswapdrst" "PACT"
 
-        log_echo "[*] Activating PACT kernel tiering environment..."
-        sysctl -w kernel.numa_balancing=0 2>/dev/null || true
-        sysctl -w kernel.perf_event_paranoid=-1 2>/dev/null || true
-        echo true > /sys/kernel/mm/numa/demotion_enabled 2>/dev/null || true
+        # Match original PACT methodology (run-pact.sh): start with demotion_enabled=0 and
+        # zone_reclaim_mode=0 so heavy initial allocations overflow smoothly to Node 1 without
+        # hanging in direct reclaim; PACT's balance loop (Algorithm 2) toggles demotion_enabled online.
+        log_echo "[*] Activating PACT kernel tiering environment (demotion_enabled=false; controlled online by PACT)..."
+        sysctl -w vm.zone_reclaim_mode=0 >/dev/null 2>&1 || true
+        sysctl -w kernel.numa_balancing=0 >/dev/null 2>&1 || true
+        echo false > /sys/kernel/mm/numa/demotion_enabled 2>/dev/null || true
 
     # ------------------
     # HybridTier Setup
@@ -249,7 +340,7 @@ configure_kernel() {
         [ ! -d "${hybridtier_dir}" ] && hybridtier_dir=$(ls -d ${ROOT_DIR}/baselines/hybridtier* 2>/dev/null | head -n 1 || true)
 
         if [ -d "${hybridtier_dir}/hook" ]; then
-            make -C "${hybridtier_dir}/hook" TARGET_EXE_NAME="${TARGET_EXE_NAME}" >/dev/null 2>&1 || true
+            make -B -C "${hybridtier_dir}/hook" TARGET_EXE_NAME="${TARGET_EXE_NAME}" >/dev/null 2>&1 || true
         fi
 
         local hook_so="${hybridtier_dir}/hook/hook.so"
@@ -265,7 +356,6 @@ configure_kernel() {
         echo 0x0000 > /sys/kernel/mm/lru_gen/enabled 2>/dev/null || true
         sysctl -w kernel.perf_event_max_sample_rate=150000 >/dev/null 2>&1 || true
         sysctl -w kernel.perf_cpu_time_max_percent=0 >/dev/null 2>&1 || true
-        sysctl -w kernel.perf_event_paranoid=-1 >/dev/null 2>&1 || true
 
         if [ ! -e "/ssd1/songxin8/thesis/autonuma/linux-6.1-rc6/tools/perf/perf" ]; then
             mkdir -p /ssd1/songxin8/thesis/autonuma/linux-6.1-rc6/tools/perf 2>/dev/null || true
@@ -273,35 +363,33 @@ configure_kernel() {
         fi
 
     # ------------------------------------
-    # AutoNUMA (Generic) Setup
+    # AutoNUMA / Generic Setup
     # ------------------------------------
-    elif [[ "${KERNEL_VER,,}" =~ generic ]]; then
-        log_echo "[*] Activating AutoNUMA + Tiered Balancing for generic kernel (mode 3)..."
-        sysctl -w kernel.numa_balancing=3 2>/dev/null || true
+    elif [[ "${KERNEL_VER,,}" =~ generic || "${KERNEL_VER,,}" =~ autonuma ]]; then
+        log_echo "[*] Activating AutoNUMA + Tiered Balancing (mode 3) and demotion..."
+        sysctl -w kernel.numa_balancing=3 >/dev/null 2>&1 || sysctl -w kernel.numa_balancing=2 >/dev/null 2>&1 || sysctl -w kernel.numa_balancing=1 >/dev/null 2>&1 || true
         echo true > /sys/kernel/mm/numa/demotion_enabled 2>/dev/null || true
 
     # ------------------------------------
     # Upstream TPP / Generic Fallback
     # ------------------------------------
     else
-        log_echo "[*] Activating Tiered NUMA Balancing (mode 2)..."
-        sysctl -w kernel.numa_balancing=2 2>/dev/null || sysctl -w kernel.numa_balancing=1 2>/dev/null || true
+        log_echo "[*] Activating TPP Tiered NUMA Balancing (mode 2) and demotion..."
+        sysctl -w kernel.numa_balancing=2 >/dev/null 2>&1 || sysctl -w kernel.numa_balancing=1 >/dev/null 2>&1 || true
         echo true > /sys/kernel/mm/numa/demotion_enabled 2>/dev/null || true
     fi
 
     # ------------------------------------------------------------------------------------------
     # Migration Prefetch Online Configuration
     # ------------------------------------------------------------------------------------------
-    local prefetch_sysfs=""
-    [ -d "/sys/kernel/mm/page_prefetch" ] && prefetch_sysfs="/sys/kernel/mm/page_prefetch"
-    [ -d "/sys/kernel/mm/pact_prefetch" ] && prefetch_sysfs="/sys/kernel/mm/pact_prefetch"
+    local prefetch_sysfs="$(get_prefetch_sysfs)"
 
     if [ -n "$prefetch_sysfs" ]; then
         write_sysfs_verified "${prefetch_sysfs}/enabled" "${PREFETCH_ENABLED}" "enabled"
+        [ -f "${prefetch_sysfs}/naive" ] && write_sysfs_verified "${prefetch_sysfs}/naive" "${PREFETCH_NAIVE}" "naive" || true
         write_sysfs_verified "${prefetch_sysfs}/adaptive" "${PREFETCH_ADAPTIVE}" "adaptive"
         write_sysfs_verified "${prefetch_sysfs}/hint" "${PREFETCH_HINT}" "hint"
 
-        # Clamp distance limits
         write_sysfs_verified "${prefetch_sysfs}/min_distance" "${PREFETCH_MIN_DISTANCE}" "min_distance" || true
         write_sysfs_verified "${prefetch_sysfs}/max_distance" "${PREFETCH_MAX_DISTANCE}" "max_distance" || true
 
@@ -312,9 +400,9 @@ configure_kernel() {
             fi
         fi
 
-        # Read back verified parameters for logging
-        local cur_en cur_hint cur_adap cur_prom cur_dem cur_min cur_max
+        local cur_en cur_naive cur_hint cur_adap cur_prom cur_dem cur_min cur_max
         cur_en="$(read_sysfs "${prefetch_sysfs}/enabled")"
+        cur_naive="$(read_sysfs "${prefetch_sysfs}/naive")"
         cur_hint="$(read_sysfs "${prefetch_sysfs}/hint")"
         cur_adap="$(read_sysfs "${prefetch_sysfs}/adaptive")"
         cur_prom="$(read_sysfs "${prefetch_sysfs}/promote_distance")"
@@ -322,6 +410,7 @@ configure_kernel() {
         cur_min="$(read_sysfs "${prefetch_sysfs}/min_distance")"
         cur_max="$(read_sysfs "${prefetch_sysfs}/max_distance")"
 
+        local engine_str="$([ "$cur_naive" == "1" ] && echo "naive" || echo "deep-tune")"
         if [ "$cur_en" == "0" ]; then
             log_echo "[*] Migration Prefetch Online Parameters (${prefetch_sysfs}): enabled=0 (disabled), hint=${cur_hint:-0}"
         elif [ -f "${prefetch_sysfs}/promote_distance" ]; then
@@ -329,148 +418,138 @@ configure_kernel() {
             [ -n "$cur_min" ] && extra_info+=", min_dist=${cur_min}"
             [ -n "$cur_max" ] && extra_info+=", max_dist=${cur_max}"
             local mode_str="$([ "$cur_adap" == "1" ] && echo "adaptive" || echo "static")"
-            local tier_info=" (promote=${cur_prom:-$PREFETCH_PROMOTE_DISTANCE}, demote=${cur_dem:-$PREFETCH_DEMOTE_DISTANCE}, mode=${mode_str}${extra_info})"
+            local tier_info=" (engine=${engine_str}, promote=${cur_prom:-$PREFETCH_PROMOTE_DISTANCE}, demote=${cur_dem:-$PREFETCH_DEMOTE_DISTANCE}, mode=${mode_str}${extra_info})"
             log_echo "[*] Migration Prefetch Online Parameters (${prefetch_sysfs}): enabled=${cur_en}${tier_info}, hint=${cur_hint:-0}"
         else
-            log_echo "[*] Migration Prefetch Online Parameters (${prefetch_sysfs}): enabled=${cur_en}, hint=${cur_hint:-0}"
+            log_echo "[*] Migration Prefetch Online Parameters (${prefetch_sysfs}): enabled=${cur_en} (engine=${engine_str}), hint=${cur_hint:-0}"
         fi
     fi
 
     # ------------------------------------------------------------------------------------------
     # Transparent Huge Pages (THP) Online Configuration
     # ------------------------------------------------------------------------------------------
-    echo "${THP_MODE}" > /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null || true
-    echo "defer" > /sys/kernel/mm/transparent_hugepage/defrag 2>/dev/null || true
+    local thp_target="${THP_MODE:-madvise}"
+    [[ ! "${thp_target}" =~ ^(always|madvise|never)$ ]] && thp_target="madvise"
+
+    # Always keep defrag=madvise (Linux default) to avoid synchronous compaction stalls on a tight fast tier
+    local defrag_target="madvise"
+
+    echo "${thp_target}" > /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null || true
+    echo "${defrag_target}" > /sys/kernel/mm/transparent_hugepage/defrag 2>/dev/null || true
     local cur_thp="$(read_sysfs /sys/kernel/mm/transparent_hugepage/enabled)"
     local cur_defrag="$(read_sysfs /sys/kernel/mm/transparent_hugepage/defrag)"
-    log_echo "[*] Transparent Huge Pages (THP): enabled=${cur_thp:-N/A} (target=${THP_MODE}), defrag=${cur_defrag:-N/A}"
+    
+    log_echo "[*] Transparent Huge Pages (THP): enabled=${cur_thp:-N/A} (target=${thp_target}), defrag=${cur_defrag:-N/A} (target=${defrag_target})"
 
-    # Log active demotion target and watermark state
-    local demote_en="$(read_sysfs /sys/kernel/mm/numa/demotion_enabled)"
-    local numa_bal="$(sysctl -n kernel.numa_balancing 2>/dev/null || true)"
-    local tiers="$(ls -d /sys/devices/virtual/memory_tiering/memory_tier* 2>/dev/null | xargs -n 1 basename 2>/dev/null | tr '\n' ' ' || true)"
-    log_echo "[*] Node 0 Tiering Status: demotion_enabled=${demote_en:-false}, numa_balancing=${numa_bal}${tiers:+, tiers=[${tiers% }]}"
-    log_echo "[*] Node 0 Watermark Buffer: min_free_kbytes=$(sysctl -n vm.min_free_kbytes 2>/dev/null), watermark_scale_factor=$(sysctl -n vm.watermark_scale_factor 2>/dev/null)"
+    log_tiering_status
 }
 
 # ------------------------------------------------------------------------------
-# Baseline Autotie: Start / Hook daemons to workload process
+# Helper Daemons: Start userspace tiering/prefetch daemons immediately (no autotie wait)
 # ------------------------------------------------------------------------------
 autotie_start() {
-    # PACT autotie: Launch background watcher to attach PACT daemon once workload starts
-    if [[ "${KERNEL_VER,,}" =~ pact ]]; then
-        local pact_bin="${ROOT_DIR}/baselines/pact/src/pact"
-        if [[ "${KERNEL_VER,,}" =~ prefetch.*batch ]] && [ -x "${ROOT_DIR}/baselines/pact-prefetch-batch/src/pact" ]; then
-            pact_bin="${ROOT_DIR}/baselines/pact-prefetch-batch/src/pact"
-        elif [[ "${KERNEL_VER,,}" =~ prefetch ]] && [ -x "${ROOT_DIR}/baselines/pact-prefetch/src/pact" ]; then
-            pact_bin="${ROOT_DIR}/baselines/pact-prefetch/src/pact"
+    # Ensure helper daemons (PACT, tier-prefetch-mon) run in root cgroup, not memtis_workload
+    [ -f /sys/fs/cgroup/cgroup.procs ] && echo $$ > /sys/fs/cgroup/cgroup.procs 2>/dev/null || true
+
+    local target_exe="${TARGET_EXE_NAME:-pr}"
+    local pact_actual_pid_file="/tmp/pact_actual_pid"
+    local pact_watcher_pid_file="/tmp/pact_watcher_pid"
+    rm -f "${pact_actual_pid_file}" "${pact_watcher_pid_file}"
+
+    local pact_bin="${ROOT_DIR}/baselines/pact/src/pact"
+    [ ! -x "${pact_bin}" ] && pact_bin=$(ls -d "${ROOT_DIR}"/baselines/pact*/src/pact 2>/dev/null | head -n 1 || true)
+
+    local need_pact=0
+    [[ "${KERNEL_VER,,}" =~ pact ]] && [ -x "${pact_bin}" ] && need_pact=1
+
+    local is_prefetch=0
+    [[ "${KERNEL_VER,,}" =~ prefetch ]] && is_prefetch=1
+
+    local need_hybrid=0
+    [[ "${KERNEL_VER,,}" =~ hybridtier ]] && need_hybrid=1
+
+    # Start adaptive prefetch monitor immediately (no ingestion delay)
+    # PACT and HybridTier embed tier-mon-prefetch in their own monitor threads.
+    if [ ${is_prefetch} -eq 1 ] && [ ${need_pact} -eq 0 ] && [ ${need_hybrid} -eq 0 ]; then
+        local mon_bin="${ROOT_DIR}/baselines/tier-prefetch-mon/tier-prefetch-mon"
+        local prefetch_mon_log="${TARGET_DIR:-/tmp}/prefetch_mon_${FILENAME_SUFFIX:-run}.log"
+        if [ "${PREFETCH_ADAPTIVE:-1}" == "1" ] && [ -x "${mon_bin}" ]; then
+            local mon_cpu_mask="${CPU_MASK:-0xffffff}"
+            local mon_interval_ms="${PREFETCH_MON_INTERVAL_MS:-50}"
+            log_echo "[+] Starting tier-prefetch-mon daemon immediately for ${KERNEL_VER} (cpu_mask=${mon_cpu_mask}, interval=${mon_interval_ms}ms, cpu=31)..."
+            taskset -c 31 "${mon_bin}" --daemon --interval-ms "${mon_interval_ms}" --cpu-mask "${mon_cpu_mask}" > "${prefetch_mon_log}" 2>&1 &
         fi
-        [ ! -x "${pact_bin}" ] && pact_bin=$(ls -d "${ROOT_DIR}"/baselines/pact*/src/pact 2>/dev/null | head -n 1 || true)
+    fi
 
-        if [ ! -x "${pact_bin}" ]; then
-            log_echo "\033[1;33m[WARNING] PACT binary not found or not executable!\033[0m"
-            return 0
-        fi
-
-        local pact_actual_pid_file="/tmp/pact_actual_pid"
-        local pact_watcher_pid_file="/tmp/pact_watcher_pid"
-        rm -f "${pact_actual_pid_file}" "${pact_watcher_pid_file}"
-
+    # PACT is a userspace daemon that requires the workload's PID (--workload <PID>).
+    # Match original run-pact.sh: do NOT wait for Read Time / ingestion logs; simply wait
+    # briefly for the workload process to spawn, then attach immediately.
+    # Because configure_kernel() sets demotion_enabled=false and vm.zone_reclaim_mode=0,
+    # initial bombard allocations overflow cleanly to Node 1 without hanging in direct reclaim.
+    if [ ${need_pact} -eq 1 ]; then
         local pact_log_file="${TARGET_DIR:-/tmp}/pact_${FILENAME_SUFFIX:-run}.log"
-        local target_exe="${TARGET_EXE_NAME:-pr}"
-        local regress_log="${REGRESS_LOG_FILE:-}"
+        local pact_margin="${PACT_DEMOTION_MARGIN:-25000}"
 
         (
-            # Workload-specific synchronization:
-            # 1. GAPBS: wait until graph file ingestion completes ("Read Time:")
-            # 2. Silo: wait until dataloading completes ("starting benchmark")
-            # 3. SPEC 2026: wait until dataloading completes ("Running Benchmarks")
-            # 4. Redis / Others: default sleep (2s)
-            case "${target_exe}" in
-                pr|tc|bc|cc|bfs|sssp)
-                    echo "[+] PACT sync: Waiting for GAPBS graph ingestion (Read Time) to complete..."
-                    local timeout=20000
-                    until [ -n "${regress_log}" -a -f "${regress_log}" ] && grep -q "Read Time:" "${regress_log}" 2>/dev/null || [ $((timeout--)) -le 0 ]; do
-                        sleep 0.1
-                    done
-                    ;;
-
-                dbtest)
-                    echo "[+] PACT sync: Waiting for Silo dataloading to complete..."
-                    local timeout=50000
-                    until ([ -n "${regress_log}" -a -f "${regress_log}" ] && grep -q "starting benchmark" "${regress_log}" 2>/dev/null) || [ $((timeout--)) -le 0 ]; do
-                        sleep 0.1
-                    done
-                    ;;
-
-                runcpu|specperl)
-                    echo "[+] PACT sync: Waiting for SPEC CPU 2026 setup & compilation to complete..."
-                    local timeout=50000
-                    until ([ -n "${regress_log}" -a -f "${regress_log}" ] && grep -q "Running Benchmarks" "${regress_log}" 2>/dev/null) || [ $((timeout--)) -le 0 ]; do
-                        sleep 0.1
-                    done
-                    sleep 1
-                    ;;
-
-                *)
-                    sleep 2
-                    ;;
-            esac
-
-            # AutoTie: Resolve target workload PID and attach PACT daemon
             local target_pid=""
-            if [ -n "${target_exe}" ] && [ "${target_exe}" != "*" ]; then
-                target_pid=$(pgrep -n -x "${target_exe}" 2>/dev/null || true)
-            fi
+            local max_attempts=150 # up to 30 seconds for process spawn
+            for attempt in $(seq 1 ${max_attempts}); do
+                if [ "${target_exe}" = "run_redis.sh" ] || [ "${target_exe}" = "redis-server" ]; then
+                    target_pid=$(pgrep -n -x redis-server 2>/dev/null || true)
+                elif [ "${target_exe}" = "runcpu" ] || [ "${target_exe}" = "specperl" ]; then
+                    target_pid=$(pgrep -n -f "_base\." 2>/dev/null || true)
+                elif [ -n "${target_exe}" ] && [ "${target_exe}" != "*" ]; then
+                    target_pid=$(pgrep -n -x "${target_exe}" 2>/dev/null || true)
+                fi
+                [ -n "${target_pid}" ] && break
+                sleep 0.2
+            done
 
-            # Redis override: attach to the redis-server database daemon holding the dataset
-            if [ "${target_exe}" = "run_redis.sh" ] || [ "${target_exe}" = "redis-server" ]; then
-                for attempt in $(seq 1 30); do
-                    local redis_pid=$(pgrep -n -x redis-server 2>/dev/null || true)
-                    [ -n "${redis_pid}" ] && { target_pid="${redis_pid}"; break; }
-                    sleep 0.5
-                done
-            fi
-
-            # SPEC CPU 2026 override: attach to the actual compute binary (*_base.mytest)
-            if [ "${target_exe}" = "runcpu" ] || [ "${target_exe}" = "specperl" ]; then
-                for attempt in $(seq 1 30); do
-                    local spec_pid=$(pgrep -n -f "_base\." 2>/dev/null || true)
-                    [ -n "${spec_pid}" ] && { target_pid="${spec_pid}"; break; }
-                    sleep 0.5
-                done
-            fi
+            # Brief settle matching original run-pact.sh (sleep 2) so the process completes exec
+            # and initial first-touch overflow before PACT toggles demotion_enabled online.
+            sleep 2
 
             if [ -n "${target_pid}" ] && kill -0 "${target_pid}" 2>/dev/null; then
-                echo "[+] PACT autotie active: Attaching PACT daemon (PID ${target_pid})..."
+                echo "[+] PACT daemon attaching immediately to PID ${target_pid} (demotion_margin=${pact_margin})..."
 
-                # 1. Save Thread 0's original affinity mask (in case Thread 0 is pinned to Core 0)
+                # Temporarily expand Thread 0's affinity so PACT discovers all cores at startup, then restore
                 local orig_mask=$(taskset -p "${target_pid}" 2>/dev/null | awk '{print $NF}')
-
-                # 2. Temporarily expand Thread 0's mask so PACT discovers all 24 cores at startup
                 taskset -p -c "${SELECTED_CPUS:-0-23}" "${target_pid}" >/dev/null 2>&1 || true
 
-                "${pact_bin}" --workload "${target_pid}" --demotion-margin 250000 > "${pact_log_file}" 2>&1 &
+                "${pact_bin}" --workload "${target_pid}" --monitor-cpu 30 --migration-cpu 29 --demotion-margin "${pact_margin}" --log-level 2 > "${pact_log_file}" 2>&1 &
                 local actual_pact_pid=$!
                 echo "${actual_pact_pid}" > "${pact_actual_pid_file}"
 
-                # Asynchronously restore Thread 0's affinity once PACT has finished startup
                 ( sleep 0.5; [ -n "${orig_mask}" ] && taskset -p "${orig_mask}" "${target_pid}" >/dev/null 2>&1 || true ) &
-
                 wait "${actual_pact_pid}"
+            else
+                echo -e "\033[1;31m[!] WARNING: PACT attacher could not find running workload '${target_exe}'!\033[0m" >&2
             fi
         ) &
         local watcher_pid=$!
         echo "${watcher_pid}" > "${pact_watcher_pid_file}"
-        log_echo "[+] PACT autotie watcher started (PID ${watcher_pid})."
+        log_echo "[+] PACT PID attacher started (PID ${watcher_pid})."
     fi
 }
 
 # ------------------------------------------------------------------------------
-# Baseline Autotie: Stop daemons and clean up temporary state
+# Helper: Gracefully stop a daemon PID (SIGINT, wait, then SIGKILL if alive)
+# ------------------------------------------------------------------------------
+stop_pid_gracefully() {
+    local pid="$1" wait_sec="${2:-0.2}"
+    [ -n "${pid}" ] && kill -0 "${pid}" 2>/dev/null || return 0
+    kill -INT "${pid}" 2>/dev/null || true
+    sleep "${wait_sec}"
+    kill -0 "${pid}" 2>/dev/null && kill -9 "${pid}" 2>/dev/null || true
+}
+
+# ------------------------------------------------------------------------------
+# Helper Daemons: Stop userspace daemons and clean up tiering state
 # ------------------------------------------------------------------------------
 autotie_stop() {
-    # Terminate PACT daemon and watcher
+    stop_pid_gracefully "$(cat "/tmp/tier_prefetch_mon.pid" 2>/dev/null || true)" 0.2
+    rm -f "/tmp/tier_prefetch_mon.pid"
+
     local pact_actual_pid_file="/tmp/pact_actual_pid"
     local pact_watcher_pid_file="/tmp/pact_watcher_pid"
     local actual_pact_pid=$(cat "${pact_actual_pid_file}" 2>/dev/null || true)
@@ -481,13 +560,7 @@ autotie_stop() {
             kill -0 "${actual_pact_pid}" 2>/dev/null || break
             sleep 0.1
         done
-        if kill -0 "${actual_pact_pid}" 2>/dev/null; then
-            kill -INT "${actual_pact_pid}" 2>/dev/null || true
-            sleep 0.5
-        fi
-        if kill -0 "${actual_pact_pid}" 2>/dev/null; then
-            kill -9 "${actual_pact_pid}" 2>/dev/null || true
-        fi
+        stop_pid_gracefully "${actual_pact_pid}" 0.5
     fi
 
     local watcher_pid=$(cat "${pact_watcher_pid_file}" 2>/dev/null || true)
@@ -500,13 +573,22 @@ autotie_stop() {
     if [[ "${KERNEL_VER,,}" =~ hybridtier ]]; then
         pkill -f "perf stat -I 60000" 2>/dev/null || true
     fi
+
+    if [[ "${KERNEL_VER,,}" =~ memtis|htmm ]]; then
+        stop_memtis_ksamplingd
+        reset_memtis_cgroup
+    elif [[ "${KERNEL_VER,,}" =~ pact ]]; then
+        echo false > /sys/kernel/mm/numa/demotion_enabled 2>/dev/null || true
+    elif [[ ! "${KERNEL_VER,,}" =~ hybridtier ]]; then
+        sysctl -w kernel.numa_balancing=0 >/dev/null 2>&1 || true
+    fi
 }
 
 # ------------------------------------------------------------------------------
 # Baseline Autotie: Wrap workload command with required preload environment
 # ------------------------------------------------------------------------------
 autotie_wrap() {
-    shift # Remove --wrap-cmd argument
+    shift
     if [[ "${KERNEL_VER,,}" =~ hybridtier ]]; then
         local hybrid_hook="${HYBRIDTIER_HOOK:-${ROOT_DIR}/baselines/hybridtier/hook/hook.so}"
         if [ -f "${hybrid_hook}" ]; then
@@ -523,23 +605,15 @@ autotie_wrap() {
 cleanup_kernel() {
     log_echo "[*] Cleaning up kernel tiering state and modules..."
 
-    # Stop any running autotie daemons first
-    autotie_stop
+    echo "madvise" > /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null || true
+    echo "madvise" > /sys/kernel/mm/transparent_hugepage/defrag 2>/dev/null || true
+    sync
+    echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
 
-    # Clean up Memtis state: Stop ksamplingd BEFORE restoring CPUs.
-    if [[ "${KERNEL_VER,,}" =~ memtis|htmm ]]; then
-        if pgrep -x ksamplingd >/dev/null 2>&1; then
-            python3 -c "import ctypes; ctypes.CDLL(None).syscall(450, -1)" 2>/dev/null || true
-        fi
-        if [ -f /sys/fs/cgroup/memtis_workload/memory.htmm_enabled ]; then
-            echo "disabled" > /sys/fs/cgroup/memtis_workload/memory.htmm_enabled 2>/dev/null || true
-        fi
-    fi
-
-    # Unload tier-latency-mon, colloid-mon, and kswapdrst if active
-    rmmod tier_latency_mon 2>/dev/null || true
+    killall tier-prefetch-mon 2>/dev/null || true
     rmmod colloid-mon 2>/dev/null || true
     rmmod kswapdrst 2>/dev/null || true
+    sleep 1 # wait for all cleanup to complete. Ensure the synchronization.
 
     log_echo "[+] Kernel tiering state cleaned up."
 }
@@ -553,18 +627,19 @@ if [ "${1:-}" == "-h" ] || [ "${1:-}" == "--help" ]; then
     echo "  --autotie-start : Start baseline autotie background watcher / cgroup attachment"
     echo "  --autotie-stop  : Stop baseline autotie daemons and cleanup"
     echo "  --wrap-cmd <cmd>: Wrap workload command with required preload environment (HybridTier)"
-    echo "  --cleanup, -c   : Stop baseline daemons (ksamplingd, pact) and unload tiering modules"
+    echo "  --cleanup, -c   : Reset kernel tiering state (cgroup/THP) and unload tiering modules"
     echo "  --status,  -s   : Show current kernel tiering and prefetch parameters"
     exit 0
 fi
 
 # ------------------------------------------------------------------------------
-# Root Privilege Elevation
+# Root Privilege Elevation (write/configure commands require root; status/help do not)
 # ------------------------------------------------------------------------------
-if [ "$EUID" -ne 0 ] && [ "${1:-}" != "--wrap-cmd" ]; then
+if [ "$EUID" -ne 0 ] && [ "${1:-}" != "--wrap-cmd" ] && [ "${1:-}" != "--status" ] && [ "${1:-}" != "-s" ] && [ "${1:-}" != "--help" ] && [ "${1:-}" != "-h" ]; then
     echo "[!] Kernel setup requires root privileges. Elevating via sudo..."
     exec sudo env PATH="$PATH" ROOT_DIR="$ROOT_DIR" THP_MODE="${THP_MODE}" \
-        PREFETCH_ENABLED="${PREFETCH_ENABLED}" PREFETCH_ADAPTIVE="${PREFETCH_ADAPTIVE}" \
+        PREFETCH_ENABLED="${PREFETCH_ENABLED}" PREFETCH_NAIVE="${PREFETCH_NAIVE}" \
+        PREFETCH_ADAPTIVE="${PREFETCH_ADAPTIVE}" \
         PREFETCH_HINT="${PREFETCH_HINT}" PREFETCH_PROMOTE_DISTANCE="${PREFETCH_PROMOTE_DISTANCE}" \
         PREFETCH_DEMOTE_DISTANCE="${PREFETCH_DEMOTE_DISTANCE}" \
         PREFETCH_MIN_DISTANCE="${PREFETCH_MIN_DISTANCE}" \

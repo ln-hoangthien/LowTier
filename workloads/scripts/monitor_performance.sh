@@ -19,6 +19,8 @@ PERF_SESSION_ID="${PERF_SESSION_ID:-${PPID}}"
 STATE_META="${PERF_STATE_DIR}/perf_monitor_${PERF_SESSION_ID}.meta"
 STATE_VMSTAT="${PERF_STATE_DIR}/perf_monitor_${PERF_SESSION_ID}.vmstat"
 STATE_PERFNOMAD="${PERF_STATE_DIR}/perf_monitor_${PERF_SESSION_ID}.perfnomad"
+STATE_BPF_PID="${PERF_STATE_DIR}/perf_monitor_${PERF_SESSION_ID}.bpf_pid"
+STATE_BPF_OUT="${PERF_STATE_DIR}/perf_monitor_${PERF_SESSION_ID}.bpf_out"
 
 SETTLE_SLEEP="${SETTLE_SLEEP:-5}"
 KERNEL_VER="$(uname -r)"
@@ -79,9 +81,84 @@ pages_to_mb() { awk "BEGIN {printf \"%.2f\", (${1:-0} * 4096) / 1048576}"; }
 pages_to_bw() { awk "BEGIN {printf \"%.2f MB/s\", (${1:-0} * 4096) / (1048576 * ${WORKLOAD_RUNTIME:-1})}"; }
 
 # ------------------------------------------------------------------------------------------
+# BPFTrace Telemetry: Track thread stall latency waiting on migrating pages
+# ------------------------------------------------------------------------------------------
+start_bpftrace() {
+    # Temporarily commented out to eliminate tracing overhead
+    return 0
+    # ------------------
+
+    [ "${ENABLE_BPFTRACE:-1}" -eq 0 ] && return 0
+    if ! command -v bpftrace >/dev/null 2>&1; then
+        return 0
+    fi
+    if [ "$(id -u)" -ne 0 ]; then
+        echo "[monitor_performance] Notice: bpftrace requires root privileges; skipping BPF tracing." >&2
+        return 0
+    fi
+
+    # Pin bpftrace to Core 31 (isolated reserve core) to avoid benchmark interference
+    taskset -c 31 bpftrace --no-warnings -e '
+kprobe:migration_entry_wait {
+    @start_norm[tid] = nsecs;
+    @numa_faults["migration_entry_wait"] = count();
+}
+kretprobe:migration_entry_wait /@start_norm[tid]/ {
+    $us = (nsecs - @start_norm[tid]) / 1000;
+    @total_time_us["migration_entry_wait"] = sum($us);
+    @numa_page_latency_us["migration_entry_wait"] = hist($us);
+    delete(@start_norm[tid]);
+}
+
+kprobe:migration_entry_wait_huge {
+    @start_huge[tid] = nsecs;
+    @numa_faults["migration_entry_wait_huge"] = count();
+}
+kretprobe:migration_entry_wait_huge /@start_huge[tid]/ {
+    $us = (nsecs - @start_huge[tid]) / 1000;
+    @total_time_us["migration_entry_wait_huge"] = sum($us);
+    @numa_page_latency_us["migration_entry_wait_huge"] = hist($us);
+    delete(@start_huge[tid]);
+}
+
+END {
+    clear(@start_norm);
+    clear(@start_huge);
+}
+' > "${STATE_BPF_OUT}" 2>&1 &
+    local bpf_pid=$!
+    echo "${bpf_pid}" > "${STATE_BPF_PID}"
+}
+
+stop_bpftrace() {
+    local bpf_pid=""
+    if [ -f "${STATE_BPF_PID}" ]; then
+        bpf_pid=$(cat "${STATE_BPF_PID}" 2>/dev/null || true)
+        rm -f "${STATE_BPF_PID}" 2>/dev/null || true
+    fi
+
+    if [ -n "${bpf_pid}" ] && kill -0 "${bpf_pid}" 2>/dev/null; then
+        kill -INT "${bpf_pid}" 2>/dev/null
+        wait "${bpf_pid}" 2>/dev/null || true
+    fi
+
+    if [ -s "${STATE_BPF_OUT}" ]; then
+        echo ""
+        echo "=========================================================================================="
+        echo "                 BPFTRACE MIGRATION STALL LATENCY SUMMARY                                 "
+        echo "=========================================================================================="
+        cat "${STATE_BPF_OUT}"
+        echo "=========================================================================================="
+    fi
+    rm -f "${STATE_BPF_OUT}" 2>/dev/null || true
+}
+
+# ------------------------------------------------------------------------------------------
 # 1. Start Telemetry Baseline
 # ------------------------------------------------------------------------------------------
 start_monitor() {
+    # start_bpftrace (temporarily disabled)
+
     if [ "$SETTLE_SLEEP" -gt 0 ]; then
         sleep "${SETTLE_SLEEP}"
     fi
@@ -108,17 +185,36 @@ stop_monitor() {
     local cmd="$*"
     local end_time=$(date +%s)
 
-    local start_time=$(( end_time - 1 ))
-    local pmi_before=0
-    local node1_before=0
+    # Resolve state files with fallback to newest session file if exact match is missing
+    if [ ! -f "${STATE_META}" ]; then
+        local latest_meta
+        latest_meta=$(ls -t "${PERF_STATE_DIR}"/perf_monitor_*.meta 2>/dev/null | head -n 1 || true)
+        if [ -n "${latest_meta}" ] && [ -f "${latest_meta}" ]; then
+            STATE_META="${latest_meta}"
+            STATE_VMSTAT="${latest_meta%.meta}.vmstat"
+            STATE_PERFNOMAD="${latest_meta%.meta}.perfnomad"
+            STATE_BPF_PID="${latest_meta%.meta}.bpf_pid"
+            STATE_BPF_OUT="${latest_meta%.meta}.bpf_out"
+        fi
+    fi
+
+    local START_TIME=""
+    local PMI_BEFORE=0
+    local NODE1_BEFORE=0
 
     if [ -f "${STATE_META}" ]; then
         # shellcheck disable=SC1090
         source "${STATE_META}"
     fi
 
-    WORKLOAD_RUNTIME=$((end_time - start_time))
-    [ $WORKLOAD_RUNTIME -le 0 ] && WORKLOAD_RUNTIME=1
+    if [ -z "${START_TIME}" ]; then
+        echo -e "\033[1;31m[ERROR] Unable to load baseline START_TIME from '${STATE_META}'!\033[0m" >&2
+        WORKLOAD_RUNTIME=0
+    else
+        WORKLOAD_RUNTIME=$(( end_time - START_TIME ))
+    fi
+    [ "$WORKLOAD_RUNTIME" -le 0 ] && WORKLOAD_RUNTIME=1
+    
 
     # Settling sleep after workload execution to allow any async worker threads to finish
     if [ "$SETTLE_SLEEP" -gt 0 ]; then
@@ -171,8 +267,8 @@ stop_monitor() {
     local delta_memtis_alloc_nvm=$(vm_delta "htmm_alloc_nvm")
 
     # Node 1 & PMI Deltas
-    local delta_pmi=$(( pmi_after > pmi_before ? pmi_after - pmi_before : 0 ))
-    local delta_node1=$(( node1_after > node1_before ? node1_after - node1_before : 0 ))
+    local delta_pmi=$(( pmi_after > PMI_BEFORE ? pmi_after - PMI_BEFORE : 0 ))
+    local delta_node1=$(( node1_after > NODE1_BEFORE ? node1_after - NODE1_BEFORE : 0 ))
 
     local total_dem_pages=$(( delta_dem_kswapd + delta_dem_direct ))
     [ "$total_dem_pages" -eq 0 ] && total_dem_pages=$(( delta_dem_page_anon + delta_dem_page_file ))
@@ -308,6 +404,9 @@ stop_monitor() {
         echo "=========================================================================================="
     fi
     echo ""
+
+    # Stop bpftrace and display migration latency histogram
+    # stop_bpftrace (temporarily disabled)
 }
 
 # ------------------------------------------------------------------------------------------

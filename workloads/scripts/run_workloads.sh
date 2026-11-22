@@ -59,6 +59,7 @@ log_echo() {
 # ------------------------------------------------------------------------------------------
 normalize_params() {
     PREFETCH_ENABLED="${PREFETCH_ENABLED:-1}"
+    PREFETCH_NAIVE="${PREFETCH_NAIVE:-0}"
     PREFETCH_ADAPTIVE="${PREFETCH_ADAPTIVE:-1}"
     PREFETCH_HINT="${PREFETCH_HINT:-0}"
     PREFETCH_PROMOTE_DISTANCE="${PREFETCH_PROMOTE_DISTANCE:-5}"
@@ -146,10 +147,11 @@ resolve_output_paths() {
             adapt_tag="_static"
         fi
 
+        local engine_tag="$([ "${PREFETCH_NAIVE:-0}" == "1" ] && echo "_naive" || echo "_deeptune")"
         if [ "${PREFETCH_ENABLED:-1}" == "0" ] || ([ "${PREFETCH_PROMOTE_DISTANCE:-0}" == "0" ] && [ "${PREFETCH_DEMOTE_DISTANCE:-0}" == "0" ]); then
             FILENAME_SUFFIX+="_0"
         else
-            FILENAME_SUFFIX+="_p${PREFETCH_PROMOTE_DISTANCE}_d${PREFETCH_DEMOTE_DISTANCE}_h${PREFETCH_HINT}${adapt_tag}"
+            FILENAME_SUFFIX+="_p${PREFETCH_PROMOTE_DISTANCE}_d${PREFETCH_DEMOTE_DISTANCE}_h${PREFETCH_HINT}${engine_tag}${adapt_tag}"
         fi
     fi
     FILENAME_SUFFIX+="_${THP_MODE}"
@@ -170,12 +172,20 @@ if [ "$EUID" -ne 0 ]; then
     echo "[!] This script requires root privileges. Elevating via sudo..."
     exec sudo env PATH="$PATH" ROOT_DIR="$ROOT_DIR" TIER_RATIO="${TIER_RATIO:-}" RATIO="${RATIO:-}" \
         THP_MODE="${THP_MODE:-madvise}" \
-        PREFETCH_ENABLED="${PREFETCH_ENABLED}" PREFETCH_ADAPTIVE="${PREFETCH_ADAPTIVE}" \
+        PREFETCH_ENABLED="${PREFETCH_ENABLED}" PREFETCH_NAIVE="${PREFETCH_NAIVE}" \
+        PREFETCH_ADAPTIVE="${PREFETCH_ADAPTIVE}" \
         PREFETCH_PROMOTE_DISTANCE="${PREFETCH_PROMOTE_DISTANCE}" \
         PREFETCH_DEMOTE_DISTANCE="${PREFETCH_DEMOTE_DISTANCE}" \
         PREFETCH_MIN_DISTANCE="${PREFETCH_MIN_DISTANCE}" \
         PREFETCH_MAX_DISTANCE="${PREFETCH_MAX_DISTANCE}" \
         PREFETCH_HINT="${PREFETCH_HINT}" "$0" "$@"
+fi
+
+# Redis disables THP via prctl(PR_SET_THP_DISABLE) when THP=always, and pre-main jemalloc
+# THPs across daemonize() fork trigger kernel crashes on HTMM/Memtis.
+if [ "${TARGET}" = "redis" ] && [ "${THP_MODE}" = "always" ]; then
+    log_echo "[SKIP] Workload '${TARGET}' with THP_MODE='${THP_MODE}' (redis + THP=always) is banned; skipping execution."
+    exit 0
 fi
 
 # ------------------------------------------------------------------------------------------
@@ -204,22 +214,28 @@ get_node1_free_mb() {
 
 # Evict all background user processes from Node 0 to Node 1
 evict_background_to_node1() {
-    if command -v migratepages >/dev/null 2>&1; then
-        for pid in $(ps -eo pid= | awk '$1 ~ /^[0-9]+$/ && $1 > 1 {print $1}'); do
-            if [ "$pid" -eq "$$" ] || [ "$pid" -eq "$PPID" ]; then
-                continue
-            fi
-            migratepages "$pid" 0 1 2>/dev/null || true
-        done
-    fi
+    command -v migratepages >/dev/null 2>&1 || return 0
+
+    local cur_thp=$(grep -o '\[.*\]' /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null | tr -d '[]' || true)
+    [ "$cur_thp" = "always" ] && echo madvise > /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null || true
+
+    for pid in $(ps -eo pid=,rss=,comm= | awk '$1 > 1 && $2 > 0 && $3 !~ /^(systemd.*|sshd|dbus-daemon|irqbalance|agetty|sudo|rg|ps|awk|migratepages|vmtouch|perf|pact|tier-prefetch.*)$/ {print $1}'); do
+        [ "$pid" -eq "$$" ] || [ "$pid" -eq "$PPID" ] && continue
+        grep -q "/memtis_workload" "/proc/${pid}/cgroup" 2>/dev/null && continue
+        migratepages "$pid" 0 1 2>/dev/null || true
+    done
+
+    [ "$cur_thp" = "always" ] && echo always > /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null || true
 }
 
 # Clean memory caches, drop residual slab, compact memory, and quiesce system
 clean_memory_caches() {
     local drop_mode="${1:-3}"
     local label=""
-    if [ "$drop_mode" -eq 2 ]; then
-        label=" (slab metadata only, preserving file pagecache)"
+    if [ "$drop_mode" -eq 0 ]; then
+        label=" (compacting only, preserving preloaded file pagecache & inodes)"
+    elif [ "$drop_mode" -eq 2 ]; then
+        label=" (slab metadata only)"
     elif [ "$drop_mode" -eq 1 ]; then
         label=" (pagecache only)"
     else
@@ -227,32 +243,21 @@ clean_memory_caches() {
     fi
 
     log_echo "[*] Cleaning memory caches${label}, compacting memory & quiescing..."
-    killall -9 pact bpftrace perf redis-server dbtest XSBench pr bc bfs cc sssp tc specperl runcpu specmake 2>/dev/null || true
-    ipcs -m 2>/dev/null | awk '$2 ~ /^[0-9]+$/ {print $2}' | xargs -r ipcrm -m 2>/dev/null || true
     swapoff -a 2>/dev/null || true
 
     # Evict background user processes (IDE, language server, shells) from Node 0 to Node 1
     evict_background_to_node1
 
-    # Quiesce, drop caches, and compact memory across iterations
-    local max_attempts=3
-    for attempt in $(seq 1 $max_attempts); do
-        sync
+    # Quiesce, optionally drop caches, and compact memory
+    # Note: drop_caches=2 evicts unreferenced inodes on Linux 5.15, which also discards their
+    # attached file pagecache (wiping vmtouch preloads). Use drop_mode=0 after vmtouch.
+    sync
+    if [ "$drop_mode" -gt 0 ]; then
         echo "${drop_mode}" > /proc/sys/vm/drop_caches 2>/dev/null || true
-        sleep 3
-        echo 1 > /proc/sys/vm/compact_memory 2>/dev/null || true
-        sleep 3
-        log_echo "[+] Headroom at Attempt=${attempt}: Node 0=$(get_node0_free_mb) MB | Node 1=$(get_node1_free_mb) MB free"
-    done
-    local free0_mb=$(get_node0_free_mb)
-    local free1_mb=$(get_node1_free_mb)
-    log_echo "[+] Clean Headroom at T=0: Node 0 = ${free0_mb} MB free | Node 1 = ${free1_mb} MB free"
-
-    # Re-sweep background processes and drop residual slab at T=0 to guarantee fresh headroom
-    evict_background_to_node1
-    sysctl -w vm.drop_caches="${drop_mode}" >/dev/null 2>&1 || echo "${drop_mode}" > /proc/sys/vm/drop_caches 2>/dev/null || true
+        sleep 1
+    fi
+    echo 1 > /proc/sys/vm/compact_memory 2>/dev/null || true
     sleep 1
-
     local free0_mb=$(get_node0_free_mb)
     local free1_mb=$(get_node1_free_mb)
     log_echo "[+] Clean Headroom at T=0: Node 0 = ${free0_mb} MB free | Node 1 = ${free1_mb} MB free"
@@ -261,7 +266,7 @@ clean_memory_caches() {
 # Clean up processes, daemons, restore machine configuration, and set user ownership
 cleanup() {
     trap - INT TERM EXIT
-    killall -9 perf 2>/dev/null || true
+    killall -9 pact bpftrace perf redis-server dbtest XSBench pr bc bfs cc sssp tc specperl runcpu specmake 2>/dev/null || true
 
     # Clean up telemetry temporary state
     "${SCRIPT_DIR}/monitor_performance.sh" --cleanup 2>/dev/null || true
@@ -289,11 +294,33 @@ log_echo "[*] Step 1: Configuring machine hardware environment..."
 REGRESS_LOG_FILE="${REGRESS_LOG_FILE:-}" "${SCRIPT_DIR}/setup_machine.sh"
 
 # ------------------------------------------------------------------------------------------
-# Step 2: Kernel & Tiered Memory Setup (Baselines, Prefetch Sysfs, THP)
+# Step 2: Cache Cleaning & Dataset Preload (before enabling THP=always / Memtis cgroup)
 # ------------------------------------------------------------------------------------------
-log_echo "[*] Step 2: Configuring kernel tiering and prefetch parameters..."
+
+# Step 1: Clean all caches & wipe stale state BEFORE preloading dataset
+clean_memory_caches 3
+
+# Step 2: Preload dataset into target tier (Node 1 or Node 0)
+PRELOAD_CMD=$(RATIO_TAG="${RATIO_TAG}" "${SCRIPT_DIR}/exec_workload.sh" --get-preload-cmd "$TARGET" ${DATASET:+"$DATASET"})
+if [ -n "${PRELOAD_CMD}" ]; then
+    log_echo "[+] Preloading dataset onto Slow Tier (Node 1): ${PRELOAD_CMD}"
+    eval "${PRELOAD_CMD}" 2>&1 | tee -a "${REGRESS_LOG_FILE:-/dev/null}"
+    sync
+    sleep 2
+fi
+
+# Step 3: Compact Node 0 memory and evict background processes AFTER preloading WITHOUT calling
+# drop_caches=2 (which evicts unreferenced inodes on Linux 5.15 and wipes vmtouch pagecache).
+clean_memory_caches 0
+evict_background_to_node1
+
+# ------------------------------------------------------------------------------------------
+# Step 3: Kernel & Tiered Memory Setup (Baselines, Prefetch Sysfs, THP)
+# ------------------------------------------------------------------------------------------
+log_echo "[*] Step 3: Configuring kernel tiering and prefetch parameters..."
 THP_MODE="${THP_MODE}" \
 PREFETCH_ENABLED="${PREFETCH_ENABLED}" \
+PREFETCH_NAIVE="${PREFETCH_NAIVE}" \
 PREFETCH_ADAPTIVE="${PREFETCH_ADAPTIVE}" \
 PREFETCH_HINT="${PREFETCH_HINT}" \
 PREFETCH_PROMOTE_DISTANCE="${PREFETCH_PROMOTE_DISTANCE}" \
@@ -317,26 +344,6 @@ REGRESS_LOG_FILE="${REGRESS_LOG_FILE:-}" \
     echo "=========================================================================================="
 } | tee -a "${REGRESS_LOG_FILE:-/dev/null}"
 
-# ------------------------------------------------------------------------------------------
-# Step 3: Workload Execution Workflow
-# ------------------------------------------------------------------------------------------
-
-# Step 1: Clean all caches & wipe stale state BEFORE preloading dataset
-clean_memory_caches 3
-
-# Step 2: Preload dataset into target tier (Node 1 or Node 0)
-PRELOAD_CMD=$(RATIO_TAG="${RATIO_TAG}" "${SCRIPT_DIR}/exec_workload.sh" --get-preload-cmd "$TARGET" ${DATASET:+"$DATASET"})
-if [ -n "${PRELOAD_CMD}" ]; then
-    log_echo "[+] Preloading dataset onto Slow Tier (Node 1): ${PRELOAD_CMD}"
-    eval "${PRELOAD_CMD}" 2>&1 | tee -a "${REGRESS_LOG_FILE:-/dev/null}"
-    sync
-    sleep 2
-fi
-
-# Step 3: Clean caches AFTER preloading: Drop slab metadata only (mode 2, preserving preloaded dataset in RAM),
-# defragment Node 0 memory frames, and report headroom before launch.
-clean_memory_caches 2
-
 # Step 4: Clear kernel dmesg ring buffer and reset prefetch stats so the log only contains this run's data
 dmesg -c >/dev/null 2>&1 || true
 [ -f "/sys/kernel/mm/page_prefetch/stats_reset" ] && echo 1 > /sys/kernel/mm/page_prefetch/stats_reset 2>/dev/null || true
@@ -348,7 +355,6 @@ log_echo "----------------------------------------------------------------------
 #   3. Execute workload command under /usr/bin/time -v directly
 #   4. Stop kernel autotie daemons
 #   5. Calculate delta and print performance report: monitor_performance.sh --stop
-evict_background_to_node1
 
 # Wrap workload command if baseline requires in-process hooking (e.g. HybridTier LD_PRELOAD)
 WORKLOAD_EXEC_CMD=$("${SCRIPT_DIR}/setup_kernel.sh" --wrap-cmd ${WORKLOAD_CMD})
@@ -364,15 +370,25 @@ FILENAME_SUFFIX="${FILENAME_SUFFIX}" \
 REGRESS_LOG_FILE="${REGRESS_LOG_FILE}" \
 "${SCRIPT_DIR}/setup_kernel.sh" --autotie-start
 
-# 3. Execute the workload command with GNU time to capture runtime & Peak RSS
+# 3. Execute the workload command with timeout, GNU time, and perf stat (Slow-tier latency & prefetch counters)
 log_echo "------------------------------------------------------------------------------------------"
-/usr/bin/time -v bash -c "exec ${WORKLOAD_EXEC_CMD}" 2>&1 | tee -a "${REGRESS_LOG_FILE}"
+PERF_EVENTS="mem_trans_retired.load_latency_gt_256,l2_rqsts.all_hwpf,l2_rqsts.swpf_hit,l2_rqsts.swpf_miss"
+if [ -z "${WORKLOAD_TIMEOUT:-}" ]; then
+    if [[ "${TARGET,,}" == spec* ]]; then
+        WORKLOAD_TIMEOUT=7200  # 2 hours for SPEC CPU 2026
+    else
+        WORKLOAD_TIMEOUT=1800  # 30 minutes for GAPBS / Silo / Redis / XSBench
+    fi
+fi
+log_echo "[run_workloads] Workload timeout: ${WORKLOAD_TIMEOUT}s (SIGKILL after +30s)"
+timeout --kill-after=30 "${WORKLOAD_TIMEOUT}" \
+    /usr/bin/time -v perf stat -e "${PERF_EVENTS}" bash -c "exec ${WORKLOAD_EXEC_CMD}" 2>&1 | tee -a "${REGRESS_LOG_FILE}"
 STATUS="${PIPESTATUS[0]}"
+if [ "${STATUS}" -eq 124 ] || [ "${STATUS}" -eq 137 ]; then
+    log_echo "\033[1;31m[ERROR] Workload '${TARGET}' TIMED OUT after ${WORKLOAD_TIMEOUT}s (exit=${STATUS}) — likely kernel livelock/hang.\033[0m"
+fi
 
-# 4. Stop baseline autotie daemons once workload completes
-"${SCRIPT_DIR}/setup_kernel.sh" --autotie-stop
-
-# 5. Calculate delta and print performance report
+# 4. Calculate delta and print performance report before dropping caches
 "${SCRIPT_DIR}/monitor_performance.sh" --stop ${WORKLOAD_EXEC_CMD} 2>&1 | tee -a "${REGRESS_LOG_FILE}"
 
 log_echo "------------------------------------------------------------------------------------------"
@@ -395,10 +411,17 @@ if [ -n "${prefetch_stats_sysfs}" ]; then
     } | tee -a "${REGRESS_LOG_FILE}" >/dev/null 2>&1 || true
 fi
 
-# Step 6: Clean up and restore system configuration (CPUs, background daemons, ownership)
+# 5. Terminate any residual workload processes and drop file + slab caches
+clean_memory_caches 3
+
+# 6. Stop baseline autotie daemons once Node 0 memory is clean
+"${SCRIPT_DIR}/setup_kernel.sh" --autotie-stop
+
+# Step 7: Clean up and restore system configuration (CPUs, background daemons, ownership)
 cleanup
 
 echo "=========================================================================================="
-echo " Workload Execution Completed."
+echo " Workload Execution Completed (exit status: ${STATUS})."
 echo " Regression Summary saved to : ${REGRESS_LOG_FILE}"
 echo "=========================================================================================="
+exit "${STATUS}"

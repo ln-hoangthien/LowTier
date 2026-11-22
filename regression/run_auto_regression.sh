@@ -22,6 +22,7 @@ STATE_FILE="${SCRIPT_DIR}/.regression_state"
 SERVICE_NAME="lowtier-regression.service"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}"
 LOG_FILE="${SCRIPT_DIR}/auto_regression_orchestrator.log"
+RERUN_LOG_FILE="${SCRIPT_DIR}/failed_reruns.sh"
 RUN_WORKLOADS="${ROOT_DIR}/workloads/scripts/run_workloads.sh"
 
 # Formatting Colors
@@ -65,6 +66,23 @@ ensure_cpus_online() {
 }
 
 # ------------------------------------------------------------------------------
+# Configure kernel sysctls to auto-reboot on Oops, soft lockup, or hard lockup
+# ------------------------------------------------------------------------------
+enable_hang_auto_reboot() {
+    local kv
+    for kv in \
+        "kernel.panic=5" \
+        "kernel.panic_on_oops=1" \
+        "kernel.softlockup_panic=0" \
+        "kernel.hardlockup_panic=1" \
+        "kernel.hung_task_panic=1" \
+        "kernel.nmi_watchdog=1" \
+        "kernel.watchdog_thresh=60"; do
+        sysctl -w "$kv" >/dev/null 2>&1 || true
+    done
+}
+
+# ------------------------------------------------------------------------------
 # Check if kernel name contains prefetch support
 # ------------------------------------------------------------------------------
 is_prefetch_kernel() {
@@ -89,23 +107,11 @@ matches_kernel_target() {
         generic)
             [[ "$k_str" =~ generic ]]
             ;;
-        pact-prefetch)
-            [[ "$k_str" =~ pact && "$k_str" =~ prefetch ]]
+        autonuma-prefetch)
+            [[ "$k_str" =~ autonuma && "$k_str" =~ prefetch ]]
             ;;
-        pact)
-            [[ "$k_str" =~ pact && ! "$k_str" =~ prefetch ]]
-            ;;
-        colloid-tpp-alto-prefetch)
-            [[ "$k_str" =~ colloid && "$k_str" =~ alto && "$k_str" =~ prefetch ]]
-            ;;
-        colloid-tpp-prefetch)
-            [[ "$k_str" =~ colloid && ! "$k_str" =~ alto && "$k_str" =~ prefetch ]]
-            ;;
-        colloid-tpp-alto)
-            [[ "$k_str" =~ colloid && "$k_str" =~ alto && ! "$k_str" =~ prefetch ]]
-            ;;
-        colloid-tpp)
-            [[ "$k_str" =~ colloid && ! "$k_str" =~ alto && ! "$k_str" =~ prefetch ]]
+        autonuma)
+            [[ "$k_str" =~ autonuma && ! "$k_str" =~ prefetch ]]
             ;;
         memtis-prefetch)
             [[ "$k_str" =~ memtis && "$k_str" =~ prefetch ]]
@@ -119,17 +125,50 @@ matches_kernel_target() {
         nomad-prefetch)
             [[ "$k_str" =~ nomad && ! "$k_str" =~ alto && "$k_str" =~ prefetch ]]
             ;;
+        nomad-alto-noinline)
+            [[ "$k_str" =~ nomad && "$k_str" =~ alto && "$k_str" =~ noinline ]]
+            ;;
+        nomad-noinline)
+            [[ "$k_str" =~ nomad && ! "$k_str" =~ alto && "$k_str" =~ noinline ]]
+            ;;
         nomad-alto)
-            [[ "$k_str" =~ nomad && "$k_str" =~ alto && ! "$k_str" =~ prefetch ]]
+            [[ "$k_str" =~ nomad && "$k_str" =~ alto && ! "$k_str" =~ noinline && ! "$k_str" =~ prefetch ]]
             ;;
         nomad)
-            [[ "$k_str" =~ nomad && ! "$k_str" =~ alto && ! "$k_str" =~ prefetch ]]
+            [[ "$k_str" =~ nomad && ! "$k_str" =~ alto && ! "$k_str" =~ noinline && ! "$k_str" =~ prefetch ]]
+            ;;
+        colloid-tpp-alto-prefetch)
+            [[ "$k_str" =~ colloid && "$k_str" =~ alto && "$k_str" =~ prefetch ]]
+            ;;
+        colloid-tpp-prefetch)
+            [[ "$k_str" =~ colloid && ! "$k_str" =~ alto && "$k_str" =~ prefetch ]]
+            ;;
+        colloid-tpp-alto|colloid-alto)
+            [[ "$k_str" =~ colloid && "$k_str" =~ alto && ! "$k_str" =~ prefetch ]]
+            ;;
+        colloid-tpp|colloid)
+            [[ "$k_str" =~ colloid && ! "$k_str" =~ alto && ! "$k_str" =~ prefetch ]]
+            ;;
+        pact-prefetch-batch)
+            [[ "$k_str" =~ prefetch-batch || "$k_str" =~ prefetch.*batch ]]
+            ;;
+        pact-prefetch)
+            [[ "$k_str" =~ pact && "$k_str" =~ prefetch && ! "$k_str" =~ batch ]]
+            ;;
+        pact)
+            [[ "$k_str" =~ pact && ! "$k_str" =~ prefetch ]]
+            ;;
+        hybridtier-prefetch)
+            [[ "$k_str" =~ hybridtier && "$k_str" =~ prefetch ]]
             ;;
         hybridtier)
-            [[ "$k_str" =~ hybridtier ]]
+            [[ "$k_str" =~ hybridtier && ! "$k_str" =~ prefetch ]]
+            ;;
+        tpp-prefetch)
+            [[ "$k_str" =~ tpp && ! "$k_str" =~ colloid && "$k_str" =~ prefetch ]]
             ;;
         tpp)
-            [[ "$k_str" =~ tpp && ! "$k_str" =~ colloid ]]
+            [[ "$k_str" =~ tpp && ! "$k_str" =~ colloid && ! "$k_str" =~ prefetch ]]
             ;;
         *)
             [[ "$k_str" =~ ${target,,} ]]
@@ -144,8 +183,20 @@ is_kernel_ready() {
     local target="$1"
     [ "$target" == "generic" ] && return 0
 
-    local kdir="${ROOT_DIR}/baselines/${target}/linux"
-    [ -d "$kdir" ] && ([ -f "$kdir/arch/x86/boot/bzImage" ] || [ -f "$kdir/vmlinux" ])
+    local base_target="${target%-prefetch}"
+    base_target="${base_target%-batch}"
+    local kdir="${ROOT_DIR}/baselines/${base_target}/linux"
+    [ -d "$kdir" ] || return 1
+    ([ -f "$kdir/arch/x86/boot/bzImage" ] || [ -f "$kdir/vmlinux" ]) || return 1
+
+    # Verify the compiled binary in the source tree actually matches target
+    if [ -f "$kdir/.config" ]; then
+        local krel
+        krel=$(make -s -C "$kdir" kernelrelease 2>/dev/null || true)
+        [ -n "$krel" ] && matches_kernel_target "$target" "$krel" && return 0
+        return 1
+    fi
+    return 0
 }
 
 # ------------------------------------------------------------------------------
@@ -232,6 +283,8 @@ load_targets() {
     PREFETCH_BOUNDS=()
     PREFETCH_MAX_DISTANCES=()
     PREFETCH_ADAPTIVE_MODES=()
+    PREFETCH_HINTS=()
+    PREFETCH_NAIVE_MODES=()
     THP_MODES=()
     # shellcheck source=/dev/null
     source "$REGRESSION_LIST"
@@ -241,6 +294,8 @@ load_targets() {
     read -ra PREFETCH_DISTANCES <<< "${PREFETCH_DISTANCES[*]:-}"
     read -ra PREFETCH_BOUNDS <<< "${PREFETCH_BOUNDS[*]:-${PREFETCH_MAX_DISTANCES[*]:-}}"
     read -ra PREFETCH_ADAPTIVE_MODES <<< "${PREFETCH_ADAPTIVE_MODES[*]:-}"
+    read -ra PREFETCH_HINTS <<< "${PREFETCH_HINTS[*]:-}"
+    read -ra PREFETCH_NAIVE_MODES <<< "${PREFETCH_NAIVE_MODES[*]:-}"
     read -ra THP_MODES <<< "${THP_MODES[*]:-}"
 
     [ ${#KERNELS[@]} -eq 0 ] && { echo -e "${RED}Error: No target kernels specified in ${REGRESSION_LIST}${NC}"; exit 1; }
@@ -248,32 +303,38 @@ load_targets() {
     [ ${#TIER_RATIOS[@]} -eq 0 ] && { echo -e "${RED}Error: No tier ratios specified in ${REGRESSION_LIST}${NC}"; exit 1; }
 
     [ ${#PREFETCH_ADAPTIVE_MODES[@]} -eq 0 ] && PREFETCH_ADAPTIVE_MODES=(1)
+    [ ${#PREFETCH_HINTS[@]} -eq 0 ] && PREFETCH_HINTS=(0)
+    [ ${#PREFETCH_NAIVE_MODES[@]} -eq 0 ] && PREFETCH_NAIVE_MODES=(0)
     [ ${#THP_MODES[@]} -eq 0 ] && THP_MODES=(madvise)
 
-    # Pre-build prefetch evaluation configurations: "adaptive_mode|distance|bounds"
+    # Pre-build prefetch evaluation configurations: "adaptive_mode|distance|bounds|hint|naive"
     local prefetch_configs=()
-    for a in "${PREFETCH_ADAPTIVE_MODES[@]}"; do
-        if [ "$a" == "1" ]; then
-            # Adaptive mode: evaluates dynamically adjusted lookahead within bounds
-            if [ ${#PREFETCH_BOUNDS[@]} -gt 0 ]; then
-                for bound in "${PREFETCH_BOUNDS[@]}"; do
-                    prefetch_configs+=("1||${bound}")
-                done
-            else
-                prefetch_configs+=("1||")
-            fi
-        elif [ "$a" == "0" ]; then
-            # Static mode: evaluates fixed lookahead distances (clamp bounds do not apply)
-            if [ ${#PREFETCH_DISTANCES[@]} -gt 0 ]; then
-                for d in "${PREFETCH_DISTANCES[@]}"; do
-                    prefetch_configs+=("0|${d}|")
-                done
-            else
-                prefetch_configs+=("0|p5_d2|")
-            fi
-        fi
+    for naive in "${PREFETCH_NAIVE_MODES[@]}"; do
+        for h in "${PREFETCH_HINTS[@]}"; do
+            for a in "${PREFETCH_ADAPTIVE_MODES[@]}"; do
+                if [ "$a" == "1" ]; then
+                    # Adaptive mode: evaluates dynamically adjusted lookahead within bounds
+                    if [ ${#PREFETCH_BOUNDS[@]} -gt 0 ]; then
+                        for bound in "${PREFETCH_BOUNDS[@]}"; do
+                            prefetch_configs+=("1||${bound}|${h}|${naive}")
+                        done
+                    else
+                        prefetch_configs+=("1|||${h}|${naive}")
+                    fi
+                elif [ "$a" == "0" ]; then
+                    # Static mode: evaluates fixed lookahead distances (clamp bounds do not apply)
+                    if [ ${#PREFETCH_DISTANCES[@]} -gt 0 ]; then
+                        for d in "${PREFETCH_DISTANCES[@]}"; do
+                            prefetch_configs+=("0|${d}||${h}|${naive}")
+                        done
+                    else
+                        prefetch_configs+=("0|p5_d2||${h}|${naive}")
+                    fi
+                fi
+            done
+        done
     done
-    [ ${#prefetch_configs[@]} -eq 0 ] && prefetch_configs+=("1||")
+    [ ${#prefetch_configs[@]} -eq 0 ] && prefetch_configs+=("1|||0|0")
 
     # Execution matrix: Kernel -> Benchmark -> Ratio -> THP -> PrefetchConfig
     # Grouping THP and prefetch configs under the same (Kernel, Benchmark, Ratio) minimizes reboots
@@ -283,15 +344,15 @@ load_targets() {
         if is_prefetch_kernel "$k"; then
             configs=("${prefetch_configs[@]}")
         else
-            configs=("||")
+            configs=("||||")
         fi
 
         for b in "${BENCHMARKS[@]}"; do
             for r in "${TIER_RATIOS[@]}"; do
                 for thp in "${THP_MODES[@]}"; do
                     for cfg in "${configs[@]}"; do
-                        IFS='|' read -r a d bound <<< "$cfg"
-                        TARGET_ITEMS+=("${k}|${b}|${r}|${d}|${a}|${bound}|${thp}")
+                        IFS='|' read -r a d bound h naive <<< "$cfg"
+                        TARGET_ITEMS+=("${k}|${b}|${r}|${d}|${a}|${bound}|${thp}|${h}|${naive}")
                     done
                 done
             done
@@ -314,6 +375,8 @@ print_regression_config() {
     done
 
     if [ "$has_prefetch" == "1" ]; then
+        echo -e " Prefetch Engines   : ${PREFETCH_NAIVE_MODES[*]} (0=Deep-tune, 1=Naive)"
+        echo -e " Prefetch Hints     : ${PREFETCH_HINTS[*]} (0=NTA, 1=L3, 2=L2, 3=L1)"
         echo -e " Prefetch Modes     : ${PREFETCH_ADAPTIVE_MODES[*]} (for *-prefetch: 0=Static, 1=Adaptive)"
         if [[ " ${PREFETCH_ADAPTIVE_MODES[*]} " =~ [[:space:]]0[[:space:]] ]]; then
             if [ ${#PREFETCH_DISTANCES[@]} -gt 0 ]; then
@@ -344,10 +407,10 @@ switch_kernel_and_reboot() {
         bash "$MANAGE_KERNELS" "$target_kernel" update_grub --memmap "$target_memmap" --reboot
     elif is_kernel_ready "$target_kernel"; then
         log "${YELLOW}[!] Kernel '${target_kernel}' built in tree but not installed in /boot. Installing and updating GRUB...${NC}"
-        bash "$MANAGE_KERNELS" "$target_kernel" --memmap "$target_memmap" --reboot
+        bash "$MANAGE_KERNELS" "$target_kernel" install --memmap "$target_memmap" --reboot
     else
         log "${YELLOW}[!] Source/binary for '${target_kernel}' not built. Compiling and installing...${NC}"
-        bash "$MANAGE_KERNELS" "$target_kernel" --memmap "$target_memmap" --reboot
+        bash "$MANAGE_KERNELS" "$target_kernel" build --memmap "$target_memmap" --reboot
     fi
 
     # Fallback reboot in case manage_kernels.sh returned without rebooting
@@ -357,10 +420,41 @@ switch_kernel_and_reboot() {
 }
 
 # ------------------------------------------------------------------------------
+# Record skipped/failed benchmark command into an executable rerun script
+# ------------------------------------------------------------------------------
+record_failed_rerun() {
+    local reason="$1" step_idx="$2" total="$3" kernel="$4" memmap="$5" bench="$6" ratio="${7:-}" dist="${8:-}" adaptive="${9:-}" bound="${10:-}" thp="${11:-}" hint="${12:-0}" naive="${13:-0}"
+    local ts="[$(date '+%Y-%m-%d %H:%M:%S')]"
+
+    if [ ! -f "$RERUN_LOG_FILE" ]; then
+        {
+            echo "#!/bin/bash"
+            echo "# Auto-generated list of skipped/failed regression commands to rerun"
+            echo ""
+        } > "$RERUN_LOG_FILE"
+        chmod +x "$RERUN_LOG_FILE"
+    fi
+
+    local env_vars="TIER_RATIO='${ratio}' THP_MODE='${thp}' THP='${thp}'"
+    if is_prefetch_kernel "$kernel"; then
+        env_vars+=" PREFETCH_PROMOTE_DISTANCE='${dist}' PREFETCH_DEMOTE_DISTANCE='${dist}' PREFETCH_DISTANCE='${dist}' PREFETCH_MIN_DISTANCE='${bound}' PREFETCH_MAX_DISTANCE='${bound}' PREFETCH_ADAPTIVE='${adaptive}' PREFETCH_HINT='${hint}' PREFETCH_NAIVE='${naive}'"
+    fi
+
+    {
+        echo "# ${ts} Step $((step_idx + 1))/${total} | Reason: ${reason} | Kernel: ${kernel} | Memmap: ${memmap}"
+        echo "# Boot cmd: sudo bash '${ROOT_DIR}/baselines/scripts/manage_kernels.sh' '${kernel}' update_grub --memmap '${memmap}' --reboot"
+        echo "sudo ${env_vars} bash '${RUN_WORKLOADS}' '${bench}'"
+        echo ""
+    } >> "$RERUN_LOG_FILE"
+    sync
+    log "${YELLOW}[!] Logged rerun command to ${RERUN_LOG_FILE}${NC}"
+}
+
+# ------------------------------------------------------------------------------
 # Execute workload with inline prefetch, ratio, and THP environment options
 # ------------------------------------------------------------------------------
 run_target_benchmark() {
-    local bench="$1" ratio="${2:-}" dist="${3:-}" adaptive="${4:-}" bound="${5:-}" thp="${6:-}"
+    local bench="$1" ratio="${2:-}" dist="${3:-}" adaptive="${4:-}" bound="${5:-}" thp="${6:-}" hint="${7:-0}" naive="${8:-0}"
 
     TIER_RATIO="${ratio}" \
     THP_MODE="${thp}" \
@@ -371,6 +465,8 @@ run_target_benchmark() {
     PREFETCH_MIN_DISTANCE="${bound}" \
     PREFETCH_MAX_DISTANCE="${bound}" \
     PREFETCH_ADAPTIVE="${adaptive}" \
+    PREFETCH_HINT="${hint}" \
+    PREFETCH_NAIVE="${naive}" \
     bash "$RUN_WORKLOADS" "$bench"
 }
 
@@ -380,6 +476,7 @@ run_target_benchmark() {
 execute_step() {
     load_targets
     [ ! -f "$STATE_FILE" ] && { log "${RED}No active regression state found. Exiting.${NC}"; exit 0; }
+    enable_hang_auto_reboot
 
     # shellcheck source=/dev/null
     source "$STATE_FILE"
@@ -387,8 +484,10 @@ execute_step() {
     local start_idx="${CURRENT_INDEX:-0}"
 
     for ((idx = start_idx; idx < total; idx++)); do
-        IFS='|' read -r CURRENT_KERNEL CURRENT_BENCHMARK CURRENT_RATIO CURRENT_DIST CURRENT_ADAPTIVE CURRENT_BOUND CURRENT_THP <<< "${TARGET_ITEMS[$idx]}"
+        IFS='|' read -r CURRENT_KERNEL CURRENT_BENCHMARK CURRENT_RATIO CURRENT_DIST CURRENT_ADAPTIVE CURRENT_BOUND CURRENT_THP CURRENT_HINT CURRENT_NAIVE <<< "${TARGET_ITEMS[$idx]}"
         CURRENT_THP="${CURRENT_THP:-}"
+        CURRENT_HINT="${CURRENT_HINT:-0}"
+        CURRENT_NAIVE="${CURRENT_NAIVE:-0}"
         CURRENT_MEMMAP=$(resolve_memmap "$CURRENT_BENCHMARK" "$CURRENT_RATIO")
 
         # If current running system doesn't match required kernel and memmap, configure & reboot
@@ -420,9 +519,50 @@ execute_step() {
         LAST_REBOOT_MEMMAP=""
         REBOOT_ATTEMPTS=0
 
+        # Crash-loop skip guard: track mid-benchmark panics/reboots per step
+        local max_exec_attempts="${MAX_EXEC_ATTEMPTS:-3}"
+        local last_exec_idx="${LAST_EXEC_INDEX:-}"
+        local exec_attempts="${EXEC_ATTEMPTS:-0}"
+        if [ "${last_exec_idx}" == "${idx}" ]; then
+            exec_attempts=$((exec_attempts + 1))
+        else
+            exec_attempts=1
+        fi
+
+        if [ "${exec_attempts}" -gt "${max_exec_attempts}" ]; then
+            log "${RED}[ERROR] Step $((idx + 1))/${total} (${CURRENT_KERNEL} | ${CURRENT_BENCHMARK} | ${CURRENT_RATIO}${CURRENT_THP:+ | THP: ${CURRENT_THP}}) crashed/rebooted ${max_exec_attempts} times.${NC}"
+            log "${YELLOW}[!] Skipping unstable step $((idx + 1))/${total} to prevent an infinite crash-reboot loop.${NC}"
+            record_failed_rerun "crashed/rebooted ${max_exec_attempts} times" "$idx" "$total" "$CURRENT_KERNEL" "$CURRENT_MEMMAP" "$CURRENT_BENCHMARK" "$CURRENT_RATIO" "$CURRENT_DIST" "$CURRENT_ADAPTIVE" "${CURRENT_BOUND:-}" "${CURRENT_THP:-}" "${CURRENT_HINT}" "${CURRENT_NAIVE}"
+            CURRENT_INDEX=$((idx + 1))
+            LAST_EXEC_INDEX=""
+            EXEC_ATTEMPTS=0
+            {
+                echo "CURRENT_INDEX=${CURRENT_INDEX}"
+                echo "STARTED_TIME=${STARTED_TIME:-$(date +%s)}"
+                echo "LAST_EXEC_INDEX="
+                echo "EXEC_ATTEMPTS=0"
+            } > "$STATE_FILE"
+            sync
+            continue
+        fi
+
+        # Persist current step attempt BEFORE launching workload so it survives a kernel panic/reboot
+        LAST_EXEC_INDEX="${idx}"
+        EXEC_ATTEMPTS="${exec_attempts}"
+        {
+            echo "CURRENT_INDEX=${idx}"
+            echo "STARTED_TIME=${STARTED_TIME:-$(date +%s)}"
+            echo "LAST_EXEC_INDEX=${LAST_EXEC_INDEX}"
+            echo "EXEC_ATTEMPTS=${EXEC_ATTEMPTS}"
+        } > "$STATE_FILE"
+        sync
+
         # Build informative logging tag for prefetch and THP parameters
         local dist_tag=""
         if is_prefetch_kernel "$CURRENT_KERNEL"; then
+            [ "$CURRENT_NAIVE" == "1" ] && dist_tag+=" | Engine: Naive"
+            [ "$CURRENT_NAIVE" == "0" ] && dist_tag+=" | Engine: Deep-tune"
+            [ -n "$CURRENT_HINT" ] && dist_tag+=" | Hint: ${CURRENT_HINT}"
             [ "$CURRENT_ADAPTIVE" == "1" ] && dist_tag+=" | Mode: Adaptive"
             [ "$CURRENT_ADAPTIVE" == "0" ] && dist_tag+=" | Mode: Static"
             [ -n "$CURRENT_DIST" ] && dist_tag+=" | Distance: ${CURRENT_DIST}"
@@ -431,7 +571,7 @@ execute_step() {
         [ -n "$CURRENT_THP" ] && dist_tag+=" | THP: ${CURRENT_THP}"
 
         log "${CYAN}================================================================================${NC}"
-        log "${CYAN} [Step $((idx + 1))/${total}] Kernel: ${CURRENT_KERNEL} | Workload: ${CURRENT_BENCHMARK} | Ratio: ${CURRENT_RATIO}${dist_tag} (${CURRENT_MEMMAP})${NC}"
+        log "${CYAN} [Step $((idx + 1))/${total}] Kernel: ${CURRENT_KERNEL} | Workload: ${CURRENT_BENCHMARK} | Ratio: ${CURRENT_RATIO}${dist_tag} (${CURRENT_MEMMAP}) [Attempt ${exec_attempts}/${max_exec_attempts}]${NC}"
         log "${CYAN}================================================================================${NC}"
 
         # Settle system before running benchmark
@@ -440,14 +580,26 @@ execute_step() {
 
         # Execute targeted workload
         log "${GREEN}Executing targeted benchmark: ${CURRENT_BENCHMARK} (Ratio: ${CURRENT_RATIO}${dist_tag})...${NC}"
-        run_target_benchmark "$CURRENT_BENCHMARK" "$CURRENT_RATIO" "$CURRENT_DIST" "$CURRENT_ADAPTIVE" "${CURRENT_BOUND:-}" "${CURRENT_THP:-}" || log "${RED}[WARNING] Benchmark ${CURRENT_BENCHMARK} exited with status $?${NC}"
+        local bench_rc=0
+        run_target_benchmark "$CURRENT_BENCHMARK" "$CURRENT_RATIO" "$CURRENT_DIST" "$CURRENT_ADAPTIVE" "${CURRENT_BOUND:-}" "${CURRENT_THP:-}" "${CURRENT_HINT}" "${CURRENT_NAIVE}" || bench_rc=$?
+        if [ "${bench_rc}" -ne 0 ]; then
+            log "${RED}[WARNING] Benchmark ${CURRENT_BENCHMARK} exited with status ${bench_rc}${NC}"
+            record_failed_rerun "exited with status ${bench_rc}" "$idx" "$total" "$CURRENT_KERNEL" "$CURRENT_MEMMAP" "$CURRENT_BENCHMARK" "$CURRENT_RATIO" "$CURRENT_DIST" "$CURRENT_ADAPTIVE" "${CURRENT_BOUND:-}" "${CURRENT_THP:-}" "${CURRENT_HINT}" "${CURRENT_NAIVE}"
+        fi
 
         log "${GREEN}Completed benchmark: ${CURRENT_BENCHMARK} (Ratio: ${CURRENT_RATIO}${dist_tag}).${NC}"
 
-        # Advance to next item
-        CURRENT_INDEX=$((CURRENT_INDEX + 1))
-        echo "CURRENT_INDEX=${CURRENT_INDEX}" > "$STATE_FILE"
-        echo "STARTED_TIME=${STARTED_TIME:-$(date +%s)}" >> "$STATE_FILE"
+        # Advance to next item and reset crash-loop counter
+        CURRENT_INDEX=$((idx + 1))
+        LAST_EXEC_INDEX=""
+        EXEC_ATTEMPTS=0
+        {
+            echo "CURRENT_INDEX=${CURRENT_INDEX}"
+            echo "STARTED_TIME=${STARTED_TIME:-$(date +%s)}"
+            echo "LAST_EXEC_INDEX="
+            echo "EXEC_ATTEMPTS=0"
+        } > "$STATE_FILE"
+        sync
     done
 
     # Clean up state and service upon completing all execution steps
@@ -506,14 +658,17 @@ show_status() {
         source "$STATE_FILE"
         local curr="${CURRENT_INDEX:-0}"
         if [ "$curr" -lt "$total" ]; then
-            IFS='|' read -r k b r d a bound thp <<< "${TARGET_ITEMS[$curr]}"
+            IFS='|' read -r k b r d a bound thp h naive <<< "${TARGET_ITEMS[$curr]}"
             local m
             m=$(resolve_memmap "$b" "$r")
             echo -e "\n Current Progress   : Step $((curr + 1)) of ${total}"
             local mode_str=""
             if is_prefetch_kernel "$k"; then
-                [ "$a" == "1" ] && mode_str=", Mode=Adaptive"
-                [ "$a" == "0" ] && mode_str=", Mode=Static"
+                [ "$naive" == "1" ] && mode_str+=", Engine=Naive"
+                [ "$naive" == "0" ] && mode_str+=", Engine=Deep-tune"
+                [ -n "$h" ] && mode_str+=", Hint=${h}"
+                [ "$a" == "1" ] && mode_str+=", Mode=Adaptive"
+                [ "$a" == "0" ] && mode_str+=", Mode=Static"
             fi
             local d_info=""
             if [ -n "$d" ] && is_prefetch_kernel "$k"; then
@@ -523,7 +678,7 @@ show_status() {
             if [ -n "$bound" ] && is_prefetch_kernel "$k"; then
                 bound_info=", Bounds='${bound}'"
             fi
-            echo -e " Active Target      : Kernel='${k}', Benchmark='${b}', Ratio='${r}'${d_info}${bound_info}${mode_str}${thp:+, THP=${thp}} (${m})"
+            echo -e " Active Target      : Kernel='${k}', Benchmark='${b}', Ratio='${r}'${mode_str}${d_info}${bound_info}${thp:+, THP=${thp}} (${m})"
         else
             echo -e "\n Current Progress   : Completed all ${total} steps"
         fi
@@ -553,6 +708,10 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
             start_regression
             ;;
         resume)
+            if [ ! -f "$SERVICE_FILE" ]; then
+                sed -i 's/^REBOOT_ATTEMPTS=.*/REBOOT_ATTEMPTS=0/; s/^EXEC_ATTEMPTS=.*/EXEC_ATTEMPTS=0/; s/^LAST_EXEC_INDEX=.*/LAST_EXEC_INDEX=/' "$STATE_FILE" 2>/dev/null || true
+                install_service
+            fi
             execute_step
             ;;
         status|check)
