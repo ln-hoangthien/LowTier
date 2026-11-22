@@ -410,28 +410,19 @@ int mig_telemetry_init(struct mig_telemetry *telem, pid_t explicit_mig_tid,
     telem->latencies.slow_ns = (uint16_t)DEFAULT_LATENCY_SLOW_NS;
     telem->latencies.fast_ns = (uint16_t)DEFAULT_LATENCY_FAST_NS;
 
-    /* Prefer actual current CPU core frequency (reflects real all-core clock
-     * under load), falling back to scaling_max_freq if unavailable. */
+    /* Determine core clock from pinned scaling_min_freq == scaling_max_freq. */
     {
-      unsigned long freq_khz = 0;
-      FILE *fp =
-          fopen("/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq", "r");
-      if (fp) {
-        if (fscanf(fp, "%lu", &freq_khz) != 1)
-          freq_khz = 0;
-        fclose(fp);
-      }
-      if (freq_khz <= 500000) {
-        fp =
-            fopen("/sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq", "r");
-        if (fp) {
-          if (fscanf(fp, "%lu", &freq_khz) != 1)
-            freq_khz = 0;
-          fclose(fp);
-        }
-      }
-      if (freq_khz > 500000) {
-        telem->core_freq_ghz = (double)freq_khz / 1e6;
+      unsigned long min_khz = mig_read_ulong_file(
+          "/sys/devices/system/cpu/cpu0/cpufreq/scaling_min_freq");
+      unsigned long max_khz = mig_read_ulong_file(
+          "/sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq");
+      if (min_khz > 500000 && min_khz == max_khz) {
+        telem->core_freq_ghz = (double)max_khz / 1e6;
+      } else {
+        mig_log_error("mig_telemetry_init",
+                      "CPU frequency is not pinned (scaling_min_freq=%lu kHz, "
+                      "scaling_max_freq=%lu kHz); keeping fallback %.3f GHz",
+                      min_khz, max_khz, telem->core_freq_ghz);
       }
     }
 

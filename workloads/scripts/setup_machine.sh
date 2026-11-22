@@ -82,10 +82,7 @@ show_status() {
     local cpu_epp="$(read_sysfs /sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference)"
     local cpu_min="$(read_sysfs /sys/devices/system/cpu/cpu0/cpufreq/scaling_min_freq)"
     local cpu_max="$(read_sysfs /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq)"
-    local cpu0_cur="$(read_sysfs /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq)"
     local no_turbo="$(read_sysfs /sys/devices/system/cpu/intel_pstate/no_turbo)"
-    local cur_freq_summary
-    cur_freq_summary=$(cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq 2>/dev/null | awk '{sum+=$1; count++; if (min=="" || $1<min) min=$1; if ($1>max) max=$1} END {if (count>0) printf "avg=%.0fkHz (min=%dkHz, max=%dkHz)", sum/count, min, max; else printf "N/A"}')
 
     local u0_dir="$(get_uncore_dir 0)"
     local u1_dir="$(get_uncore_dir 1)"
@@ -95,7 +92,7 @@ show_status() {
     local u1_max="$( [ -n "$u1_dir" ] && read_sysfs "$u1_dir/max_freq_khz" )"
 
     local online_cpus=$(grep -c "^processor" /proc/cpuinfo 2>/dev/null || echo "N/A")
-    log_echo "[*] CPU Power & Frequency Profile: gov=${cpu_gov:-N/A} (epp=${cpu_epp:-N/A}), clamped=${cpu_min:-N/A}-${cpu_max:-N/A}kHz, cur_freq=${cur_freq_summary} (cpu0=${cpu0_cur:-N/A}kHz)"
+    log_echo "[*] CPU Power & Frequency Profile: gov=${cpu_gov:-N/A} (epp=${cpu_epp:-N/A}), clamped=${cpu_min:-N/A}-${cpu_max:-N/A}kHz"
     log_echo "[*] Machine Status: turbo=$([ "${no_turbo}" == "1" ] && echo "DISABLED(no_turbo=1)" || echo "active(no_turbo=0)"), uncore_pkg0=${u0_min:-N/A}-${u0_max:-N/A}kHz, uncore_pkg1=${u1_min:-N/A}-${u1_max:-N/A}kHz, online_cores=${online_cpus}"
 }
 

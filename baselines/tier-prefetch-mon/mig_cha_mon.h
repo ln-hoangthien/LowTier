@@ -42,6 +42,7 @@ typedef struct {
   double tsc_freq_ghz;
 } mig_cha_mon_t;
 
+unsigned long mig_read_ulong_file(const char *path);
 int mig_cha_mon_init(mig_cha_mon_t *mon, uint64_t cpu_mask, int target_cpu);
 void mig_cha_mon_start(mig_cha_mon_t *mon);
 void mig_cha_mon_stop(mig_cha_mon_t *mon);

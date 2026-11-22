@@ -56,27 +56,45 @@ static long sys_perf_event_open(struct perf_event_attr *hw_event, pid_t pid,
   return syscall(__NR_perf_event_open, hw_event, pid, cpu, group_fd, flags);
 }
 
+unsigned long mig_read_ulong_file(const char *path) {
+  FILE *fp = fopen(path, "r");
+  if (!fp)
+    return 0;
+  unsigned long val = 0;
+  if (fscanf(fp, "%lu", &val) != 1)
+    val = 0;
+  fclose(fp);
+  return val;
+}
+
 /* CHA TOR_OCCUPANCY counts in Package 0 uncore clock cycles (independent of
- * core Turbo frequency). Read pkg0 uncore frequency so latency stays accurate
- * when core clocks are pinned at 2.1, 3.0, or 3.5 GHz. */
+ * core Turbo frequency). Require pinned pkg0 min_freq_khz == max_freq_khz. */
 static double mig_detect_uncore_freq_ghz(void) {
-  static const char *const paths[] = {
-      "/sys/devices/system/cpu/intel_uncore_frequency/package_00_die_00/current_freq_khz",
-      "/sys/devices/system/cpu/intel_uncore_frequency/package_00_die_00/max_freq_khz",
-      "/sys/devices/system/cpu/intel_uncore_frequency/uncore00/current_freq_khz",
-      "/sys/devices/system/cpu/intel_uncore_frequency/uncore00/max_freq_khz",
+  static const struct {
+    const char *min_path;
+    const char *max_path;
+  } dirs[] = {
+      {"/sys/devices/system/cpu/intel_uncore_frequency/package_00_die_00/min_freq_khz",
+       "/sys/devices/system/cpu/intel_uncore_frequency/package_00_die_00/max_freq_khz"},
+      {"/sys/devices/system/cpu/intel_uncore_frequency/uncore00/min_freq_khz",
+       "/sys/devices/system/cpu/intel_uncore_frequency/uncore00/max_freq_khz"},
   };
-  for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
-    FILE *fp = fopen(paths[i], "r");
-    if (fp) {
-      unsigned long khz = 0;
-      if (fscanf(fp, "%lu", &khz) == 1 && khz > 500000) {
-        fclose(fp);
-        return (double)khz / 1e6;
-      }
-      fclose(fp);
+  unsigned long last_min = 0, last_max = 0;
+  for (size_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
+    unsigned long min_khz = mig_read_ulong_file(dirs[i].min_path);
+    unsigned long max_khz = mig_read_ulong_file(dirs[i].max_path);
+    if (min_khz > 500000 && min_khz == max_khz) {
+      return (double)max_khz / 1e6;
+    }
+    if (min_khz > 0 || max_khz > 0) {
+      last_min = min_khz;
+      last_max = max_khz;
     }
   }
+  mig_log_error("mig_detect_uncore_freq_ghz",
+                "Pkg0 uncore frequency is not pinned (min_freq_khz=%lu kHz, "
+                "max_freq_khz=%lu kHz); keeping fallback %.3f GHz",
+                last_min, last_max, DEFAULT_UNCORE_FREQ_GHZ);
   return DEFAULT_UNCORE_FREQ_GHZ;
 }
 
