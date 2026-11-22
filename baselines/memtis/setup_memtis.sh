@@ -31,10 +31,10 @@ make clean
 rm -f tools/objtool/fixdep scripts/basic/fixdep
 
 echo "Applying $(basename "$PATCH_FILE") ..."
-if patch -p1 --dry-run < "$PATCH_FILE" >/dev/null 2>&1; then
-    patch -p1 < "$PATCH_FILE"
+if git apply --reverse --check "$PATCH_FILE" >/dev/null 2>&1; then
+    echo "  (already applied, skipping)"
 else
-    echo "  (already applied or failed dry-run, skipping)"
+    git apply "$PATCH_FILE"
 fi
 
 # Copy base configuration to .config

@@ -1,0 +1,166 @@
+diff --git a/baselines/hybridtier/hook/Makefile b/baselines/hybridtier/hook/Makefile
+index c9e6951..b128c38 100644
+--- a/baselines/hybridtier/hook/Makefile
++++ b/baselines/hybridtier/hook/Makefile
+@@ -1,15 +1,17 @@
+ CXX = g++-11
+-CXXFLAGS ?= -O3 -Wall -fPIC -g
++CXXFLAGS ?= -O3 -Wall -fPIC -g -I../../tier-prefetch-mon
+ LDFLAGS ?= -shared -ldl -lpthread -lnuma
+ TARGET_EXE_NAME ?= pr
+ 
++PREFETCH_SRCS = ../../tier-prefetch-mon/mig_cha_mon.c ../../tier-prefetch-mon/mig_telemetry.c
++
+ all: hook.so hook_huge.so
+ 
+-hook.so: hook.cpp
+-	$(CXX) $(CXXFLAGS) hook.cpp -o hook.so $(LDFLAGS) -DHYBRIDTIER_REGULAR -DFAST_MEMORY_SIZE_GB=16 -DTARGET_EXE_NAME=\"$(TARGET_EXE_NAME)\"
++hook.so: hook.cpp $(PREFETCH_SRCS)
++	$(CXX) $(CXXFLAGS) -DPREFETCH_ENABLED hook.cpp $(PREFETCH_SRCS) -o hook.so $(LDFLAGS) -DHYBRIDTIER_REGULAR -DFAST_MEMORY_SIZE_GB=16 -DTARGET_EXE_NAME=\"$(TARGET_EXE_NAME)\"
+ 
+-hook_huge.so: hook.cpp
+-	$(CXX) $(CXXFLAGS) hook.cpp -o hook_huge.so $(LDFLAGS) -DHYBRIDTIER_HUGE -DFAST_MEMORY_SIZE_GB=16 -DTARGET_EXE_NAME=\"$(TARGET_EXE_NAME)\"
++hook_huge.so: hook.cpp $(PREFETCH_SRCS)
++	$(CXX) $(CXXFLAGS) -DPREFETCH_ENABLED hook.cpp $(PREFETCH_SRCS) -o hook_huge.so $(LDFLAGS) -DHYBRIDTIER_HUGE -DFAST_MEMORY_SIZE_GB=16 -DTARGET_EXE_NAME=\"$(TARGET_EXE_NAME)\"
+ 
+ clean:
+ 	rm -f hook.so hook_huge.so
+diff --git a/baselines/hybridtier/hook/hook.cpp b/baselines/hybridtier/hook/hook.cpp
+index 42eac99..ad62290 100644
+--- a/baselines/hybridtier/hook/hook.cpp
++++ b/baselines/hybridtier/hook/hook.cpp
+@@ -3,6 +3,14 @@
+ #include <pthread.h>
+ #include <unistd.h>
+ 
++#ifdef PREFETCH_ENABLED
++extern "C" {
++#include "../../tier-prefetch-mon/mig_cha_mon.h"
++#include "../../tier-prefetch-mon/mig_telemetry.h"
++#include "../../tier-prefetch-mon/logging.h"
++}
++#endif
++
+ #if defined(HYBRIDTIER_REGULAR)
+     #include "../tiering_runtime/hybridtier.cpp"
+ #elif defined(HYBRIDTIER_HUGE)
+diff --git a/baselines/hybridtier/tiering_runtime/hybridtier.cpp b/baselines/hybridtier/tiering_runtime/hybridtier.cpp
+index 495a82b..f430adc 100644
+--- a/baselines/hybridtier/tiering_runtime/hybridtier.cpp
++++ b/baselines/hybridtier/tiering_runtime/hybridtier.cpp
+@@ -816,6 +816,17 @@ void* perf_func(void*) {
+ 
+     uint16_t demotion_reset_count = 0;
+ 
++#ifdef PREFETCH_ENABLED
++    struct mig_telemetry telem;
++    bool telem_initialized = (mig_telemetry_init(&telem, gettid(), 0xFFFFFFULL, 31) == 0);
++    if (telem_initialized) {
++        if (telem.cha_mon_enabled) {
++            mig_cha_mon_start(&telem.cha_mon);
++        }
++        mig_log_info("hybridtier_prefetch", "HybridTier prefetch telemetry initialized on monitor thread (TID %d)", (int)gettid());
++    }
++#endif
++
+ perf_sampling_start:
+     sample_cnt = 0;
+     cur_page_in_migration_batch = 0;
+@@ -949,6 +957,11 @@ perf_sampling_start:
+                     if (move_page_ret == 0) { 
+                       pages_migrated += num_pages_in_slow;
+                       num_pages_promoted_history += num_pages_in_slow;
++#ifdef PREFETCH_ENABLED
++                      if (telem_initialized) {
++                        mig_telemetry_step(&telem, num_pages_promoted_history);
++                      }
++#endif
+                     } else {
+                       printf("move page ret %d \n", move_page_ret);
+                       std::cout << "move page error: " << errno << '\n';
+@@ -1026,6 +1039,9 @@ perf_sampling_start:
+                           }
+ 
+                           demote_ret = numa_move_pages(0, demote_page_list.size(), (void **)demote_pages, demote_nodes, demote_status, MPOL_MF_MOVE_ALL);
++                          if (demote_ret == 0) {
++                            num_pages_promoted_history += demote_page_list.size();
++                          }
+ 
+                           delete[] demote_pages;
+                           delete[] demote_nodes;
+@@ -1046,6 +1062,14 @@ perf_sampling_start:
+                                                                    lfu, momentum, pages_to_demote, 
+                                                                    &last_scanned_address, &full_sweep_not_enough_cold_pages);
+                       std::cout << "pages_demoted " << pages_demoted  << std::endl;
++                      if (pages_demoted != (uint64_t)-1) {
++                        num_pages_promoted_history += pages_demoted;
++#ifdef PREFETCH_ENABLED
++                        if (telem_initialized) {
++                          mig_telemetry_step(&telem, num_pages_promoted_history);
++                        }
++#endif
++                      }
+ 
+ 
+                       // Potentially throttle demotion
+diff --git a/baselines/hybridtier/tiering_runtime/hybridtier_huge.cpp b/baselines/hybridtier/tiering_runtime/hybridtier_huge.cpp
+index e57c1b4..e398c71 100644
+--- a/baselines/hybridtier/tiering_runtime/hybridtier_huge.cpp
++++ b/baselines/hybridtier/tiering_runtime/hybridtier_huge.cpp
+@@ -860,6 +860,17 @@ void* perf_func(void*) {
+ 
+     uint16_t demotion_reset_count = 0;
+ 
++#ifdef PREFETCH_ENABLED
++    struct mig_telemetry telem;
++    bool telem_initialized = (mig_telemetry_init(&telem, gettid(), 0xFFFFFFULL, 31) == 0);
++    if (telem_initialized) {
++        if (telem.cha_mon_enabled) {
++            mig_cha_mon_start(&telem.cha_mon);
++        }
++        mig_log_info("hybridtier_prefetch", "HybridTier-huge prefetch telemetry initialized on monitor thread (TID %d)", (int)gettid());
++    }
++#endif
++
+ perf_sampling_start:
+     sample_cnt = 0;
+     cur_page_in_migration_batch = 0;
+@@ -986,7 +994,12 @@ perf_sampling_start:
+                         //pages_migrated += num_pages_in_slow - num_pages_remain_in_slow; 
+                         pages_migrated += num_pages_in_slow;
+                         num_pages_promoted_history += num_pages_in_slow;
+-
++#ifdef PREFETCH_ENABLED
++                        if (telem_initialized) {
++                          /* Normalize 2MB huge pages to universal 4KB base page units (x512) */
++                          mig_telemetry_step(&telem, num_pages_promoted_history * 512ULL);
++                        }
++#endif
+                       } else {
+                         printf("move page ret %d \n", move_page_ret);
+                         std::cout << "move page error: " << errno << '\n';
+@@ -1065,6 +1078,9 @@ perf_sampling_start:
+                           }
+ 
+                           demote_ret = numa_move_pages(0, demote_page_list.size(), (void **)demote_pages, demote_nodes, demote_status, MPOL_MF_MOVE_ALL);
++                          if (demote_ret == 0) {
++                            num_pages_promoted_history += demote_page_list.size();
++                          }
+ 
+                           delete[] demote_pages;
+                           delete[] demote_nodes;
+@@ -1080,6 +1096,14 @@ perf_sampling_start:
+                                                                    lfu, momentum, pages_to_demote, 
+                                                                    &last_scanned_address, &full_sweep_not_enough_cold_pages);
+                       std::cout << "pages_demoted " << pages_demoted  << std::endl;
++                      if (pages_demoted != (uint64_t)-1) {
++                        num_pages_promoted_history += pages_demoted;
++#ifdef PREFETCH_ENABLED
++                        if (telem_initialized) {
++                          mig_telemetry_step(&telem, num_pages_promoted_history * 512ULL);
++                        }
++#endif
++                      }
+ 
+ 
+                       // Potentially throttle demotion

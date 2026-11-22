@@ -56,9 +56,11 @@ fi
 scripts/config --set-str CONFIG_LOCALVERSION "-TPP"
 scripts/config --set-str CONFIG_SYSTEM_TRUSTED_KEYS ""
 scripts/config --set-str CONFIG_SYSTEM_REVOCATION_KEYS ""
-scripts/config --disable CONFIG_DEBUG_INFO_BTF
 
-# 2. Single-Socket NUMA Emulation Configs (managed in manage_kernels.sh; will remove in real 2-socket NUMA in the future)
+# 2. Intel Uncore Frequency Control
+scripts/config --enable CONFIG_INTEL_UNCORE_FREQ_CONTROL
+
+# 3. Single-Socket NUMA Emulation Configs (managed in manage_kernels.sh; will remove in real 2-socket NUMA in the future)
 if type configure_single_socket_numa >/dev/null 2>&1; then
     configure_single_socket_numa "$KERNEL_DIR"
 fi

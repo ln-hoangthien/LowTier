@@ -56,13 +56,19 @@ fi
 scripts/config --set-str CONFIG_LOCALVERSION "-Nomad-Alto"
 scripts/config --set-str CONFIG_SYSTEM_TRUSTED_KEYS ""
 scripts/config --set-str CONFIG_SYSTEM_REVOCATION_KEYS ""
-scripts/config --disable CONFIG_DEBUG_INFO_BTF
 
-# 2. Core Architecture Configuration
+# 2. Intel Uncore Frequency Control
+scripts/config --enable CONFIG_INTEL_UNCORE_FREQ_CONTROL
+
+# 3. Core Architecture Configuration
 # - CONFIG_X86_5LEVEL (disabled): Enforces standard 4-level paging expected by Nomad patch
 scripts/config --disable CONFIG_X86_5LEVEL
 
-# 3. Single-Socket NUMA Emulation Configs (managed in manage_kernels.sh; will remove in real 2-socket NUMA in the future)
+# 4. Disable BTF to avoid incompatibility between modern pahole/toolchain and 5.13 resolve_btfids
+scripts/config --disable CONFIG_DEBUG_INFO_BTF
+scripts/config --disable CONFIG_DEBUG_INFO_BTF_MODULES
+
+# 5. Single-Socket NUMA Emulation Configs (managed in manage_kernels.sh; will remove in real 2-socket NUMA in the future)
 if type configure_single_socket_numa >/dev/null 2>&1; then
     configure_single_socket_numa "$KERNEL_DIR"
 fi

@@ -60,11 +60,18 @@ scripts/config --disable CONFIG_LOCALVERSION_AUTO
 scripts/config --set-str CONFIG_SYSTEM_TRUSTED_KEYS ""
 scripts/config --set-str CONFIG_SYSTEM_REVOCATION_KEYS ""
 
-# 2. Apply Ubuntu Boot Fixes & Safety Nets
+# 2. Intel Uncore Frequency Control
+scripts/config --enable CONFIG_INTEL_UNCORE_FREQ_CONTROL
+
+# 3. Disable BTF to prevent building resolve_btfids/libbpf with modern host toolchain
+scripts/config --disable CONFIG_DEBUG_INFO_BTF
+scripts/config --disable CONFIG_DEBUG_INFO_BTF_MODULES
+
+# 4. Apply Ubuntu Boot Fixes & Safety Nets
 echo "Applying Ubuntu fixes configuration: $UBUNTU_FIXES_CONFIG"
 ./scripts/kconfig/merge_config.sh -m .config "$UBUNTU_FIXES_CONFIG"
 
-# 3. Single-Socket NUMA Emulation Configs (managed in manage_kernels.sh)
+# 5. Single-Socket NUMA Emulation Configs (managed in manage_kernels.sh)
 if type configure_single_socket_numa >/dev/null 2>&1; then
     configure_single_socket_numa "$KERNEL_DIR"
 fi

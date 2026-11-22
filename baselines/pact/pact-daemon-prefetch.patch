@@ -1,0 +1,311 @@
+diff --git a/baselines/pact/src/pact.c b/baselines/pact/src/pact.c
+index faf5b18..42f439a 100644
+--- a/baselines/pact/src/pact.c
++++ b/baselines/pact/src/pact.c
+@@ -34,6 +34,7 @@
+ #include "perf.h"
+ #include "stats-coro.h"
+ #include "cooling.h"
++#include "prefetch-coro.h"
+ #include "utils.h"
+ 
+ /* layout invariants — failures would silently break NMI-shared state,
+@@ -450,6 +451,7 @@ static void mig_dispatch_batch(pact_context_t *ctx, pid_t target_pid, void **pag
+ {
+     long result = numa_move_pages(target_pid, batch_count, pages, nodes, status, MPOL_MF_MOVE);
+     int errno_val = errno;
++    prefetch_account_batch(ctx, metas, status, batch_count);
+     process_migration_batch_results(ctx, metas, status, batch_count, result, errno_val);
+ }
+ 
+@@ -502,6 +504,7 @@ static int mig_drain_workload_ring(pact_context_t *ctx, void **pages, int *nodes
+ static void *migration_thread_fn(void *arg)
+ {
+     pact_context_t *ctx = (pact_context_t *)arg;
++    ctx->migration_tid = gettid();
+ 
+     if (ctx->migration_cpu >= 0) {
+         pact_pin_to_cpu(ctx->migration_cpu);
+@@ -568,6 +571,8 @@ static int init_migration_thread(pact_context_t *ctx)
+         return -1;
+     }
+ 
++    ctx->migration_tid = 0;
++    ctx->migrated_4kb_pages = 0;
+     ctx->migration_thread_running = true;
+     if (pthread_create(&ctx->migration_thread, NULL, migration_thread_fn, ctx) != 0) {
+         log_error("init_migration_thread", "Failed to create migration thread: %s",
+@@ -728,7 +733,10 @@ static int init_coroutines(pact_context_t *ctx)
+     if (create_coroutine(ctx, CORO_TYPE_STATS, "stats", stats_coroutine) < 0) {
+         return -1;
+     }
+-    log_info("init_coroutines", "Initialized 4 coroutines for single-threaded event loop");
++    if (create_coroutine(ctx, CORO_TYPE_PREFETCH, "prefetch", prefetch_coroutine) < 0) {
++        return -1;
++    }
++    log_info("init_coroutines", "Initialized 5 coroutines for single-threaded event loop");
+     return 0;
+ }
+ 
+@@ -858,6 +866,10 @@ static void run_pact_event_loop(pact_context_t *pact)
+             total_yields++;
+             did_work = true;
+         }
++        if (tick_coroutine(pact, now, CORO_TYPE_PREFETCH)) {
++            total_yields++;
++            did_work = true;
++        }
+ 
+         check_targets_alive(pact, now);
+ 
+diff --git a/baselines/pact/src/pact.h b/baselines/pact/src/pact.h
+index bc14972..d2d6a4a 100644
+--- a/baselines/pact/src/pact.h
++++ b/baselines/pact/src/pact.h
+@@ -71,6 +71,7 @@ typedef enum {
+     CORO_TYPE_PAC,     /* adaptive */
+     CORO_TYPE_COOLING, /* cooling */
+     CORO_TYPE_STATS,   /* stats */
++    CORO_TYPE_PREFETCH,/* prefetch distance */
+     CORO_TYPE_MAX
+ } coro_type_t;
+ 
+@@ -355,6 +356,8 @@ struct pact_context {
+     /* ===== Migration Thread ===== */
+     pthread_t migration_thread;             /* Migration thread handle */
+     volatile bool migration_thread_running; /* Thread control flag */
++    pid_t migration_tid;                    /* Migration thread TID (from gettid()) */
++    _Atomic uint64_t migrated_4kb_pages;    /* Per-thread actual migrated 4KB base pages */
+ 
+     /* CPU affinity configuration */
+     int monitor_cpu;   /* CPU for main event loop (-1 = no pinning) */
+@@ -388,6 +391,8 @@ static inline uint32_t pact_coro_interval_ms(const pact_context_t *ctx, coro_typ
+         return ctx->cooling_interval_ms;
+     case CORO_TYPE_STATS:
+         return ctx->stats_interval_ms;
++    case CORO_TYPE_PREFETCH:
++        return 300;
+     default:
+         return 0;
+     }
+@@ -406,6 +411,8 @@ static inline const char *pact_coro_name(coro_type_t type)
+         return "Cooling";
+     case CORO_TYPE_STATS:
+         return "Stats";
++    case CORO_TYPE_PREFETCH:
++        return "Prefetch";
+     default:
+         return "?";
+     }
+diff --git a/baselines/pact/src/prefetch-coro.c b/baselines/pact/src/prefetch-coro.c
+new file mode 100644
+index 0000000..765dc30
+--- /dev/null
++++ b/baselines/pact/src/prefetch-coro.c
+@@ -0,0 +1,189 @@
++#ifndef _GNU_SOURCE
++#define _GNU_SOURCE
++#endif
++
++#include "prefetch-coro.h"
++#include "pact.h"
++#include "tsc.h"
++#include "logging.h"
++
++int g_verbose = 0;
++
++/* Directly tie to the unified mig_telemetry and cha_mon subsystems */
++#include "../../tier-prefetch-mon/mig_cha_mon.c"
++#include "../../tier-prefetch-mon/mig_telemetry.c"
++
++#define THP_TAG_TABLE_BITS 16U
++#define THP_TAG_TABLE_SIZE (1U << THP_TAG_TABLE_BITS)
++#define THP_TAG_TABLE_MASK (THP_TAG_TABLE_SIZE - 1U)
++
++static uint64_t s_thp_fast_tags[THP_TAG_TABLE_SIZE];
++static uint64_t s_last_demoted_baseline = 0;
++static uint64_t s_demoted_4kb_credit = 0;
++static uint16_t s_demotion_epoch = 1;
++
++/*
++ * Per-thread 4KB base-page accounting for PACT's migration thread:
++ * - Called directly from mig_dispatch_batch() on the migration thread before
++ *   process_migration_batch_results() mutates metas[i]->tier.
++ * - Under THP=always, the first 4KB subpage in a 2MB frame (page_addr >> 21)
++ *   migrates the entire 2MB compound folio (512 x 4KB base pages), while
++ *   subsequent 4KB subpages in that same 2MB frame return status[i]==0 as
++ *   0-byte no-ops because the 2MB folio is already on Node 0.
++ * - Under both 4KB and 2MB modes, re-promotions (demoted_by_other) are gated
++ *   against actual kernel LRU demotion credit (stats.demotion_successes) so
++ *   stale PEBS samples on already-promoted pages do not inflate page counts.
++ */
++void prefetch_account_batch(pact_context_t *ctx, pac_metadata_t **metas, const int *status,
++                            int count)
++{
++    if (!ctx || !ctx->workload || !metas || !status || count <= 0) {
++        return;
++    }
++
++    if (!s_cfg_initialized) {
++        mig_telemetry_init_sysfs(&s_cfg);
++    }
++
++    uint64_t cur_demoted = ctx->workload->stats.demotion_successes;
++    if (cur_demoted > s_last_demoted_baseline) {
++        s_demoted_4kb_credit += (cur_demoted - s_last_demoted_baseline);
++        s_last_demoted_baseline = cur_demoted;
++        s_demotion_epoch = (uint16_t)((s_demotion_epoch + 1U) & 0x7FFFU);
++        if (s_demotion_epoch == 0) {
++            s_demotion_epoch = 1;
++        }
++    }
++
++    uint64_t added_4kb_pages = 0;
++    bool thp_mode = s_cfg.thp_always;
++
++    for (int i = 0; i < count; i++) {
++        pac_metadata_t *meta = metas[i];
++        if (!meta || status[i] != 0 || meta->tier == 0) {
++            continue;
++        }
++
++        if (thp_mode) {
++            uint64_t thp_vpn = (meta->page_addr >> 21) & 0x0000FFFFFFFFFFFFULL;
++            uint64_t valid_vpn = (1ULL << 63) | thp_vpn;
++            uint64_t tagged_entry = valid_vpn | ((uint64_t)s_demotion_epoch << 48);
++            size_t slot = (size_t)(thp_vpn & THP_TAG_TABLE_MASK);
++
++            if ((s_thp_fast_tags[slot] & 0x8000FFFFFFFFFFFFULL) != valid_vpn) {
++                s_thp_fast_tags[slot] = tagged_entry;
++                added_4kb_pages += 512ULL;
++            } else if ((s_thp_fast_tags[slot] != tagged_entry) && meta->demoted_by_other &&
++                       s_demoted_4kb_credit >= 512ULL) {
++                s_thp_fast_tags[slot] = tagged_entry;
++                s_demoted_4kb_credit -= 512ULL;
++                added_4kb_pages += 512ULL;
++            }
++        } else {
++            if (!meta->demoted_by_other) {
++                added_4kb_pages += 1ULL;
++            } else if (s_demoted_4kb_credit > 0) {
++                s_demoted_4kb_credit -= 1ULL;
++                added_4kb_pages += 1ULL;
++            }
++        }
++    }
++
++    if (added_4kb_pages > 0) {
++        __atomic_fetch_add(&ctx->migrated_4kb_pages, added_4kb_pages, __ATOMIC_RELAXED);
++    }
++}
++
++typedef enum {
++    PREFETCH_STATE_START_CAPTURE,
++    PREFETCH_STATE_FINISH_CAPTURE
++} prefetch_state_t;
++
++/*
++ * Prefetch Coroutine:
++ * Dynamic kernel prefetch distance tuner. Directly taps PACT's existing uncore
++ * CHA TOR_OCCUPANCY and core LLC misses for Little's Law latency calculation,
++ * setting telem.latencies with ZERO new PMU events.
++ *
++ * Implements a 2-stage non-blocking coroutine yield:
++ * - START_CAPTURE: Disables PACT CHAs, starts telemetry CHA capture, schedules
++ *   coroutine resume in 15 ms via next_tsc, and yields to the PACT event loop.
++ * - FINISH_CAPTURE: Wakes up after 15 ms without blocking the event loop (PEBS
++ *   aggregator runs uninterrupted), stops CHA capture, re-enables PACT CHAs,
++ *   computes telemetry step, and yields until the next stats interval.
++ */
++void prefetch_coroutine(mco_coro *co)
++{
++    pact_context_t *ctx = (pact_context_t *)mco_get_user_data(co);
++    struct mig_telemetry telem;
++    bool initialized = false;
++    prefetch_state_t state = PREFETCH_STATE_START_CAPTURE;
++    int target_uncore_cpu = (ctx && ctx->monitor_cpu >= 0) ? ctx->monitor_cpu : 0;
++
++    while (mco_status(co) != MCO_DEAD) {
++        if (!initialized) {
++            pid_t mig_tid = (ctx && ctx->migration_tid > 0) ? ctx->migration_tid : 0;
++            uint64_t cpu_mask = (ctx && ctx->workload) ? ctx->workload->cpu_mask : 0;
++            if (mig_telemetry_init(&telem, mig_tid, cpu_mask, target_uncore_cpu) == 0) {
++                initialized = true;
++                if (telem.cha_mon_enabled) {
++                    mig_cha_mon_stop(&telem.cha_mon);
++                }
++                mig_log_info(
++                    "prefetch_coro",
++                    "Prefetch telemetry initialized (cha_mon_interleaved=%d, host CPU: %d, "
++                    "mig_tid: %d)",
++                    telem.cha_mon_enabled, target_uncore_cpu, (int)mig_tid);
++            }
++        }
++
++        if (initialized) {
++            if (telem.fd_uops < 0 && ctx && ctx->migration_tid > 0) {
++                mig_telemetry_attach_tid(&telem, ctx->migration_tid);
++            }
++
++            /* Non-blocking interleaved CHA PMU capture across coroutine yields */
++            if (telem.cha_mon_enabled) {
++                if (state == PREFETCH_STATE_START_CAPTURE) {
++                    /* Step 1: Pause PACT's CHAs and start telemetry CHA window */
++                    if (ctx && ctx->workload && ctx->workload->nr_cha > 0) {
++                        ioctl_pmu_cha_perf_events(ctx->workload->cha_pmus, ctx->workload->nr_cha,
++                                                  PERF_EVENT_IOC_DISABLE);
++                    }
++                    mig_cha_mon_start(&telem.cha_mon);
++
++                    /* Schedule this coroutine to resume non-blockingly in 15 ms */
++                    if (ctx) {
++                        ctx->timing[CORO_TYPE_PREFETCH].next_tsc =
++                            rdtsc() + ms_to_tsc(ctx, 15);
++                    }
++                    state = PREFETCH_STATE_FINISH_CAPTURE;
++
++                    /* Yield back to event loop immediately; PEBS aggregator stays active */
++                    mco_yield(co);
++                    continue;
++                } else {
++                    /* Step 2: 15 ms non-blocking window elapsed; stop and resume PACT CHAs */
++                    mig_cha_mon_stop(&telem.cha_mon);
++                    if (ctx && ctx->workload && ctx->workload->nr_cha > 0) {
++                        ioctl_pmu_cha_perf_events(ctx->workload->cha_pmus, ctx->workload->nr_cha,
++                                                  PERF_EVENT_IOC_ENABLE);
++                    }
++                    state = PREFETCH_STATE_START_CAPTURE;
++                }
++            }
++
++            uint64_t pages_promoted =
++                ctx ? __atomic_load_n(&ctx->migrated_4kb_pages, __ATOMIC_RELAXED) : 0;
++
++            /* mig_telemetry_step calculates distance and logs telemetry */
++            mig_telemetry_step(&telem, pages_promoted);
++        }
++
++        mco_yield(co);
++    }
++
++    if (initialized) {
++        mig_telemetry_close(&telem);
++    }
++}
+diff --git a/baselines/pact/src/prefetch-coro.h b/baselines/pact/src/prefetch-coro.h
+new file mode 100644
+index 0000000..51f891d
+--- /dev/null
++++ b/baselines/pact/src/prefetch-coro.h
+@@ -0,0 +1,11 @@
++#ifndef PACT_PREFETCH_CORO_H
++#define PACT_PREFETCH_CORO_H
++
++#include "pact.h"
++#include "minicoro.h"
++
++void prefetch_account_batch(pact_context_t *ctx, pac_metadata_t **metas, const int *status,
++                            int count);
++void prefetch_coroutine(mco_coro *co);
++
++#endif /* PACT_PREFETCH_CORO_H */

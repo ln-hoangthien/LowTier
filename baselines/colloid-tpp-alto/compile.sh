@@ -60,11 +60,15 @@ scripts/config --set-str CONFIG_LOCALVERSION "-Colloid-TPP-Alto"
 scripts/config --set-str CONFIG_SYSTEM_TRUSTED_KEYS ""
 scripts/config --set-str CONFIG_SYSTEM_REVOCATION_KEYS ""
 
-# 2. Apply Ubuntu Boot Fixes & Safety Nets
+# 2. Disable BTF to prevent building resolve_btfids/libbpf with modern host toolchain
+scripts/config --disable CONFIG_DEBUG_INFO_BTF
+scripts/config --disable CONFIG_DEBUG_INFO_BTF_MODULES
+
+# 3. Apply Ubuntu Boot Fixes & Safety Nets
 echo "Applying Ubuntu fixes configuration: $UBUNTU_FIXES_CONFIG"
 ./scripts/kconfig/merge_config.sh -m .config "$UBUNTU_FIXES_CONFIG"
 
-# 3. Single-Socket NUMA Emulation Configs (managed in manage_kernels.sh; will remove in real 2-socket NUMA in the future)
+# 4. Single-Socket NUMA Emulation Configs (managed in manage_kernels.sh; will remove in real 2-socket NUMA in the future)
 if type configure_single_socket_numa >/dev/null 2>&1; then
     configure_single_socket_numa "$KERNEL_DIR"
 fi

@@ -1,0 +1,647 @@
+--- a/mm/migrate.c
++++ b/mm/migrate.c
+@@ -732,6 +732,8 @@
+ }
+ EXPORT_SYMBOL(folio_migrate_mapping);
+ 
++static int folio_migrate_copy(struct folio *newfolio, struct folio *folio);
++
+ /*
+  * The expected number of remaining references is the same as that
+  * of folio_migrate_mapping().
+@@ -745,7 +747,7 @@
+ 	if (folio_ref_count(src) != expected_count)
+ 		return -EAGAIN;
+ 
+-	rc = folio_mc_copy(dst, src);
++	rc = folio_migrate_copy(dst, src);
+ 	if (unlikely(rc))
+ 		return rc;
+ 
+@@ -863,6 +865,564 @@
+ }
+ EXPORT_SYMBOL(folio_migrate_flags);
+ 
++/*
++ * Pipelined Cacheline Prefetching (Method 1: Cacheline-lookahead)
++ * Uses separate lookahead distances for promotion and demotion.
++ * Supports dynamic Little's Law adaptation:
++ *   adaptive=0: Static prefetch distance (promote_distance, demote_distance)
++ *   adaptive=1: Dynamic Little's Law adaptation:
++ *               Distance = TOR_OCCUPANCY / sum_cycles (MLP),
++ *               dynamically updated via promote_distance and demote_distance
++ *
++ * Promotion (remote slow tier -> local fast tier):
++ *   Uses promote_distance (def: 5)
++ * Demotion (local fast tier -> remote slow tier):
++ *   Uses demote_distance (def: 2)
++ *
++ * Configurable via sysfs (/sys/kernel/mm/page_prefetch/):
++ *   enabled:                  master toggle (0 or 1, default: 1)
++ *   naive:                    prefetch engine (0=deep-tune two-wave, 1=naive lookahead, default: 0)
++ *   adaptive:                 adaptation mode (0=static, 1=adaptive Little's Law, default: 1)
++ *   promote_distance:         lookahead distance for promotion (default: 5)
++ *   demote_distance:          lookahead distance for demotion (default: 2)
++ *   min_distance:             minimum clamp distance (default: 1)
++ *   max_distance:             maximum clamp distance (default: 16)
++ *   hint:                     cache hint (0=NTA, 1=L3, 2=L2, 3=L1, default: 0)
++ */
++#define PREFETCH_DEFAULT_PROMOTE_DISTANCE      5
++#define PREFETCH_DEFAULT_DEMOTE_DISTANCE       2
++#define PREFETCH_DEFAULT_MIN_DISTANCE          1
++#define PREFETCH_DEFAULT_MAX_DISTANCE          16
++#define PREFETCH_DEFAULT_HINT                  0
++
++static DEFINE_STATIC_KEY_TRUE(prefetch_enabled_key);
++static DEFINE_STATIC_KEY_FALSE(prefetch_naive_key);
++static DEFINE_STATIC_KEY_TRUE(prefetch_hint_nta);
++static DEFINE_STATIC_KEY_FALSE(prefetch_hint_l3);
++static DEFINE_STATIC_KEY_FALSE(prefetch_hint_l2);
++#ifdef CONFIG_SYSFS
++static unsigned int prefetch_enabled = 1;
++static unsigned int prefetch_naive = 0;
++static unsigned int prefetch_adaptive = 1;
++static unsigned int prefetch_min_distance = PREFETCH_DEFAULT_MIN_DISTANCE;
++static unsigned int prefetch_max_distance = PREFETCH_DEFAULT_MAX_DISTANCE;
++static unsigned int prefetch_hint = PREFETCH_DEFAULT_HINT;
++static DEFINE_MUTEX(prefetch_cfg_lock);
++#endif
++
++union pact_distances {
++	struct {
++		u16 promote;
++		u16 demote;
++	};
++	u32 val;
++};
++
++static union pact_distances prefetch_distances ____cacheline_aligned = {
++	.promote = PREFETCH_DEFAULT_PROMOTE_DISTANCE,
++	.demote  = PREFETCH_DEFAULT_DEMOTE_DISTANCE,
++};
++
++void page_prefetch_set_tier_distances(int promote_dist, int demote_dist)
++{
++	union pact_distances cur, next;
++	u32 old;
++
++	cur.val = READ_ONCE(prefetch_distances.val);
++	do {
++		next.promote = (promote_dist >= 0 && promote_dist <= 64) ?
++			       (u16)promote_dist : cur.promote;
++		next.demote  = (demote_dist >= 0 && demote_dist <= 64) ?
++			       (u16)demote_dist : cur.demote;
++		if (cur.val == next.val)
++			break;
++		old = cmpxchg(&prefetch_distances.val, cur.val, next.val);
++		if (old == cur.val)
++			break;
++		cur.val = old;
++	} while (1);
++}
++EXPORT_SYMBOL(page_prefetch_set_tier_distances);
++
++static inline bool is_tiered_promotion(int source_id)
++{
++	if (source_id < 0)
++		return false;
++	if (!node_is_toptier(source_id))
++		return true;
++	if (num_node_state(N_MEMORY) == num_node_state(N_CPU) && source_id > 0)
++		return true;
++	return false;
++}
++
++static inline bool is_tiered_promotion_dir(int src_id, int dst_id)
++{
++	if (src_id < 0 || dst_id < 0 || src_id == dst_id)
++		return false;
++	if (!node_is_toptier(src_id) && node_is_toptier(dst_id))
++		return true;
++	if (node_is_toptier(src_id) && !node_is_toptier(dst_id))
++		return false;
++	return src_id > dst_id;
++}
++
++static inline unsigned int get_migration_prefetch_distance(int source_id)
++{
++	union pact_distances d = { .val = READ_ONCE(prefetch_distances.val) };
++
++	return is_tiered_promotion(source_id) ? d.promote : d.demote;
++}
++
++static inline unsigned int get_migration_prefetch_distance_dir(int src_id,
++							       int dst_id)
++{
++	union pact_distances d = { .val = READ_ONCE(prefetch_distances.val) };
++
++	return is_tiered_promotion_dir(src_id, dst_id) ? d.promote : d.demote;
++}
++
++#define PREFETCH_WAVE1_LOOP(addr, dist, locality) do {			\
++	unsigned int __i;						\
++	for (__i = 0; __i < (dist); __i++) {				\
++		unsigned int __line = (__i < 4) ? __i : (4 + (__i - 4) * 2); \
++		if (__line >= (PAGE_SIZE / SMP_CACHE_BYTES))		\
++			break;						\
++		__builtin_prefetch((addr) + (__line * SMP_CACHE_BYTES),	\
++				   0, (locality));			\
++	}								\
++} while (0)
++
++#define PREFETCH_WAVE2_LOOP(src_addr, start_line, dist, locality) do {	\
++	unsigned int __i;						\
++	for (__i = 0; __i < (dist); __i++) {				\
++		unsigned int __line = (start_line) + __i * 2;		\
++		if (__line >= (PAGE_SIZE / SMP_CACHE_BYTES))		\
++			break;						\
++		__builtin_prefetch((src_addr) + (__line * SMP_CACHE_BYTES), \
++				   0, (locality));			\
++	}								\
++} while (0)
++
++#define PREFETCH_CONT_LOOP(addr, dist, locality) do {			\
++	unsigned int __i;						\
++	for (__i = 0; __i < (dist); __i++) {				\
++		if (__i >= (PAGE_SIZE / SMP_CACHE_BYTES))		\
++			break;						\
++		__builtin_prefetch((addr) + (__i * SMP_CACHE_BYTES),	\
++				   0, (locality));			\
++	}								\
++} while (0)
++
++#define PREFETCH_DISPATCH_HINT(loop_macro, ...) do {			\
++	if (static_branch_likely(&prefetch_hint_nta))			\
++		loop_macro(__VA_ARGS__, 0);				\
++	else if (static_branch_unlikely(&prefetch_hint_l2))		\
++		loop_macro(__VA_ARGS__, 2);				\
++	else if (static_branch_unlikely(&prefetch_hint_l3))		\
++		loop_macro(__VA_ARGS__, 1);				\
++	else								\
++		loop_macro(__VA_ARGS__, 3);				\
++} while (0)
++
++/*
++ * Wave 1 (Lead-time prefetch):
++ * Uses 2-cacheline spatial stride (i * 2) when d >= 4 so the CPU's L2
++ * Spatial / Adjacent-Cache-Line prefetcher pulls the odd companion lines.
++ * Hint selection uses static_branch jump labels (zero hot-path loads/branches).
++ */
++static inline void prefetch_page_wave1(struct page *page, unsigned int dist)
++{
++	const char *addr;
++
++	if (!dist || PageHighMem(page))
++		return;
++
++	addr = page_address(page);
++	PREFETCH_DISPATCH_HINT(PREFETCH_WAVE1_LOOP, addr, dist);
++}
++
++/*
++ * Wave 2 (Mid-page pipeline prefetch):
++ */
++static inline void prefetch_page_wave2(const char *src_addr, unsigned int dist)
++{
++	unsigned int start_line;
++
++	if (!dist)
++		return;
++
++	start_line = (dist <= 4) ? dist : (4 + (dist - 4) * 2);
++	PREFETCH_DISPATCH_HINT(PREFETCH_WAVE2_LOOP, src_addr, start_line, dist);
++}
++
++static inline void prefetch_page_continuous(struct page *page, unsigned int dist)
++{
++	const char *addr;
++
++	if (!dist || PageHighMem(page))
++		return;
++
++	addr = page_address(page);
++	PREFETCH_DISPATCH_HINT(PREFETCH_CONT_LOOP, addr, dist);
++}
++
++static inline void prefetch_folio_head(struct folio *folio)
++{
++	unsigned int dist;
++
++	if (!static_branch_likely(&prefetch_enabled_key))
++		return;
++	dist = get_migration_prefetch_distance(folio_nid(folio));
++	if (!dist)
++		return;
++	if (static_branch_unlikely(&prefetch_naive_key))
++		prefetch_page_continuous(folio_page(folio, 0), dist);
++	else
++		prefetch_page_wave1(folio_page(folio, 0), dist);
++}
++
++/*
++ * Naive Cacheline Prefetch:
++ * Continuous prefetching without Wave 2 mid-page prefetch.
++ */
++static void folio_copy_naive(struct folio *dst, struct folio *src,
++	unsigned int distance)
++{
++	long nr = folio_nr_pages(src);
++	long i;
++
++	if (nr == 1) {
++		char *dst_k = kmap_local_folio(dst, 0);
++		char *src_k = kmap_local_folio(src, 0);
++
++		copy_page(dst_k, src_k);
++
++		kunmap_local(src_k);
++		kunmap_local(dst_k);
++		return;
++	}
++
++	for (i = 0; i < nr; i++) {
++		struct page *src_p = folio_page(src, i);
++		struct page *dst_p = folio_page(dst, i);
++
++		char *dst_k = kmap_local_page(dst_p);
++		char *src_k = kmap_local_page(src_p);
++
++		if (i + 1 < nr)
++			prefetch_page_continuous(folio_page(src, i + 1), distance);
++
++		copy_page(dst_k, src_k);
++
++		kunmap_local(src_k);
++		kunmap_local(dst_k);
++
++		if ((i & 0x1F) == 0x1F && (i + 1 < nr))
++			cond_resched();
++	}
++}
++
++/*
++ * Two-Wave Pipelined ERMS Folio Copy:
++ */
++static void folio_copy_adaptive(struct folio *dst, struct folio *src,
++	unsigned int distance)
++{
++	long nr = folio_nr_pages(src);
++	long i;
++
++	if (nr == 1) {
++		char *dst_k = kmap_local_folio(dst, 0);
++		char *src_k = kmap_local_folio(src, 0);
++
++		prefetch_page_wave2(src_k, distance);
++		copy_page(dst_k, src_k);
++
++		kunmap_local(src_k);
++		kunmap_local(dst_k);
++		return;
++	}
++
++	for (i = 0; i < nr; i++) {
++		struct page *src_p = folio_page(src, i);
++		struct page *dst_p = folio_page(dst, i);
++
++		char *dst_k = kmap_local_page(dst_p);
++		char *src_k = kmap_local_page(src_p);
++
++		prefetch_page_wave2(src_k, distance);
++
++		if (i + 1 < nr)
++			prefetch_page_wave1(folio_page(src, i + 1), distance);
++
++		copy_page(dst_k, src_k);
++
++		kunmap_local(src_k);
++		kunmap_local(dst_k);
++
++		if ((i & 0x1F) == 0x1F && (i + 1 < nr))
++			cond_resched();
++	}
++}
++
++#ifdef CONFIG_SYSFS
++static ssize_t prefetch_enabled_show(struct kobject *kobj,
++	struct kobj_attribute *attr, char *buf)
++{
++	return sprintf(buf, "%u\n", prefetch_enabled);
++}
++
++static ssize_t prefetch_enabled_store(struct kobject *kobj,
++				      struct kobj_attribute *attr,
++				      const char *buf, size_t count)
++{
++	unsigned int val;
++	if (kstrtouint(buf, 10, &val))
++		return -EINVAL;
++	val = !!val;
++	mutex_lock(&prefetch_cfg_lock);
++	if (val != prefetch_enabled) {
++		if (val)
++			static_branch_enable(&prefetch_enabled_key);
++		else
++			static_branch_disable(&prefetch_enabled_key);
++		prefetch_enabled = val;
++	}
++	mutex_unlock(&prefetch_cfg_lock);
++	return count;
++}
++static struct kobj_attribute prefetch_enabled_attr =
++__ATTR(enabled, 0644, prefetch_enabled_show, prefetch_enabled_store);
++
++static ssize_t prefetch_adaptive_show(struct kobject *kobj,
++	struct kobj_attribute *attr, char *buf)
++{
++	return sprintf(buf, "%u\n", prefetch_adaptive);
++}
++
++static ssize_t prefetch_adaptive_store(struct kobject *kobj,
++	struct kobj_attribute *attr,
++	const char *buf, size_t count)
++{
++	unsigned int val;
++	if (kstrtouint(buf, 10, &val))
++		return -EINVAL;
++	prefetch_adaptive = !!val;
++	return count;
++}
++static struct kobj_attribute prefetch_adaptive_attr =
++__ATTR(adaptive, 0644, prefetch_adaptive_show, prefetch_adaptive_store);
++
++static ssize_t prefetch_promote_distance_show(struct kobject *kobj,
++	struct kobj_attribute *attr, char *buf)
++{
++	union pact_distances d = { .val = READ_ONCE(prefetch_distances.val) };
++	return sprintf(buf, "%u\n", d.promote);
++}
++
++static ssize_t prefetch_promote_distance_store(struct kobject *kobj,
++	struct kobj_attribute *attr,
++	const char *buf, size_t count)
++{
++	unsigned int val;
++	if (kstrtouint(buf, 10, &val))
++		return -EINVAL;
++	if (val > 64)
++		return -EINVAL;
++	page_prefetch_set_tier_distances((int)val, -1);
++	return count;
++}
++static struct kobj_attribute prefetch_promote_distance_attr =
++__ATTR(promote_distance, 0644, prefetch_promote_distance_show, prefetch_promote_distance_store);
++
++static ssize_t prefetch_demote_distance_show(struct kobject *kobj,
++	struct kobj_attribute *attr, char *buf)
++{
++	union pact_distances d = { .val = READ_ONCE(prefetch_distances.val) };
++	return sprintf(buf, "%u\n", d.demote);
++}
++
++static ssize_t prefetch_demote_distance_store(struct kobject *kobj,
++	struct kobj_attribute *attr,
++	const char *buf, size_t count)
++{
++	unsigned int val;
++	if (kstrtouint(buf, 10, &val))
++		return -EINVAL;
++	if (val > 64)
++		return -EINVAL;
++	page_prefetch_set_tier_distances(-1, (int)val);
++	return count;
++}
++static struct kobj_attribute prefetch_demote_distance_attr =
++__ATTR(demote_distance, 0644, prefetch_demote_distance_show, prefetch_demote_distance_store);
++
++static ssize_t prefetch_hint_show(struct kobject *kobj,
++	struct kobj_attribute *attr, char *buf)
++{
++	return sprintf(buf, "%u\n", prefetch_hint);
++}
++
++static ssize_t prefetch_hint_store(struct kobject *kobj,
++				   struct kobj_attribute *attr,
++				   const char *buf, size_t count)
++{
++	unsigned int val, old_val;
++	if (kstrtouint(buf, 10, &val))
++		return -EINVAL;
++	if (val > 3)
++		return -EINVAL;
++	mutex_lock(&prefetch_cfg_lock);
++	old_val = prefetch_hint;
++	if (val != old_val) {
++		/* Enable new key before disabling old key to avoid transient fallback */
++		if (val == 0)
++			static_branch_enable(&prefetch_hint_nta);
++		else if (val == 1)
++			static_branch_enable(&prefetch_hint_l3);
++		else if (val == 2)
++			static_branch_enable(&prefetch_hint_l2);
++
++		if (old_val == 0)
++			static_branch_disable(&prefetch_hint_nta);
++		else if (old_val == 1)
++			static_branch_disable(&prefetch_hint_l3);
++		else if (old_val == 2)
++			static_branch_disable(&prefetch_hint_l2);
++
++		prefetch_hint = val;
++	}
++	mutex_unlock(&prefetch_cfg_lock);
++	return count;
++}
++static struct kobj_attribute prefetch_hint_attr =
++__ATTR(hint, 0644, prefetch_hint_show, prefetch_hint_store);
++
++static ssize_t prefetch_min_distance_show(struct kobject *kobj,
++	struct kobj_attribute *attr, char *buf)
++{
++	return sprintf(buf, "%u\n", prefetch_min_distance);
++}
++
++static ssize_t prefetch_min_distance_store(struct kobject *kobj,
++	struct kobj_attribute *attr,
++	const char *buf, size_t count)
++{
++	unsigned int val;
++	if (kstrtouint(buf, 10, &val))
++		return -EINVAL;
++	if (val > 64)
++		return -EINVAL;
++	prefetch_min_distance = val;
++	return count;
++}
++static struct kobj_attribute prefetch_min_distance_attr =
++__ATTR(min_distance, 0644, prefetch_min_distance_show, prefetch_min_distance_store);
++
++static ssize_t prefetch_max_distance_show(struct kobject *kobj,
++	struct kobj_attribute *attr, char *buf)
++{
++	return sprintf(buf, "%u\n", prefetch_max_distance);
++}
++
++static ssize_t prefetch_max_distance_store(struct kobject *kobj,
++	struct kobj_attribute *attr,
++	const char *buf, size_t count)
++{
++	unsigned int val;
++	if (kstrtouint(buf, 10, &val))
++		return -EINVAL;
++	if (val > 64)
++		return -EINVAL;
++	prefetch_max_distance = val;
++	return count;
++}
++static struct kobj_attribute prefetch_max_distance_attr =
++__ATTR(max_distance, 0644, prefetch_max_distance_show, prefetch_max_distance_store);
++
++static ssize_t prefetch_naive_show(struct kobject *kobj,
++	struct kobj_attribute *attr, char *buf)
++{
++	return sprintf(buf, "%u\n", prefetch_naive);
++}
++
++static ssize_t prefetch_naive_store(struct kobject *kobj,
++				    struct kobj_attribute *attr,
++				    const char *buf, size_t count)
++{
++	unsigned int val;
++	if (kstrtouint(buf, 10, &val))
++		return -EINVAL;
++	val = !!val;
++	mutex_lock(&prefetch_cfg_lock);
++	if (val != prefetch_naive) {
++		if (val)
++			static_branch_enable(&prefetch_naive_key);
++		else
++			static_branch_disable(&prefetch_naive_key);
++		prefetch_naive = val;
++	}
++	mutex_unlock(&prefetch_cfg_lock);
++	return count;
++}
++static struct kobj_attribute prefetch_naive_attr =
++__ATTR(naive, 0644, prefetch_naive_show, prefetch_naive_store);
++
++static struct attribute *prefetch_attrs[] = {
++	&prefetch_enabled_attr.attr,
++	&prefetch_naive_attr.attr,
++	&prefetch_adaptive_attr.attr,
++	&prefetch_promote_distance_attr.attr,
++	&prefetch_demote_distance_attr.attr,
++	&prefetch_min_distance_attr.attr,
++	&prefetch_max_distance_attr.attr,
++	&prefetch_hint_attr.attr,
++	NULL,
++};
++
++static const struct attribute_group prefetch_attr_group = {
++	.attrs = prefetch_attrs,
++};
++
++static int __init prefetch_sysfs_init(void)
++{
++	struct kobject *kobj;
++	int err;
++
++	kobj = kobject_create_and_add("page_prefetch", mm_kobj);
++	if (!kobj)
++		return -ENOMEM;
++
++	err = sysfs_create_group(kobj, &prefetch_attr_group);
++	if (err) {
++		kobject_put(kobj);
++		return err;
++	}
++	if (sysfs_create_link_nowarn(mm_kobj, kobj, "pact_prefetch")) {
++		/* Non-fatal: legacy compatibility alias */
++	}
++	return 0;
++}
++subsys_initcall(prefetch_sysfs_init);
++#endif
++
++static int folio_migrate_copy(struct folio *newfolio, struct folio *folio)
++{
++	if (static_branch_likely(&prefetch_enabled_key)) {
++		unsigned int dist = get_migration_prefetch_distance_dir(
++			folio_nid(folio), folio_nid(newfolio));
++
++		if (dist > 0) {
++			if (static_branch_unlikely(&prefetch_naive_key))
++				folio_copy_naive(newfolio, folio, dist);
++			else
++				folio_copy_adaptive(newfolio, folio, dist);
++			return 0;
++		}
++	}
++	return folio_mc_copy(newfolio, folio);
++}
++
+ /************************************************************
+  *                    Migration functions
+  ***********************************************************/
+@@ -877,7 +1437,7 @@
+ 	if (folio_ref_count(src) != expected_count)
+ 		return -EAGAIN;
+ 
+-	rc = folio_mc_copy(dst, src);
++	rc = folio_migrate_copy(dst, src);
+ 	if (unlikely(rc))
+ 		return rc;
+ 
+@@ -1362,8 +1922,8 @@
+ /* Migrate the folio to the newly allocated folio in dst. */
+ static int migrate_folio_move(free_folio_t put_new_folio, unsigned long private,
+ 			      struct folio *src, struct folio *dst,
+-			      enum migrate_mode mode, enum migrate_reason reason,
+-			      struct list_head *ret)
++			      struct folio *next_src, enum migrate_mode mode,
++			      enum migrate_reason reason, struct list_head *ret)
+ {
+ 	int rc;
+ 	int old_folio_state = 0;
+@@ -1394,6 +1954,15 @@
+ 		goto out;
+ 
+ 	/*
++	 * Post-copy cross-folio prefetch:
++	 * copy on @src is now finished (LFBs are free). Prefetch @next_src
++	 * now so its memory read latency is hidden behind @src's PTE restoration,
++	 * LRU insertion, lock release, and @next_src's folio_migrate_mapping().
++	 */
++	if (next_src)
++		prefetch_folio_head(next_src);
++
++	/*
+ 	 * Requeue the destination folio on the deferred split queue if
+ 	 * the source was on the queue.  The source is unqueued in
+ 	 * __folio_migrate_mapping(), so we recorded the state from
+@@ -1740,15 +2309,22 @@
+ 
+ 	dst = list_first_entry(dst_folios, struct folio, lru);
+ 	dst2 = list_next_entry(dst, lru);
++	/* Prefetch initial folio in batch to prime pipeline */
++	if (!list_empty(src_folios))
++		prefetch_folio_head(list_first_entry(src_folios, struct folio, lru));
++
+ 	list_for_each_entry_safe(folio, folio2, src_folios, lru) {
++		/* Lookahead target for post-copy pipelined prefetch */
++		struct folio *next_folio =
++			(&folio2->lru != src_folios) ? folio2 : NULL;
+ 		is_thp = folio_test_large(folio) && folio_test_pmd_mappable(folio);
+ 		nr_pages = folio_nr_pages(folio);
+ 
+ 		cond_resched();
+ 
+-		rc = migrate_folio_move(put_new_folio, private,
+-				folio, dst, mode,
+-				reason, ret_folios);
++		rc = migrate_folio_move(put_new_folio, private, folio,
++					dst, next_folio, mode, reason,
++					ret_folios);
+ 		/*
+ 		 * The rules are:
+ 		 *	0: folio will be freed
