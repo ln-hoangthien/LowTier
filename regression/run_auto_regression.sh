@@ -519,6 +519,19 @@ execute_step() {
         LAST_REBOOT_MEMMAP=""
         REBOOT_ATTEMPTS=0
 
+        # Reboot once if >2 GiB of Node 0 memory is still occupied after prior runs (prevents intra-boot leaks)
+        if [ "${DRIFT_REBOOT_INDEX:-}" != "${idx}" ] && [ -f /sys/devices/system/node/node0/meminfo ]; then
+            local n0_total_kb=$(awk '$3 == "MemTotal:" {print $4}' /sys/devices/system/node/node0/meminfo 2>/dev/null || echo 0)
+            local n0_free_kb=$(awk '$3 == "MemFree:" {print $4}' /sys/devices/system/node/node0/meminfo 2>/dev/null || echo 0)
+            if [ "${n0_total_kb}" -gt 0 ] && [ $(( n0_total_kb - n0_free_kb )) -gt 2097152 ]; then
+                log "${YELLOW}[!] Node 0 memory drift detected ($(( (n0_total_kb - n0_free_kb) / 1024 )) MiB used > 2048 MiB). Rebooting for clean headroom...${NC}"
+                printf "CURRENT_INDEX=%s\nSTARTED_TIME=%s\nDRIFT_REBOOT_INDEX=%s\nLAST_EXEC_INDEX=%s\nEXEC_ATTEMPTS=%s\n" \
+                    "$idx" "${STARTED_TIME:-$(date +%s)}" "$idx" "${LAST_EXEC_INDEX:-}" "${EXEC_ATTEMPTS:-0}" > "$STATE_FILE"
+                sync && sleep 2 && reboot
+                return 0
+            fi
+        fi
+
         # Crash-loop skip guard: track mid-benchmark panics/reboots per step
         local max_exec_attempts="${MAX_EXEC_ATTEMPTS:-3}"
         local last_exec_idx="${LAST_EXEC_INDEX:-}"
@@ -589,15 +602,17 @@ execute_step() {
 
         log "${GREEN}Completed benchmark: ${CURRENT_BENCHMARK} (Ratio: ${CURRENT_RATIO}${dist_tag}).${NC}"
 
-        # Advance to next item and reset crash-loop counter
+        # Advance to next item and reset crash-loop & drift-reboot counters
         CURRENT_INDEX=$((idx + 1))
         LAST_EXEC_INDEX=""
         EXEC_ATTEMPTS=0
+        DRIFT_REBOOT_INDEX=""
         {
             echo "CURRENT_INDEX=${CURRENT_INDEX}"
             echo "STARTED_TIME=${STARTED_TIME:-$(date +%s)}"
             echo "LAST_EXEC_INDEX="
             echo "EXEC_ATTEMPTS=0"
+            echo "DRIFT_REBOOT_INDEX="
         } > "$STATE_FILE"
         sync
     done
@@ -616,6 +631,9 @@ execute_step() {
 start_regression() {
     load_targets
     local total="${#TARGET_ITEMS[@]}"
+
+    # Start fresh logs for a new regression run (resume preserves existing logs)
+    rm -f "$LOG_FILE" "$RERUN_LOG_FILE"
 
     echo -e "${CYAN}================================================================================${NC}"
     echo -e "${CYAN} Starting Automated Multi-Kernel & Multi-Ratio Regression Suite (${total} Steps) ${NC}"
@@ -690,11 +708,17 @@ show_status() {
 # Cancel running regression, bring CPUs online, and reset state
 # ------------------------------------------------------------------------------
 abort_regression() {
+    local clean_logs="${1:-0}"
     log "${YELLOW}Aborting automated regression and cleaning up...${NC}"
     ensure_cpus_online
     remove_service
     rm -f "$STATE_FILE"
-    log "${GREEN}Automated regression stopped.${NC}"
+    if [ "${clean_logs}" == "1" ]; then
+        rm -f "$LOG_FILE" "$RERUN_LOG_FILE"
+        echo -e "${GREEN}Automated regression reset (state and logs cleared).${NC}"
+    else
+        log "${GREEN}Automated regression stopped.${NC}"
+    fi
 }
 
 # ------------------------------------------------------------------------------
@@ -717,18 +741,21 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
         status|check)
             show_status
             ;;
-        stop|abort|cancel|reset)
-            abort_regression
+        stop|abort|cancel)
+            abort_regression 0
+            ;;
+        reset)
+            abort_regression 1
             ;;
         -h|--help|help)
             echo "Usage: sudo $0 [start | resume | status | stop | reset]"
             echo ""
             echo "Commands:"
-            echo "  start (default) : Start or resume automated regression over regression_list"
-            echo "  resume          : Resume regression from current state step"
+            echo "  start (default) : Start fresh automated regression (clears old logs & failed_reruns.sh)"
+            echo "  resume          : Resume regression from current state step (preserves logs)"
             echo "  status          : Display current progress and active target"
-            echo "  stop / abort    : Cancel running regression and remove autostart service"
-            echo "  reset           : Clear state, remove autostart service, and bring CPUs online"
+            echo "  stop / abort    : Cancel running regression and remove autostart service (keeps logs)"
+            echo "  reset           : Clear state, logs, failed_reruns.sh, remove service, and online CPUs"
             ;;
         *)
             echo "Usage: sudo $0 [start | resume | status | stop | reset]"

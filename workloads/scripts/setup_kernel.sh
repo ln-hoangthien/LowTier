@@ -76,24 +76,9 @@ get_prefetch_sysfs() {
 # Helper: Compute usable Node 0 byte quota for Memtis cgroup
 # ------------------------------------------------------------------------------
 compute_memtis_node0_quota() {
-    local node0_total_kb=$(awk '/MemTotal:/ {print $4}' /sys/devices/system/node/node0/meminfo 2>/dev/null || echo 0)
-    local node0_free_kb=$(awk '/MemFree:/ {print $4}' /sys/devices/system/node/node0/meminfo 2>/dev/null || echo 0)
-
-    # Always reserve at least 1.5 GB of actual free Node 0 memory for OS, page tables, and pginfo slabs
-    # so Memtis switches allocations to Node 1 (mempolicy.c) before Node 0 hits __GFP_THISNODE OOM or direct reclaim.
-    local reserve_kb=1572864
-    local quota_kb=0
-    if [ "${node0_free_kb}" -gt $(( reserve_kb + 524288 )) ]; then
-        quota_kb=$(( node0_free_kb - reserve_kb ))
-    else
-        quota_kb=$(( node0_free_kb * 65 / 100 ))
-    fi
-
-    if [ "${node0_total_kb}" -gt 6291456 ]; then
-        local total_cap_kb=$(( node0_total_kb - reserve_kb ))
-        [ "${total_cap_kb}" -lt "${quota_kb}" ] && quota_kb="${total_cap_kb}"
-    fi
-
+    local node0_total_kb=$(awk '$3 == "MemTotal:" {print $4}' /sys/devices/system/node/node0/meminfo 2>/dev/null || echo 0)
+    local reserve_kb=2306868  # 2.2 GiB (OS_HEADROOM=3 GiB minus ~0.8 GiB hardware/boot hole)
+    local quota_kb=$(( node0_total_kb - reserve_kb ))
     [ "${quota_kb}" -lt 131072 ] && quota_kb=131072
     echo $(( quota_kb * 1024 ))
 }
