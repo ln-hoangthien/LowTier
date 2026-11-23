@@ -72,6 +72,13 @@ get_prefetch_sysfs() {
     fi
 }
 
+get_hybridtier_hook() {
+    local base="${1:-${ROOT_DIR}/baselines/hybridtier}"
+    local name="hook.so"
+    [ "${THP_MODE:-madvise}" == "always" ] && name="hook_huge.so"
+    echo "${HYBRIDTIER_HOOK:-${base}/hook/${name}}"
+}
+
 # ------------------------------------------------------------------------------
 # Helper: Compute usable Node 0 byte quota for Memtis cgroup
 # ------------------------------------------------------------------------------
@@ -88,7 +95,6 @@ compute_memtis_node0_quota() {
 # ------------------------------------------------------------------------------
 reset_memtis_cgroup() {
     local memtis_cgroup="/sys/fs/cgroup/memtis_workload"
-    rm -f /tmp/memtis_node0_quota_bytes
     [ -d "${memtis_cgroup}" ] || return 0
 
     # Disable HTMM first to restore kswapd and stop kmigraterd cleanly before migrating PIDs out
@@ -143,19 +149,22 @@ ensure_module_loaded() {
         rmmod "${mod_id}" 2>/dev/null || true
     fi
 
-    local kdir="${base_dir}/linux"
-    [ ! -d "${kdir}" ] && kdir="/lib/modules/${KERNEL_VER}/build"
+    local mod_file="${target_dir}/${mod_name}.ko"
+    local mod_vermagic=""
+    [ -f "${mod_file}" ] && mod_vermagic="$(modinfo -F vermagic "${mod_file}" 2>/dev/null | awk '{print $1}' || true)"
 
-    log_echo "[*] Cleaning and compiling ${label} ${mod_name}.ko for ${KERNEL_VER}..."
-    if [ -d "${kdir}" ]; then
-        make -C "${kdir}" M="${target_dir}" clean >/dev/null 2>&1 || true
-        make -C "${kdir}" M="${target_dir}" modules CC=gcc-11 HOSTCC=gcc-11 >/dev/null 2>&1 || true
-    else
-        make -C "${target_dir}" clean >/dev/null 2>&1 || true
-        make -C "${target_dir}" CC=gcc-11 HOSTCC=gcc-11 >/dev/null 2>&1 || true
+    if [ "${mod_vermagic}" != "${KERNEL_VER}" ]; then
+        local kdir="/lib/modules/${KERNEL_VER}/build"
+        log_echo "[*] Cleaning and compiling ${label} ${mod_name}.ko for ${KERNEL_VER}..."
+        if [ -d "${kdir}" ]; then
+            make -C "${kdir}" M="${target_dir}" clean >/dev/null 2>&1 || true
+            make -C "${kdir}" M="${target_dir}" modules CC=gcc-11 HOSTCC=gcc-11 >/dev/null 2>&1 || true
+        else
+            make -C "${target_dir}" clean >/dev/null 2>&1 || true
+            make -C "${target_dir}" CC=gcc-11 HOSTCC=gcc-11 >/dev/null 2>&1 || true
+        fi
     fi
 
-    local mod_file="${target_dir}/${mod_name}.ko"
     if [ -f "${mod_file}" ]; then
         log_echo "[*] Loading ${label} ${mod_name} module (${mod_file})..."
         insmod "${mod_file}" 2>/dev/null || true
@@ -192,13 +201,14 @@ show_status() {
     log_echo "=========================================================================================="
     if [ -n "$prefetch_sysfs" ]; then
         local cur_en="$(read_sysfs "${prefetch_sysfs}/enabled")"
+        local cur_naive="$(read_sysfs "${prefetch_sysfs}/naive")"
         local cur_hint="$(read_sysfs "${prefetch_sysfs}/hint")"
         local cur_adap="$(read_sysfs "${prefetch_sysfs}/adaptive")"
         local cur_prom="$(read_sysfs "${prefetch_sysfs}/promote_distance")"
         local cur_dem="$(read_sysfs "${prefetch_sysfs}/demote_distance")"
         local cur_min="$(read_sysfs "${prefetch_sysfs}/min_distance")"
         local cur_max="$(read_sysfs "${prefetch_sysfs}/max_distance")"
-        log_echo "[*] Migration Prefetch (${prefetch_sysfs}): enabled=${cur_en}, adaptive=${cur_adap}, hint=${cur_hint}, promote=${cur_prom:-N/A}, demote=${cur_dem:-N/A}, min=${cur_min:-N/A}, max=${cur_max:-N/A}"
+        log_echo "[*] Migration Prefetch (${prefetch_sysfs}): enabled=${cur_en}, engine=$([ "${cur_naive}" == "1" ] && echo "naive" || echo "deep-tune"), adaptive=${cur_adap}, hint=${cur_hint}, promote=${cur_prom:-N/A}, demote=${cur_dem:-N/A}, min=${cur_min:-N/A}, max=${cur_max:-N/A}"
     else
         log_echo "[*] Migration Prefetch: Not present in this kernel"
     fi
@@ -238,7 +248,7 @@ configure_kernel() {
         local nomad_dir="${ROOT_DIR}/baselines/nomad"
         [[ "${KERNEL_VER,,}" =~ alto ]] && nomad_dir+="-alto"
         [ ! -d "${nomad_dir}" ] && nomad_dir=$(ls -d ${ROOT_DIR}/baselines/nomad* 2>/dev/null | head -n 1 || true)
-        ensure_module_loaded "async_promote" "${nomad_dir}" "nomad_module" "Nomad"
+        ensure_module_loaded "async_promote" "${nomad_dir}" "nomad_module" "Nomad" || true
 
         log_echo "[*] Activating Nomad Tiered NUMA Balancing (mode 2) and demotion..."
         sysctl -w kernel.numa_balancing=2 >/dev/null 2>&1 || true
@@ -269,7 +279,6 @@ configure_kernel() {
 
         # Apply memory.max_at_node0 immediately so Memtis manages Node 0 from T=0
         local node0_usable_bytes=$(compute_memtis_node0_quota)
-        echo "${node0_usable_bytes}" > /tmp/memtis_node0_quota_bytes
         if [ -f "${memtis_cgroup}/memory.max_at_node0" ]; then
             echo "${node0_usable_bytes}" > "${memtis_cgroup}/memory.max_at_node0" 2>/dev/null || true
             log_echo "[*] Memtis Node 0 Memory Quota set to: $(cat "${memtis_cgroup}/memory.max_at_node0" 2>/dev/null || echo "${node0_usable_bytes}") bytes"
@@ -287,8 +296,8 @@ configure_kernel() {
         [[ "${KERNEL_VER,,}" =~ alto ]] && colloid_dir+="-alto"
         [ ! -d "${colloid_dir}" ] && colloid_dir=$(ls -d ${ROOT_DIR}/baselines/colloid* 2>/dev/null | head -n 1 || true)
 
-        ensure_module_loaded "tierinit" "${colloid_dir}" "tierinit" "Colloid"
-        ensure_module_loaded "colloid-mon" "${colloid_dir}" "colloid-mon" "Colloid"
+        ensure_module_loaded "tierinit" "${colloid_dir}" "tierinit" "Colloid" || true
+        ensure_module_loaded "colloid-mon" "${colloid_dir}" "colloid-mon" "Colloid" || true
 
         log_echo "[*] Activating Colloid Tiered NUMA Balancing (mode 6: TIERING | COLLOID) and demotion..."
         sysctl -w kernel.numa_balancing=6 >/dev/null 2>&1 || true
@@ -299,15 +308,18 @@ configure_kernel() {
     # ------------------
     elif [[ "${KERNEL_VER,,}" =~ pact ]]; then
         local pact_dir="${ROOT_DIR}/baselines/pact"
-        if [[ "${KERNEL_VER,,}" =~ prefetch.*batch ]]; then
-            pact_dir+="-prefetch-batch"
-        elif [[ "${KERNEL_VER,,}" =~ prefetch ]]; then
-            pact_dir+="-prefetch"
-        fi
         [ ! -d "${pact_dir}" ] && pact_dir=$(ls -d ${ROOT_DIR}/baselines/pact* 2>/dev/null | head -n 1 || true)
 
-        ensure_module_loaded "tierinit" "${pact_dir}" "tierinit" "PACT"
-        ensure_module_loaded "kswapdrst" "${pact_dir}" "kswapdrst" "PACT"
+        ensure_module_loaded "tierinit" "${pact_dir}" "tierinit" "PACT" || true
+        ensure_module_loaded "kswapdrst" "${pact_dir}" "kswapdrst" "PACT" || true
+
+        if [ ! -x "${pact_dir}/src/pact" ] && [ -d "${pact_dir}/src" ]; then
+            log_echo "[*] Building PACT daemon (${pact_dir}/src/pact)..."
+            make -C "${pact_dir}/src" >/dev/null 2>&1 || true
+        fi
+        if [ ! -x "${pact_dir}/src/pact" ]; then
+            log_echo "\033[1;31m[ERROR] PACT daemon binary not found or failed to build: ${pact_dir}/src/pact\033[0m"
+        fi
 
         # Match original PACT methodology (run-pact.sh): start with demotion_enabled=0 and
         # zone_reclaim_mode=0 so heavy initial allocations overflow smoothly to Node 1 without
@@ -324,13 +336,18 @@ configure_kernel() {
         local hybridtier_dir="${ROOT_DIR}/baselines/hybridtier"
         [ ! -d "${hybridtier_dir}" ] && hybridtier_dir=$(ls -d ${ROOT_DIR}/baselines/hybridtier* 2>/dev/null | head -n 1 || true)
 
+        local hook_so="$(get_hybridtier_hook "${hybridtier_dir}")"
+        local hook_target="$(basename "${hook_so}")"
+        local fast_mem_gb=$(awk '$3 == "MemTotal:" {g=int(($4 + 524288) / 1048576); if (g < 1) g=1; print g}' /sys/devices/system/node/node0/meminfo 2>/dev/null || echo 16)
+
         if [ -d "${hybridtier_dir}/hook" ]; then
-            make -B -C "${hybridtier_dir}/hook" TARGET_EXE_NAME="${TARGET_EXE_NAME}" >/dev/null 2>&1 || true
+            make -B -C "${hybridtier_dir}/hook" "${hook_target}" TARGET_EXE_NAME="${TARGET_EXE_NAME}" FAST_MEMORY_SIZE_GB="${fast_mem_gb}" >/dev/null 2>&1 || true
         fi
 
-        local hook_so="${hybridtier_dir}/hook/hook.so"
         if [ -f "${hook_so}" ]; then
-            log_echo "[+] HybridTier hook library detected: ${hook_so}"
+            log_echo "[+] HybridTier hook library built: ${hook_so} (target=${TARGET_EXE_NAME}, fast_mem=${fast_mem_gb} GB)"
+        else
+            log_echo "\033[1;31m[ERROR] HybridTier hook library missing: ${hook_so}\033[0m"
         fi
 
         log_echo "[*] Activating HybridTier kernel environment..."
@@ -370,19 +387,17 @@ configure_kernel() {
     local prefetch_sysfs="$(get_prefetch_sysfs)"
 
     if [ -n "$prefetch_sysfs" ]; then
-        write_sysfs_verified "${prefetch_sysfs}/enabled" "${PREFETCH_ENABLED}" "enabled"
+        write_sysfs_verified "${prefetch_sysfs}/enabled" "${PREFETCH_ENABLED}" "enabled" || true
         [ -f "${prefetch_sysfs}/naive" ] && write_sysfs_verified "${prefetch_sysfs}/naive" "${PREFETCH_NAIVE}" "naive" || true
-        write_sysfs_verified "${prefetch_sysfs}/adaptive" "${PREFETCH_ADAPTIVE}" "adaptive"
-        write_sysfs_verified "${prefetch_sysfs}/hint" "${PREFETCH_HINT}" "hint"
+        write_sysfs_verified "${prefetch_sysfs}/adaptive" "${PREFETCH_ADAPTIVE}" "adaptive" || true
+        write_sysfs_verified "${prefetch_sysfs}/hint" "${PREFETCH_HINT}" "hint" || true
 
         write_sysfs_verified "${prefetch_sysfs}/min_distance" "${PREFETCH_MIN_DISTANCE}" "min_distance" || true
         write_sysfs_verified "${prefetch_sysfs}/max_distance" "${PREFETCH_MAX_DISTANCE}" "max_distance" || true
 
-        if [ -f "${prefetch_sysfs}/promote_distance" ]; then
-            if [ "${PREFETCH_ENABLED}" != "0" ]; then
-                write_sysfs_verified "${prefetch_sysfs}/promote_distance" "${PREFETCH_PROMOTE_DISTANCE}" "promote_distance"
-                write_sysfs_verified "${prefetch_sysfs}/demote_distance"  "${PREFETCH_DEMOTE_DISTANCE}"  "demote_distance"
-            fi
+        if [ -f "${prefetch_sysfs}/promote_distance" ] && [ "${PREFETCH_ENABLED}" != "0" ]; then
+            write_sysfs_verified "${prefetch_sysfs}/promote_distance" "${PREFETCH_PROMOTE_DISTANCE}" "promote_distance" || true
+            write_sysfs_verified "${prefetch_sysfs}/demote_distance"  "${PREFETCH_DEMOTE_DISTANCE}"  "demote_distance" || true
         fi
 
         local cur_en cur_naive cur_hint cur_adap cur_prom cur_dem cur_min cur_max
@@ -423,7 +438,7 @@ configure_kernel() {
     echo "${defrag_target}" > /sys/kernel/mm/transparent_hugepage/defrag 2>/dev/null || true
     local cur_thp="$(read_sysfs /sys/kernel/mm/transparent_hugepage/enabled)"
     local cur_defrag="$(read_sysfs /sys/kernel/mm/transparent_hugepage/defrag)"
-    
+
     log_echo "[*] Transparent Huge Pages (THP): enabled=${cur_thp:-N/A} (target=${thp_target}), defrag=${cur_defrag:-N/A} (target=${defrag_target})"
 
     log_tiering_status
@@ -444,25 +459,39 @@ autotie_start() {
     local pact_bin="${ROOT_DIR}/baselines/pact/src/pact"
     [ ! -x "${pact_bin}" ] && pact_bin=$(ls -d "${ROOT_DIR}"/baselines/pact*/src/pact 2>/dev/null | head -n 1 || true)
 
-    local need_pact=0
-    [[ "${KERNEL_VER,,}" =~ pact ]] && [ -x "${pact_bin}" ] && need_pact=1
+    local is_pact=0 need_pact=0
+    if [[ "${KERNEL_VER,,}" =~ pact ]]; then
+        is_pact=1
+        if [ -x "${pact_bin}" ]; then
+            need_pact=1
+        else
+            log_echo "\033[1;31m[ERROR] PACT kernel running but binary is missing: ${pact_bin:-baselines/pact/src/pact}\033[0m"
+        fi
+    fi
 
     local is_prefetch=0
     [[ "${KERNEL_VER,,}" =~ prefetch ]] && is_prefetch=1
 
-    local need_hybrid=0
-    [[ "${KERNEL_VER,,}" =~ hybridtier ]] && need_hybrid=1
+    local has_embedded_mon=0
+    if [ ${need_pact} -eq 1 ] && strings "${pact_bin}" 2>/dev/null | grep -q "prefetch_coro"; then
+        has_embedded_mon=1
+    elif [[ "${KERNEL_VER,,}" =~ hybridtier ]]; then
+        local hybrid_hook="$(get_hybridtier_hook)"
+        if [ -f "${hybrid_hook}" ] && strings "${hybrid_hook}" 2>/dev/null | grep -q "hybridtier_prefetch"; then
+            has_embedded_mon=1
+        fi
+    fi
 
-    # Start adaptive prefetch monitor immediately (no ingestion delay)
-    # PACT and HybridTier embed tier-mon-prefetch in their own monitor threads.
-    if [ ${is_prefetch} -eq 1 ] && [ ${need_pact} -eq 0 ] && [ ${need_hybrid} -eq 0 ]; then
+    # Start adaptive prefetch monitor immediately unless the active daemon already embeds mig_telemetry
+    if [ ${is_prefetch} -eq 1 ] && [ ${has_embedded_mon} -eq 0 ] && { [ ${is_pact} -eq 0 ] || [ ${need_pact} -eq 1 ]; }; then
         local mon_bin="${ROOT_DIR}/baselines/tier-prefetch-mon/tier-prefetch-mon"
         local prefetch_mon_log="${TARGET_DIR:-/tmp}/prefetch_mon_${FILENAME_SUFFIX:-run}.log"
-        if [ "${PREFETCH_ADAPTIVE:-1}" == "1" ] && [ -x "${mon_bin}" ]; then
+        if [ "${PREFETCH_ENABLED:-1}" != "0" ] && [ "${PREFETCH_ADAPTIVE:-1}" == "1" ] && [ -x "${mon_bin}" ]; then
             local mon_cpu_mask="${CPU_MASK:-0xffffff}"
             local mon_interval_ms="${PREFETCH_MON_INTERVAL_MS:-50}"
             log_echo "[+] Starting tier-prefetch-mon daemon immediately for ${KERNEL_VER} (cpu_mask=${mon_cpu_mask}, interval=${mon_interval_ms}ms, cpu=31)..."
             taskset -c 31 "${mon_bin}" --daemon --interval-ms "${mon_interval_ms}" --cpu-mask "${mon_cpu_mask}" > "${prefetch_mon_log}" 2>&1 &
+            echo $! > /tmp/tier_prefetch_mon.pid
         fi
     fi
 
@@ -575,7 +604,7 @@ autotie_stop() {
 autotie_wrap() {
     shift
     if [[ "${KERNEL_VER,,}" =~ hybridtier ]]; then
-        local hybrid_hook="${HYBRIDTIER_HOOK:-${ROOT_DIR}/baselines/hybridtier/hook/hook.so}"
+        local hybrid_hook="$(get_hybridtier_hook)"
         if [ -f "${hybrid_hook}" ]; then
             echo "env LD_PRELOAD=\"${hybrid_hook}\${LD_PRELOAD:+:\$LD_PRELOAD}\" TARGET_EXE_NAME=\"${TARGET_EXE_NAME}\" $*"
             return 0
@@ -592,8 +621,11 @@ cleanup_kernel() {
 
     echo "madvise" > /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null || true
     echo "madvise" > /sys/kernel/mm/transparent_hugepage/defrag 2>/dev/null || true
-    sync
-    echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+    if [ "${KEEP_PRELOAD_CACHE:-0}" != "1" ]; then
+        rm -f /run/lowtier_preloaded_graph
+        sync
+        echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+    fi
 
     killall tier-prefetch-mon 2>/dev/null || true
     rmmod colloid-mon 2>/dev/null || true
@@ -629,7 +661,9 @@ if [ "$EUID" -ne 0 ] && [ "${1:-}" != "--wrap-cmd" ] && [ "${1:-}" != "--status"
         PREFETCH_DEMOTE_DISTANCE="${PREFETCH_DEMOTE_DISTANCE}" \
         PREFETCH_MIN_DISTANCE="${PREFETCH_MIN_DISTANCE}" \
         PREFETCH_MAX_DISTANCE="${PREFETCH_MAX_DISTANCE}" \
-        TARGET_EXE_NAME="${TARGET_EXE_NAME}" "$0" "$@"
+        TARGET_EXE_NAME="${TARGET_EXE_NAME}" \
+        KEEP_PRELOAD_CACHE="${KEEP_PRELOAD_CACHE:-0}" \
+        REGRESS_LOG_FILE="${REGRESS_LOG_FILE:-}" "$0" "$@"
 fi
 
 # ------------------------------------------------------------------------------

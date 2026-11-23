@@ -264,6 +264,8 @@ clean_memory_caches() {
 }
 
 # Clean up processes, daemons, restore machine configuration, and set user ownership
+PRELOAD_CMD=""
+STATUS=1
 cleanup() {
     trap - INT TERM EXIT
     killall -9 pact bpftrace perf redis-server dbtest XSBench pr bc bfs cc sssp tc specperl runcpu specmake 2>/dev/null || true
@@ -275,7 +277,9 @@ cleanup() {
     "${SCRIPT_DIR}/setup_kernel.sh" --autotie-stop 2>/dev/null || true
 
     # Clean up kernel tiering state and unload baseline modules
-    "${SCRIPT_DIR}/setup_kernel.sh" --cleanup 2>/dev/null || true
+    local keep_cache=0
+    [ "${STATUS:-1}" -eq 0 ] && [ -n "${PRELOAD_CMD:-}" ] && keep_cache=1
+    KEEP_PRELOAD_CACHE="${keep_cache}" "${SCRIPT_DIR}/setup_kernel.sh" --cleanup 2>/dev/null || true
 
     # Restore machine hardware configuration (hyperthreads, turbo, governor)
     "${SCRIPT_DIR}/setup_machine.sh" --restore 2>/dev/null || true
@@ -296,23 +300,39 @@ REGRESS_LOG_FILE="${REGRESS_LOG_FILE:-}" "${SCRIPT_DIR}/setup_machine.sh"
 # ------------------------------------------------------------------------------------------
 # Step 2: Cache Cleaning & Dataset Preload (before enabling THP=always / Memtis cgroup)
 # ------------------------------------------------------------------------------------------
-
-# Step 1: Clean all caches & wipe stale state BEFORE preloading dataset
-clean_memory_caches 3
-
-# Step 2: Preload dataset into target tier (Node 1 or Node 0)
+PRELOAD_MARKER="/run/lowtier_preloaded_graph"
 PRELOAD_CMD=$(RATIO_TAG="${RATIO_TAG}" "${SCRIPT_DIR}/exec_workload.sh" --get-preload-cmd "$TARGET" ${DATASET:+"$DATASET"})
+PRELOAD_FILE=""
+REUSE_PRELOAD=0
+
 if [ -n "${PRELOAD_CMD}" ]; then
-    log_echo "[+] Preloading dataset onto Slow Tier (Node 1): ${PRELOAD_CMD}"
-    eval "${PRELOAD_CMD}" 2>&1 | tee -a "${REGRESS_LOG_FILE:-/dev/null}"
-    sync
-    sleep 2
+    PRELOAD_FILE="${PRELOAD_CMD##* }"
+    n0_file_kb=$(awk '$3 == "FilePages:" {print $4}' /sys/devices/system/node/node0/meminfo 2>/dev/null || echo 0)
+    if [ -f "${PRELOAD_FILE}" ] && \
+       [ "$(cat "${PRELOAD_MARKER}" 2>/dev/null || true)" == "${PRELOAD_FILE}" ] && \
+       [ "${n0_file_kb:-0}" -lt 262144 ] && \
+       vmtouch -f -m 64G "${PRELOAD_FILE}" 2>/dev/null | grep -qE "Resident Pages:.*100%"; then
+        REUSE_PRELOAD=1
+    fi
 fi
 
-# Step 3: Compact Node 0 memory and evict background processes AFTER preloading WITHOUT calling
-# drop_caches=2 (which evicts unreferenced inodes on Linux 5.15 and wipes vmtouch pagecache).
-clean_memory_caches 0
-evict_background_to_node1
+if [ "${REUSE_PRELOAD}" -eq 1 ]; then
+    log_echo "[+] Reusing Node 1 preloaded dataset (100% resident, Node 0 FilePages=$(( ${n0_file_kb:-0} / 1024 )) MB): ${PRELOAD_FILE}"
+    clean_memory_caches 0
+else
+    rm -f "${PRELOAD_MARKER}"
+    clean_memory_caches 3
+    if [ -n "${PRELOAD_CMD}" ]; then
+        log_echo "[+] Preloading dataset onto Slow Tier (Node 1): ${PRELOAD_CMD}"
+        eval "${PRELOAD_CMD}" 2>&1 | tee -a "${REGRESS_LOG_FILE:-/dev/null}"
+        if [ "${PIPESTATUS[0]}" -eq 0 ]; then
+            echo "${PRELOAD_FILE}" > "${PRELOAD_MARKER}"
+        fi
+        sync
+        sleep 2
+        clean_memory_caches 0
+    fi
+fi
 
 # ------------------------------------------------------------------------------------------
 # Step 3: Kernel & Tiered Memory Setup (Baselines, Prefetch Sysfs, THP)
@@ -344,26 +364,28 @@ REGRESS_LOG_FILE="${REGRESS_LOG_FILE:-}" \
     echo "=========================================================================================="
 } | tee -a "${REGRESS_LOG_FILE:-/dev/null}"
 
-# Step 4: Clear kernel dmesg ring buffer and reset prefetch stats so the log only contains this run's data
+# Step 4: Clear kernel dmesg ring buffer so the log only contains this run's data
 dmesg -c >/dev/null 2>&1 || true
-[ -f "/sys/kernel/mm/page_prefetch/stats_reset" ] && echo 1 > /sys/kernel/mm/page_prefetch/stats_reset 2>/dev/null || true
 log_echo "------------------------------------------------------------------------------------------"
 
 # Step 5: Execute workload workflow:
 #   1. Start stats baseline: monitor_performance.sh --start
-#   2. Start kernel autotie watcher (PACT daemon attacher)
+#   2. Start kernel autotie watcher (PACT daemon / tier-prefetch-mon)
 #   3. Execute workload command under /usr/bin/time -v directly
-#   4. Stop kernel autotie daemons
-#   5. Calculate delta and print performance report: monitor_performance.sh --stop
+#   4. Calculate delta and print performance report: monitor_performance.sh --stop
+#   5. Clean caches, stop daemons, and restore system configuration
 
 # Wrap workload command if baseline requires in-process hooking (e.g. HybridTier LD_PRELOAD)
-WORKLOAD_EXEC_CMD=$("${SCRIPT_DIR}/setup_kernel.sh" --wrap-cmd ${WORKLOAD_CMD})
+WORKLOAD_EXEC_CMD=$(THP_MODE="${THP_MODE}" TARGET_EXE_NAME="${TARGET_EXE_NAME}" "${SCRIPT_DIR}/setup_kernel.sh" --wrap-cmd ${WORKLOAD_CMD})
 log_echo "[run_workloads] Running workload: ${WORKLOAD_EXEC_CMD}"
 
 # 1. Start baseline telemetry capture
 "${SCRIPT_DIR}/monitor_performance.sh" --start
 
-# 2. Start asynchronous baseline autotie watcher (e.g. PACT daemon attacher)
+# 2. Start asynchronous baseline autotie watcher (PACT daemon / tier-prefetch-mon)
+THP_MODE="${THP_MODE}" \
+PREFETCH_ENABLED="${PREFETCH_ENABLED}" \
+PREFETCH_ADAPTIVE="${PREFETCH_ADAPTIVE}" \
 TARGET_EXE_NAME="${TARGET_EXE_NAME}" \
 TARGET_DIR="${TARGET_DIR}" \
 FILENAME_SUFFIX="${FILENAME_SUFFIX}" \
@@ -394,30 +416,16 @@ fi
 log_echo "------------------------------------------------------------------------------------------"
 log_echo "[+] Workload completed. Compiling final statistics..."
 
-# Append prefetch hardware stats to PACT and regression log files if available
-prefetch_stats_sysfs=""
-[ -f "/sys/kernel/mm/page_prefetch/stats" ] && prefetch_stats_sysfs="/sys/kernel/mm/page_prefetch/stats"
-[ -f "/sys/kernel/mm/pact_prefetch/stats" ] && prefetch_stats_sysfs="/sys/kernel/mm/pact_prefetch/stats"
-
-if [ -n "${prefetch_stats_sysfs}" ]; then
-    log_echo "[*] Capturing Migration Prefetch Statistics (${prefetch_stats_sysfs})..."
-    {
-        echo ""
-        echo "=========================================================================================="
-        echo "                 PACT PREFETCH HARDWARE STATS SUMMARY                                     "
-        echo "=========================================================================================="
-        cat "${prefetch_stats_sysfs}"
-        echo "=========================================================================================="
-    } | tee -a "${REGRESS_LOG_FILE}" >/dev/null 2>&1 || true
+# 5. Terminate any residual workload processes and clean caches
+# (preserve Node 1 graph pagecache on successful GAPBS runs so back-to-back configs reuse it)
+if [ "${STATUS}" -eq 0 ] && [ -n "${PRELOAD_CMD}" ]; then
+    clean_memory_caches 0
+else
+    rm -f "${PRELOAD_MARKER}"
+    clean_memory_caches 3
 fi
 
-# 5. Terminate any residual workload processes and drop file + slab caches
-clean_memory_caches 3
-
-# 6. Stop baseline autotie daemons once Node 0 memory is clean
-"${SCRIPT_DIR}/setup_kernel.sh" --autotie-stop
-
-# Step 7: Clean up and restore system configuration (CPUs, background daemons, ownership)
+# Step 6: Stop daemons, clean up kernel state, and restore machine configuration
 cleanup
 
 echo "=========================================================================================="

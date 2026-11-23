@@ -336,8 +336,9 @@ load_targets() {
     done
     [ ${#prefetch_configs[@]} -eq 0 ] && prefetch_configs+=("1|||0|0")
 
-    # Execution matrix: Kernel -> Benchmark -> Ratio -> THP -> PrefetchConfig
-    # Grouping THP and prefetch configs under the same (Kernel, Benchmark, Ratio) minimizes reboots
+    # Execution matrix: Kernel -> Ratio -> Benchmark -> THP -> PrefetchConfig
+    # Grouping benchmarks under the same (Kernel, Ratio) lets GAPBS workloads sharing the
+    # same memmap & graph (e.g. pr/bfs/bc/cc on kron.sg) stay on one boot and reuse vmtouch.
     TARGET_ITEMS=()
     for k in "${KERNELS[@]}"; do
         local configs=()
@@ -347,8 +348,8 @@ load_targets() {
             configs=("||||")
         fi
 
-        for b in "${BENCHMARKS[@]}"; do
-            for r in "${TIER_RATIOS[@]}"; do
+        for r in "${TIER_RATIOS[@]}"; do
+            for b in "${BENCHMARKS[@]}"; do
                 for thp in "${THP_MODES[@]}"; do
                     for cfg in "${configs[@]}"; do
                         IFS='|' read -r a d bound h naive <<< "$cfg"

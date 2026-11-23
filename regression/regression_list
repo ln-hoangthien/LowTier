@@ -5,9 +5,9 @@
 # Tier ratios (Fast:Slow relative to RSS)
 TIER_RATIOS=(
     1:8
-    1:4
-    #1:2
-    #1:1
+    # 1:4
+    1:2
+    # 1:1
     #2:1
     #4:1
     #8:1
@@ -22,6 +22,7 @@ TIER_RATIOS=(
 # When commented out: uses kernel default lookahead distance
 PREFETCH_DISTANCES=(
     # Paired Promotion:Demotion Testing
+    # p0_d0
     p5_d2
 )
 
@@ -30,7 +31,9 @@ PREFETCH_DISTANCES=(
 # Format: [Min:Max] or min<min>_max<max> or max value (default min=1)
 # Default if commented out: min=1, max=10
 PREFETCH_BOUNDS=(
-    min1_max12
+    # min0_max4
+    min0_max6
+    # min0_max8
 )
 
 # 3. Prefetch distance adaptation mode (Evaluated for *-prefetch kernels)
@@ -40,6 +43,28 @@ PREFETCH_BOUNDS=(
 PREFETCH_ADAPTIVE_MODES=(
     0    # Non-adaptive (Static)
     1    # Adaptive
+)
+
+# 4. Prefetch CPU Cache Hint (Evaluated for *-prefetch kernels)
+# 0 = NTA (Non-Temporal: L1/L2 bypass, minimize cache pollution)
+# 1 = L3 (Prefetch into Last Level Cache)
+# 2 = L2 (Prefetch into L2 Cache)
+# 3 = L1 (Prefetch into L1/L2/L3 Cache)
+# Uncomment / comment to select which hint(s) to evaluate:
+PREFETCH_HINTS=(
+    0
+    # 1
+    2
+    # 3
+)
+
+# 5. Prefetch Engine Mode (Evaluated for *-prefetch kernels)
+# 0 = Deep-tune migration prefetch (Two-wave pipelined copy + cross-folio lookahead)
+# 1 = Naive prefetch (Only prefetch 'distance' cachelines ahead)
+# Uncomment / comment to select which engine mode(s) to evaluate:
+PREFETCH_NAIVE_MODES=(
+    0    # Deep-tune
+    1    # Naive
 )
 
 # ==============================================================================
@@ -54,46 +79,59 @@ PREFETCH_ADAPTIVE_MODES=(
 THP_MODES=(
     always
     madvise
+    # never
 )
 
 # Benchmarks to evaluate
+# GAPBS benchmarks are grouped by graph file so algorithms sharing the same graph
+# and memmap (e.g., pr/bfs/bc/cc on kron.sg) reuse a single Node 1 vmtouch preload.
 BENCHMARKS=(
     ## -----------------------------
-    ## GAPBS
+    ## GAPBS — kron.sg (shared graph)
     ## -----------------------------
     gapbs_pr_kron
-    gapbs_pr_urand
-    gapbs_pr_twitter
-    ##gapbs_pr_web
-    ##gapbs_pr_road
-
-    ##gapbs_tc_kron
-    ##gapbs_tc_urand
-    ##gapbs_tc_twitter
-    ##gapbs_tc_web
-    ##gapbs_tc_road
-
     gapbs_bfs_kron
-    gapbs_bfs_urand
-    gapbs_bfs_twitter
-    ##gapbs_bfs_web
-    ##gapbs_bfs_road
-
     gapbs_bc_kron
-    gapbs_bc_urand
-    gapbs_bc_twitter
-    #gapbs_bc_web
-    #gapbs_bc_road
-
     gapbs_cc_kron
+
+    ## -----------------------------
+    ## GAPBS — urand.sg (shared graph)
+    ## -----------------------------
+    gapbs_pr_urand
+    gapbs_bfs_urand
     gapbs_cc_urand
+    gapbs_bc_urand
+
+    ## -----------------------------
+    ## GAPBS — twitter.sg (shared graph)
+    ## -----------------------------
+    gapbs_pr_twitter
+    gapbs_bfs_twitter
+    gapbs_bc_twitter
     gapbs_cc_twitter
-    #gapbs_cc_web
-    #gapbs_cc_road
+
+    ## -----------------------------
+    ## GAPBS — TC (*U.sg) & SSSP (*.wsg)
+    ## -----------------------------
+    gapbs_tc_kron
+    gapbs_tc_urand
+    gapbs_tc_twitter
 
     gapbs_sssp_kron
     gapbs_sssp_urand
     gapbs_sssp_twitter
+
+    ## GAPBS — web / road (disabled)
+    ##gapbs_pr_web
+    ##gapbs_pr_road
+    ##gapbs_tc_web
+    ##gapbs_tc_road
+    ##gapbs_bfs_web
+    ##gapbs_bfs_road
+    #gapbs_bc_web
+    #gapbs_bc_road
+    #gapbs_cc_web
+    #gapbs_cc_road
     #gapbs_sssp_web
     #gapbs_sssp_road
 
@@ -102,8 +140,8 @@ BENCHMARKS=(
     ## -----------------------------
     ## Silo
     ## -----------------------------
-    #silo_tpcc
-    #silo_ycsb
+    silo_tpcc
+    silo_ycsb
     ##silo_queue
     ##silo_bid
     ##silo_encstress
@@ -112,13 +150,13 @@ BENCHMARKS=(
     ## -----------------------------
     ## Redis
     ## -----------------------------
-    #redis
+    redis
     ## -----------------------------
 
     ## -----------------------------
     ## XSBench
     ## -----------------------------
-    #xsbench
+    xsbench
     ## -----------------------------
 
     # -----------------------------
@@ -158,7 +196,7 @@ BENCHMARKS=(
     #spec2026_811.tealeaf_s
     #spec2026_816.nab_s
     #spec2026_817.flac_s
-    spec2026_820.cloverleaf_s
+    # spec2026_820.cloverleaf_s
     #spec2026_821.gcc_s
     #spec2026_822.palm_s
     #spec2026_823.llvm_s
@@ -166,34 +204,37 @@ BENCHMARKS=(
     #spec2026_829.abc_s
     #spec2026_834.vpr_s
     #spec2026_835.gem5_s
-    #spec2026_838.diamond_s
+    # spec2026_838.diamond_s
     #spec2026_846.minizinc_s
-    #spec2026_849.fotonik3d_s
+    # spec2026_849.fotonik3d_s
     #spec2026_853.ns3_s
-    spec2026_854.graph500_s
+    # spec2026_854.graph500_s
     #spec2026_857.namd_s
-    spec2026_865.roms_s
+    # spec2026_865.roms_s
     #spec2026_867.nest_s
     #spec2026_872.marian_s
-    spec2026_881.neutron_s
+    # spec2026_881.neutron_s
     # -----------------------------
 )
 
 # Baseline kernels to evaluate
 KERNELS=(
-    # tpp
-    pact-prefetch
+    memtis
+    memtis-prefetch
     pact
-    # colloid-tpp-prefetch
-    # colloid-tpp-alto-prefetch
-    # colloid-tpp
-    # colloid-tpp-alto
-    # memtis-prefetch
-    # memtis
-    # nomad-prefetch
-    # nomad-alto-prefetch
-    # nomad
-    # nomad-alto
-    # hybridtier
-    # generic
+    pact-prefetch
+    autonuma
+    autonuma-prefetch
+    nomad
+    nomad-prefetch
+    nomad-alto
+    nomad-alto-prefetch
+    hybridtier
+    hybridtier-prefetch
+    colloid-tpp
+    colloid-tpp-prefetch
+    colloid-tpp-alto
+    colloid-tpp-alto-prefetch
+    tpp
+    tpp-prefetch
 )

@@ -2,26 +2,27 @@ diff --git a/baselines/hybridtier/hook/Makefile b/baselines/hybridtier/hook/Make
 index c9e6951..b128c38 100644
 --- a/baselines/hybridtier/hook/Makefile
 +++ b/baselines/hybridtier/hook/Makefile
-@@ -1,15 +1,17 @@
+@@ -1,16 +1,18 @@
  CXX = g++-11
 -CXXFLAGS ?= -O3 -Wall -fPIC -g
 +CXXFLAGS ?= -O3 -Wall -fPIC -g -I../../tier-prefetch-mon
  LDFLAGS ?= -shared -ldl -lpthread -lnuma
  TARGET_EXE_NAME ?= pr
+ FAST_MEMORY_SIZE_GB ?= 16
  
 +PREFETCH_SRCS = ../../tier-prefetch-mon/mig_cha_mon.c ../../tier-prefetch-mon/mig_telemetry.c
 +
  all: hook.so hook_huge.so
  
 -hook.so: hook.cpp
--	$(CXX) $(CXXFLAGS) hook.cpp -o hook.so $(LDFLAGS) -DHYBRIDTIER_REGULAR -DFAST_MEMORY_SIZE_GB=16 -DTARGET_EXE_NAME=\"$(TARGET_EXE_NAME)\"
+-	$(CXX) $(CXXFLAGS) hook.cpp -o hook.so $(LDFLAGS) -DHYBRIDTIER_REGULAR -DFAST_MEMORY_SIZE_GB=$(FAST_MEMORY_SIZE_GB) -DTARGET_EXE_NAME=\"$(TARGET_EXE_NAME)\"
 +hook.so: hook.cpp $(PREFETCH_SRCS)
-+	$(CXX) $(CXXFLAGS) -DPREFETCH_ENABLED hook.cpp $(PREFETCH_SRCS) -o hook.so $(LDFLAGS) -DHYBRIDTIER_REGULAR -DFAST_MEMORY_SIZE_GB=16 -DTARGET_EXE_NAME=\"$(TARGET_EXE_NAME)\"
++	$(CXX) $(CXXFLAGS) -DPREFETCH_ENABLED hook.cpp $(PREFETCH_SRCS) -o hook.so $(LDFLAGS) -DHYBRIDTIER_REGULAR -DFAST_MEMORY_SIZE_GB=$(FAST_MEMORY_SIZE_GB) -DTARGET_EXE_NAME=\"$(TARGET_EXE_NAME)\"
  
 -hook_huge.so: hook.cpp
--	$(CXX) $(CXXFLAGS) hook.cpp -o hook_huge.so $(LDFLAGS) -DHYBRIDTIER_HUGE -DFAST_MEMORY_SIZE_GB=16 -DTARGET_EXE_NAME=\"$(TARGET_EXE_NAME)\"
+-	$(CXX) $(CXXFLAGS) hook.cpp -o hook_huge.so $(LDFLAGS) -DHYBRIDTIER_HUGE -DFAST_MEMORY_SIZE_GB=$(FAST_MEMORY_SIZE_GB) -DTARGET_EXE_NAME=\"$(TARGET_EXE_NAME)\"
 +hook_huge.so: hook.cpp $(PREFETCH_SRCS)
-+	$(CXX) $(CXXFLAGS) -DPREFETCH_ENABLED hook.cpp $(PREFETCH_SRCS) -o hook_huge.so $(LDFLAGS) -DHYBRIDTIER_HUGE -DFAST_MEMORY_SIZE_GB=16 -DTARGET_EXE_NAME=\"$(TARGET_EXE_NAME)\"
++	$(CXX) $(CXXFLAGS) -DPREFETCH_ENABLED hook.cpp $(PREFETCH_SRCS) -o hook_huge.so $(LDFLAGS) -DHYBRIDTIER_HUGE -DFAST_MEMORY_SIZE_GB=$(FAST_MEMORY_SIZE_GB) -DTARGET_EXE_NAME=\"$(TARGET_EXE_NAME)\"
  
  clean:
  	rm -f hook.so hook_huge.so
