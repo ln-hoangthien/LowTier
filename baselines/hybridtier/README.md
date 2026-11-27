@@ -1,12 +1,28 @@
-# Artifact repository for HybridTier (ASPLOS 25)
+# HybridTier (ASPLOS '25 — Linux v6.2)
 
-HybridTier: An Adaptive and Lightweight CXL-Memory Tiering System
+HybridTier: An Adaptive and Lightweight CXL-Memory Tiering System (Kevin Song, Jiacheng Yang, Zixuan Wang, Jishen Zhao, Sihang Liu, Gennady Pekhimenko, ASPLOS '25).
 
-> Kevin Song, Jiacheng Yang, Zixuan Wang, Jishen Zhao, Sihang Liu, Gennady Pekhimenko
-> International Conference on Architectural Support for Programming Languages and Operating Systems (ASPLOS), 2025
+## Repository Integration (Baseline & Prefetch)
 
+- `compile.sh` — Checks out Linux `v6.2` in `./linux`, applies `hybridtier.patch` + `hybridtier-mig-stats.patch`, sets `CONFIG_LOCALVERSION="-hybridtier"`, and compiles the kernel and userspace runtime (`tiering_runtime/`).
+- `compile-prefetch.sh` — Applies `hybridtier.patch`, `hybridtier-prefetch.patch`, and `hybridtier-mig-stats.patch` (plus `hybridtier-daemon-prefetch.patch`), sets `CONFIG_LOCALVERSION="-Hybridtier-Prefetch"`, and compiles the prefetch-enabled kernel.
+- `hybridtier-mig-stats.patch` — Adds migration wait/copy latency vmstat counters (`MIG_WAIT_*`, `MIG_COPY_NS`).
+- `hybridtier-prefetch.patch`, `hybridtier-daemon-prefetch.patch` — Adds `/sys/kernel/mm/page_prefetch/` migration prefetching support.
 
-## Kernel setup
+```bash
+# Build via manage_kernels.sh (auto-clones v6.2 if missing)
+sudo ./baselines/scripts/manage_kernels.sh hybridtier build
+sudo ./baselines/scripts/manage_kernels.sh hybridtier-prefetch build
+
+# Switch GRUB default with target memmap
+sudo ./baselines/scripts/manage_kernels.sh hybridtier-prefetch update_grub --memmap "memmap=43G!5G" --reboot
+```
+
+Expected `uname -r`: `6.2.0-hybridtier+` or `6.2.0-Hybridtier-Prefetch`. Runtime setup and `tier-prefetch-mon` are managed automatically by `workloads/scripts/setup_kernel.sh`.
+
+---
+
+## Upstream Notes: Kernel Setup & Porting
 _This section assumes you have a two NUMA node system to emulate fast-tier and slow-tier CXL memory._
 If you have a different hardware platform, e.g. one with real CXL memory or persistent memory, please see [this section](#porting-hybridtier-to-other-hardware-platforms). 
 

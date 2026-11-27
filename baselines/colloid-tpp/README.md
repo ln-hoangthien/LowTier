@@ -1,38 +1,28 @@
-# Colloid (SOSP '24)
+# Colloid-TPP (SOSP '24 — Linux v6.3)
 
-Colloid tiering baseline. As noted in the parent
-[README](../README.md), "Colloid" in this work refers to **Colloid-tpp**
-(Colloid built on the TPP path), though the Colloid paper itself uses NBT
-(NUMA-Balancing-Tiering) in Linux v6.3.
+Colloid built on the TPP path (`colloid-skx.patch`) on Linux `v6.3`, evaluated in both baseline (`colloid-tpp`) and page-migration prefetching (`colloid-tpp-prefetch`) configurations.
 
 ## Contents
-- `colloid-skx.patch`, `colloid-skx-alto.patch` - kernel patches applied on
-  top of Linux `v6.3` (Skylake-X target).
-- `compile.sh` - checks out `v6.3` in a sibling `linux/` git tree, applies
-  both patches, builds, installs modules, runs `make install` and
-  `update-grub`.
-- `colloid-mon/` - Colloid monitoring daemon.
-- `tierinit/` - tier-initialization helper (CPU on/offline).
-- `kswapdrst/` - kswapd reset helper.
 
-## Build
-`compile.sh` expects a Linux git checkout in `./linux` (not bundled). Clone it
-first, then build (kernel install + `update-grub` need root):
+- `compile.sh` — Checks out `v6.3` in `./linux`, applies `colloid-skx.patch` + `colloid-tpp-mig-stats.patch`, merges `ubuntu_fixes.config`, sets `CONFIG_LOCALVERSION="-Colloid-TPP"`, and builds the kernel and helpers.
+- `compile-prefetch.sh` — Adds `colloid-tpp-prefetch.patch`, sets `CONFIG_LOCALVERSION="-Colloid-TPP-Prefetch"`, and builds the prefetch-enabled kernel.
+- `colloid-skx.patch` — Colloid kernel patch on Linux `v6.3`.
+- `colloid-tpp-mig-stats.patch` — Adds migration wait/copy latency vmstat counters (`MIG_WAIT_*`, `MIG_COPY_NS`).
+- `colloid-tpp-prefetch.patch` — Adds `/sys/kernel/mm/page_prefetch/` migration prefetching.
+- `colloid-mon/`, `tierinit/`, `kswapdrst/` — Colloid monitoring module and tiering helpers.
+
+## Build & Usage
 
 ```bash
-cd colloid-tpp
-git clone https://github.com/torvalds/linux.git linux   # v6.3 is a mainline tag
-sudo ./compile.sh
+# Recommended: build via manage_kernels.sh (auto-clones v6.3 if missing)
+sudo ./baselines/scripts/manage_kernels.sh colloid-tpp build
+sudo ./baselines/scripts/manage_kernels.sh colloid-tpp-prefetch build
+
+# Compile only (no /boot or GRUB modification)
+sudo ./baselines/scripts/manage_kernels.sh colloid-tpp-prefetch compile_only
+
+# Switch GRUB default with target memmap
+sudo ./baselines/scripts/manage_kernels.sh colloid-tpp-prefetch update_grub --memmap "memmap=43G!5G" --reboot
 ```
 
-The script runs: `git checkout v6.3` → `git apply colloid-skx.patch` →
-merge `ubuntu_fixes.config` → `make olddefconfig` → `make -j` →
-`make modules_install` → `make install` → `update-grub`.
-
-Build the helper tools (`colloid-mon/`, `tierinit/`, `kswapdrst/`) with the
-`make` target in each subdirectory; see their own READMEs.
-
-## Running a workload
-Kernel + helpers only; no Colloid-specific top-level run wrapper is shipped.
-Boot into the patched kernel, start the monitor/helpers, and drive a workload
-with your own launcher.
+Expected `uname -r`: `6.3.0-Colloid-TPP` or `6.3.0-Colloid-TPP-Prefetch`. Helper module loading (`tierinit`, `kswapdrst`, `colloid-mon`) and `tier-prefetch-mon` are managed automatically by `workloads/scripts/setup_kernel.sh`.

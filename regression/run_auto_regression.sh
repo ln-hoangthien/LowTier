@@ -82,6 +82,7 @@ enable_hang_auto_reboot() {
         "kernel.softlockup_panic=0" \
         "kernel.hardlockup_panic=1" \
         "kernel.hung_task_panic=1" \
+        "kernel.hung_task_timeout_secs=600" \
         "kernel.nmi_watchdog=1" \
         "kernel.watchdog_thresh=60"; do
         sysctl -w "$kv" >/dev/null 2>&1 || true

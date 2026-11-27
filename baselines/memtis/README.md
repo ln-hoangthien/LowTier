@@ -1,74 +1,28 @@
-# Memtis - Linux v5.15.19 kernel
+# Memtis (SOSP '23 — Linux v5.15.19)
 
-This folder builds the Memtis kernel used as a baseline in PACT evaluation. Memtis is a hardware-performance-counter-driven tiered memory management system that profiles per-page access frequency using PEBS and migrates pages between tiers accordingly.
+Memtis PEBS-driven tiered-memory baseline on Linux `v5.15.19`, evaluated in both baseline (`memtis`) and page-migration prefetching (`memtis-prefetch`) configurations.
 
----
+## Contents
 
-## Folder contents
+- `setup_memtis.sh` — Checks out `v5.15.19` in `./linux`, applies `memtis.patch` + `memtis-mig-stats.patch`, sets `CONFIG_LOCALVERSION="-Memtis"`, and compiles the kernel.
+- `setup_memtis-prefetch.sh` — Applies `memtis.patch`, `memtis-prefetch.patch`, and `memtis-mig-stats.patch`, sets `CONFIG_LOCALVERSION="-Memtis-Prefetch"`, and compiles the prefetch-enabled kernel.
+- `memtis.patch` — Upstream Memtis (HTMM) kernel patch (`EXTRAVERSION = -htmm`).
+- `memtis-mig-stats.patch` — Adds migration wait/copy latency vmstat counters (`MIG_WAIT_*`, `MIG_COPY_NS`).
+- `memtis-prefetch.patch` — Adds `/sys/kernel/mm/page_prefetch/` migration prefetching.
+- `config` — Base kernel `.config`.
 
-| File | Purpose |
-|------|---------|
-| `setup_memtis.sh` | One-shot build script - clone, patch, configure, compile |
-| `memtis.patch` | Memtis patch applied to clean Linux v5.15.19 |
-| `config` | Base `.config` used as the starting configuration |
-
----
-
-## Requirements
-
-- `git`, `make`, `gcc` (gcc 9+ recommended)
-- Kernel build dependencies:
+## Build & Usage
 
 ```bash
-# Ubuntu / Debian
-sudo apt install git build-essential bc bison flex libelf-dev libssl-dev \
-     libncurses-dev dwarves pahole
+# Recommended: build via manage_kernels.sh (auto-clones linux-stable v5.15.19 & uses Docker on GCC >= 12)
+sudo ./baselines/scripts/manage_kernels.sh memtis build
+sudo ./baselines/scripts/manage_kernels.sh memtis-prefetch build
 
-# RHEL / CentOS / Fedora
-sudo dnf install git gcc make bc bison flex elfutils-libelf-devel openssl-devel \
-     ncurses-devel dwarves
+# Compile only (no /boot or GRUB modification)
+sudo ./baselines/scripts/manage_kernels.sh memtis-prefetch compile_only
+
+# Switch GRUB default with target memmap
+sudo ./baselines/scripts/manage_kernels.sh memtis-prefetch update_grub --memmap "memmap=44G!4G" --reboot
 ```
 
-- At least **20 GB** free disk space
-- At least **8 GB RAM** recommended for parallel build
-
----
-
-## Usage
-
-Memtis builds via `setup_memtis.sh` (not `compile.sh`). The script expects the
-kernel tree at `./linux`; `v5.15.19` is a **stable** point release, so clone the
-`linux-stable` tree (not `torvalds/linux`). The kernel install below needs root:
-
-```bash
-cd memtis
-git clone https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git linux
-sudo ./setup_memtis.sh   # checks out tag v5.15.19
-```
-
-The script will:
-1. Clone `linux-stable` at tag `v5.15.19` into `linux/`
-2. Apply `memtis.patch` (sets `EXTRAVERSION = -htmm`)
-3. Copy `config` as the base `.config`
-4. Run `make olddefconfig` to resolve any new symbols
-5. Force `CONFIG_INTEL_UNCORE_FREQ_CONTROL=y` (built-in `*`)
-6. Build with `make -j$(nproc)`
-
-If the repo is already present the clone step is skipped automatically.
-
----
-
-## Installation (optional)
-
-```bash
-cd linux
-sudo make modules_install
-sudo make install
-sudo reboot
-```
-
-Verify after reboot:
-```bash
-uname -r
-# expected: 5.15.19-htmm
-```
+Expected `uname -r`: `5.15.19-htmm-Memtis+` or `5.15.19-htmm-Memtis-Prefetch+`. Cgroup quota (`memory.max_at_node0`), `htmm_mode`, `ksamplingd`, `tier-prefetch-mon`, and safe teardown are managed automatically by `workloads/scripts/setup_kernel.sh`.

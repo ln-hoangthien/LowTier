@@ -1,28 +1,27 @@
-# TPP (ASPLOS '23)
+# TPP (ASPLOS '23 — Linux v5.15)
 
-Transparent Page Placement, evaluated as a tiering baseline.
+Transparent Page Placement (TPP) tiered-memory baseline on Linux `v5.15`, evaluated in both baseline (`tpp`) and page-migration prefetching (`tpp-prefetch`) configurations.
 
 ## Contents
-- `tpp.patch` - kernel patch applied on top of Linux `v5.15`.
-- `compile.sh` - checks out `v5.15` in a sibling `linux/` git tree, applies
-  `tpp.patch`, builds, installs modules, runs `make install` and
-  `update-grub`.
 
-## Build
-`compile.sh` expects a Linux git checkout in `./linux` (not bundled). Clone it
-first, then build (kernel install + `update-grub` need root):
+- `compile.sh` — Checks out `v5.15` in `./linux`, applies `tpp.patch` + `tpp-mig-stats.patch`, sets `CONFIG_LOCALVERSION="-TPP"`, and compiles the kernel and modules.
+- `compile-prefetch.sh` — Applies `tpp.patch`, `tpp-prefetch.patch`, and `tpp-mig-stats.patch`, sets `CONFIG_LOCALVERSION="-TPP-Prefetch"`, and compiles the prefetch-enabled kernel.
+- `tpp.patch` — Upstream TPP kernel patch.
+- `tpp-mig-stats.patch` — Adds migration wait/copy latency vmstat counters (`MIG_WAIT_*`, `MIG_COPY_NS`).
+- `tpp-prefetch.patch` — Adds `/sys/kernel/mm/page_prefetch/` migration prefetching.
+
+## Build & Usage
 
 ```bash
-cd tpp
-git clone https://github.com/torvalds/linux.git linux   # v5.15 is a mainline tag
-sudo ./compile.sh
+# Recommended: build via manage_kernels.sh (auto-clones v5.15 & uses Docker on GCC >= 12)
+sudo ./baselines/scripts/manage_kernels.sh tpp build
+sudo ./baselines/scripts/manage_kernels.sh tpp-prefetch build
+
+# Compile only (no /boot or GRUB modification)
+sudo ./baselines/scripts/manage_kernels.sh tpp-prefetch compile_only
+
+# Switch GRUB default with target memmap
+sudo ./baselines/scripts/manage_kernels.sh tpp-prefetch update_grub --memmap "memmap=43G!5G" --reboot
 ```
 
-The script runs: `git checkout v5.15` → `git apply tpp.patch` →
-`make olddefconfig` → `make -j` → `make modules_install` → `make install` →
-`update-grub`.
-
-## Running a workload
-This directory ships the kernel patch only; there is no TPP-specific run
-wrapper. Boot into the patched kernel, then drive a workload with your own
-launcher (TPP operates transparently in the kernel once booted).
+Expected `uname -r`: `5.15.0-TPP` or `5.15.0-TPP-Prefetch`. Demotion/NUMA-balancing sysctls and `tier-prefetch-mon` are managed automatically by `workloads/scripts/setup_kernel.sh`.

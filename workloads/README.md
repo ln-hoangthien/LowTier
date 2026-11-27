@@ -1,219 +1,196 @@
-# LowTier Workload Evaluation Suite
+# Workload Evaluation Suite
 
-This directory contains the benchmark workloads, datasets, and automation scripts used to evaluate the **LowTier** tiered memory system and comparison baselines (**Nomad**, **Nomad-Alto**, **Memtis**, **TPP**, **Colloid-tpp**, **PACT**, and **HybridTier**).
+This directory contains the benchmark workloads, datasets, hardware/kernel configuration scripts, and zero-overhead telemetry tooling used to evaluate **adaptive page-migration prefetching** across all 9 tiered-memory baselines (**AutoNUMA**, **Memtis**, **Nomad**, **Nomad-Alto**, **TPP**, **Colloid-TPP**, **Colloid-TPP-Alto**, **PACT**, and **HybridTier**) and their `-prefetch` variants.
 
 ---
 
 ## Table of Contents
 
-1. [Overview & Architecture](#1-overview--architecture)
-2. [Workload Classification: Open-Source vs Proprietary](#2-workload-classification-open-source-vs-proprietary)
-3. [Open-Source Workloads (GitHub Sync)](#3-open-source-workloads-github-sync)
-   - [GAPBS (Graph Algorithm Platform Benchmark Suite)](#gapbs-graph-algorithm-platform-benchmark-suite)
-   - [Silo (In-Memory Transactional OLTP Database)](#silo-in-memory-transactional-oltp-database)
-   - [Redis (In-Memory Key-Value Store)](#redis-in-memory-key-value-store)
-   - [STREAM (Memory Bandwidth & Tiering Variants)](#stream-memory-bandwidth--tiering-variants)
-   - [XSBench (Monte Carlo Transport Simulation)](#xsbench-monte-carlo-transport-simulation)
-4. [Proprietary & Licensed Workloads](#4-proprietary--licensed-workloads)
-   - [SPEC CPU 2026 (`spec2026`)](#spec-cpu-2026-spec2026)
-   - [Intel Memory Latency Checker (`mlc`)](#intel-memory-latency-checker-mlc)
-5. [Automated Setup & Build Guide](#5-automated-setup--build-guide)
-6. [Workload Execution & Profiling Tools](#6-workload-execution--profiling-tools)
-7. [Memory Footprint (RSS) & Tier Ratios](#7-memory-footprint-rss--tier-ratios)
-8. [Directory Structure](#8-directory-structure)
+1. [Overview & Hardware Emulation](#1-overview--hardware-emulation)
+2. [CPU Topology & Core Allocation](#2-cpu-topology--core-allocation)
+3. [Workload Classification: Open-Source vs Proprietary](#3-workload-classification-open-source-vs-proprietary)
+4. [Open-Source Workloads](#4-open-source-workloads)
+5. [Proprietary & Licensed Workloads](#5-proprietary--licensed-workloads)
+6. [Automated Setup & Build Guide](#6-automated-setup--build-guide)
+7. [Workload Execution & Telemetry Scripts](#7-workload-execution--telemetry-scripts)
+8. [Memory Footprint (RSS) & Tier Ratios](#8-memory-footprint-rss--tier-ratios)
+9. [Directory Structure](#9-directory-structure)
 
 ---
 
-## 1. Overview & Architecture
+## 1. Overview & Hardware Emulation
 
-The workloads in this suite are curated to cover diverse memory access behaviors under tiered memory architectures:
-- **Streaming & Bandwidth-Bound**: Sequential access with high throughput demands (STREAM).
-- **Pointer-Chasing & Memory Latency-Bound**: Irregular memory accesses and low spatial/temporal locality (GAPBS, XSBench).
-- **Cache-Pollution & Write-Intensive**: High mutation rates and lock contention (Silo TPC-C/YCSB, Redis).
-- **Heterogeneous Real-World Computation**: Complex instruction and data working sets (SPEC CPU 2026).
+The workloads cover diverse memory access behaviors under tiered memory:
+- **Streaming & Bandwidth-Bound**: Sequential sweeps with high memory bandwidth demand (`stream`, `stream_copy`).
+- **Pointer-Chasing & Latency-Bound**: Irregular graph/scientific accesses with low locality (`gapbs_*`, `xsbench`).
+- **Write-Intensive & Lock-Contended**: High mutation rates and concurrency (`silo_tpcc`, `silo_ycsb`, `redis`).
+- **Heterogeneous Real-World Compute**: Large scientific & engineering working sets (`spec2026_*`).
 
-Workloads are run across simulated NUMA tiers:
-- **Node 0 (Fast Tier / Local DRAM)**: Constrained via `memmap` (e.g. `memmap=35G!13G`) to force tiering pressure.
-- **Node 1 (Slow Tier / CXL Emulation)**: Degraded uncore frequency (~1.3 GHz) to simulate typical CXL memory latencies (~185ns to 200ns).
+Workloads run across a 2-node emulated tiered-memory topology configured by [`setup_machine.sh`](scripts/setup_machine.sh) and GRUB `memmap=`:
+- **Node 0 (Fast Tier / Local DRAM)**: Capacity constrained via `memmap=<reserved>G!<fast>G`, Pkg 0 uncore locked to **2.5 GHz**, Socket 0 cores clamped to **3.0 GHz** (`performance` governor, `min=max`).
+- **Node 1 (Slow Tier / Emulated CXL)**: Pkg 1 uncore locked to **1.3 GHz** (before Socket 1 CPUs `32..63` are offlined) to emulate CXL-class remote latency (~185–200 ns).
 
 ---
 
-## 2. Workload Classification: Open-Source vs Proprietary
+## 2. CPU Topology & Core Allocation
+
+Centralized in [`scripts/cpu_config.sh`](scripts/cpu_config.sh) (Socket 0 = 32 physical cores; Socket 1 / hyperthreads `32..63` offlined):
+
+| Core(s) | Assignment |
+| :--- | :--- |
+| **Core 0** | OS interrupts & Socket 0 `uncore_cha_*` PMUs |
+| **Cores 1–24** | Benchmark workload threads (`WORKLOAD_CORES=24`, `numactl --physcpubind=1..24`) |
+| **Cores 25–27** | Kernel headroom (`kswapd0`, `kcompactd0`, `kworker`) |
+| **Core 28** | 1-second time-series & uncore DRAM telemetry (`tier_ts_mon`, memory bound to Node 1) |
+| **Core 29** | PACT migration thread (`--migration-cpu`) |
+| **Core 30** | PACT monitor / PEBS coroutine loop (`--monitor-cpu`) |
+| **Core 31** | Standalone `tier-prefetch-mon` adaptive pacing daemon |
+| **Cores 32–63** | Offlined Socket 1 CPUs (kept offline across same-boot regression steps via `KEEP_MACHINE_CONFIG=1`) |
+
+---
+
+## 3. Workload Classification: Open-Source vs Proprietary
 
 > [!IMPORTANT]
-> **All workloads in this repository are open source and can be automatically cloned or synced from public GitHub repositories, with the exception of `spec2026` and `mlc`.**
+> All workloads are open source and automatically cloned/built by `setup_workloads.sh`, except **`spec2026`** and **`mlc`**, which are proprietary and must be supplied locally.
 
-| Workload | Category | License / Type | Source / Sync Repository | Footprint (RSS) |
-|---|---|---|---|---|
-| **GAPBS** | Graph Analytics | Open Source (BSD-3-Clause) | [github.com/sbeamer/gapbs](https://github.com/sbeamer/gapbs) | 12 – 38 GB |
-| **Silo** | In-Memory Database | Open Source (MIT) | [github.com/stephentu/silo](https://github.com/stephentu/silo) | 18 – 57 GB |
-| **Redis** | Key-Value Database | Open Source (BSD-3-Clause) | [github.com/redis/redis](https://github.com/redis/redis) | ~26 GB |
-| **STREAM** | Bandwidth / Microbench | Open Source (Custom) | [github.com/jeffhammond/STREAM](https://github.com/jeffhammond/STREAM) | ~18 – 19 GB |
-| **XSBench** | Scientific Simulation | Open Source (MIT) | [github.com/ANL-CESAR/XSBench](https://github.com/ANL-CESAR/XSBench) | ~18 GB |
-| **SPEC CPU 2026** | Standard Benchmark Suite | **Proprietary Commercial** | Licensed from SPEC | 1 – 49 GB |
+| Workload | Category | License / Type | Source Repository | Configured RSS |
+| :--- | :--- | :--- | :--- | :--- |
+| **GAPBS** | Graph Analytics | Open Source (BSD-3-Clause) | [github.com/sbeamer/gapbs](https://github.com/sbeamer/gapbs) | 12 – 38 GiB |
+| **Silo** | In-Memory OLTP DB | Open Source (MIT) | [github.com/stephentu/silo](https://github.com/stephentu/silo) | 15 – 40 GiB |
+| **Redis** | Key-Value Store | Open Source (BSD-3-Clause) | [github.com/redis/redis](https://github.com/redis/redis) | ~26 GiB |
+| **STREAM** | Memory Bandwidth | Open Source (Custom) | [github.com/jeffhammond/STREAM](https://github.com/jeffhammond/STREAM) | ~18 GiB |
+| **XSBench** | Monte Carlo Transport | Open Source (MIT) | [github.com/ANL-CESAR/XSBench](https://github.com/ANL-CESAR/XSBench) | ~18 GiB |
+| **SPEC CPU 2026** | Standard Benchmark Suite | **Proprietary Commercial** | Licensed from SPEC | 22 – 49 GiB |
 | **Intel MLC** | Memory Diagnostic Tool | **Proprietary Intel** | Intel Developer Zone | Configurable |
 
 ---
 
-## 3. Open-Source Workloads (GitHub Sync)
+## 4. Open-Source Workloads
 
-### GAPBS (Graph Algorithm Platform Benchmark Suite)
-- **Repository**: [https://github.com/sbeamer/gapbs.git](https://github.com/sbeamer/gapbs.git)
-- **Target Algorithms**:
-  - `gapbs_bc`: Betweenness Centrality
-  - `gapbs_tc`: Triangle Counting
-  - `gapbs_pr`: PageRank
-  - `gapbs_bfs`: Breadth-First Search
-  - `gapbs_cc`: Connected Components
-  - `gapbs_sssp`: Single-Source Shortest Paths
-- **Graph Datasets Supported**:
-  - `kron`: Kronecker Synthetic Graph ($2^{27}$ vertices, scale 27)
-  - `urand`: Uniform Random Graph ($2^{27}$ vertices, scale 27)
-  - `twitter`: Real-world Twitter follower network dataset
-  - `web` & `road`: Web crawl and road network topologies
-- **Compilation**: Built via `make bench-graphs` inside `workloads/gapbs`.
+### GAPBS (`gapbs_<algo>_<dataset>`)
+- **Algorithms**: `pr` (PageRank), `bc` (Betweenness Centrality), `cc` (Connected Components), `bfs` (Breadth-First Search), `sssp` (Single-Source Shortest Paths), `tc` (Triangle Counting).
+- **Datasets**: `kron` ($2^{27}$ vertices), `urand` ($2^{27}$ vertices), `twitter`, `web`, `road`.
+- **Graph Cache Reuse**: `run_workloads.sh` preloads graph files into Node 1 via `vmtouch` and reuses resident Node 1 pagecache across back-to-back GAPBS runs sharing the same graph.
 
-### Silo (In-Memory Transactional OLTP Database)
-- **Repository**: [https://github.com/stephentu/silo.git](https://github.com/stephentu/silo.git)
-- **Submodule**: [https://github.com/kohler/masstree-beta.git](https://github.com/kohler/masstree-beta.git) (Masstree indexing backend)
-- **Target Benchmarks**:
-  - `silo_tpcc`: TPC-C Online Transaction Processing (high-concurrency write/read transactions)
-  - `silo_ycsb`: Yahoo! Cloud Serving Benchmark
-  - `silo_queue`, `silo_bid`, `silo_encstress`
-- **Build Notes**: Automatically pulls dependencies (`libdb++-dev`, `libnuma-dev`, `libjemalloc-dev`, `libaio-dev`, `libssl-dev`) and synchronizes the Masstree submodule over HTTPS.
+### Silo (`silo_tpcc`, `silo_ycsb`, `silo_queue`, `silo_bid`, `silo_encstress`)
+- Built from upstream `stephentu/silo` + Masstree submodule (`NMAXCORES=512`).
+- `silo_tpcc` runs with `--num-threads 24 --scale-factor 150 --parallel-loading --runtime 180` (453 loader threads + 24 aligned workers ≤ 512 core IDs).
+- `silo_ycsb` runs with `--num-threads 24 --scale-factor 240000 --parallel-loading --runtime 600`.
 
-### Redis (In-Memory Key-Value Store)
-- **Repository**: [https://github.com/redis/redis.git](https://github.com/redis/redis.git) (cloned to `workloads/redis_src`)
-- **Execution**: Runs `redis-server` paired with `redis-benchmark` across multiple worker threads.
-- **Parameters**: 4.3M keys with 8 KB payloads (~26.3 GB memory footprint), testing interleaved `set` and `get` operations.
+### Redis (`redis`)
+- Runs `redis-server` paired with `redis-benchmark` (`4.3M` keys × `8 KB` payload ≈ 26 GiB RSS, `set,get`). Note: `redis` + `THP=always` is skipped automatically because Redis disables THP via `prctl`.
 
-### STREAM (Memory Bandwidth & Tiering Variants)
-- **Repository**: [https://github.com/jeffhammond/STREAM.git](https://github.com/jeffhammond/STREAM.git)
-- **Variants Included**:
-  - `stream`: Classic STREAM benchmark compiled with large array sizes ($800\text{M elements} \times 8\text{B} \times 3 \approx 19.2\text{ GB}$).
-  - `stream_hot`: Hot-working-set variant causing rapid page migration pressure.
-  - `stream_phase`: Multi-phase execution cycling between high-intensity computation and memory sweep phases.
+### STREAM (`stream`, `stream_copy`)
+- Classic `stream` and pure copy-kernel `stream_copy` compiled with `STREAM_ARRAY_SIZE=800000000` (~18 GiB footprint).
 
-### XSBench (Monte Carlo Transport Simulation)
-- **Repository**: [https://github.com/ANL-CESAR/XSBench.git](https://github.com/ANL-CESAR/XSBench.git)
-- **Details**: Mini-app representing the computational kernel of the OpenMC Monte Carlo neutron transport code. Heavily exercises continuous-energy microscopic cross-section lookups with irregular memory access patterns.
+### XSBench (`xsbench`)
+- OpenMP continuous-energy Monte Carlo neutron transport mini-app (`-g 37000 -p 5000000`, ~18 GiB).
 
 ---
 
-## 4. Proprietary & Licensed Workloads
+## 5. Proprietary & Licensed Workloads
 
 > [!WARNING]
-> Due to licensing and copyright agreements, the following benchmarks **cannot** be hosted on public repositories or synced from GitHub.
+> Due to licensing restrictions, `spec2026` and `mlc` cannot be redistributed in this repository.
 
-### SPEC CPU 2026 (`spec2026`)
-- **Provider**: Standard Performance Evaluation Corporation (SPEC)
-- **Distribution Format**: ISO installer image (`cpu2026-1.0.1.iso`) located in `workloads/`.
-- **License**: Proprietary commercial software. Redistribution is prohibited under SPEC license agreements.
-- **Supported Benchmarks in Suite**:
-  - **SPECrate®2026**: `spec2026_706.stockfish_r`, `spec2026_708.sqlite_r`, `spec2026_709.cactus_r`, `spec2026_721.gcc_r`, `spec2026_723.llvm_r`, `spec2026_765.roms_r`, `spec2026_782.lbm_r`, etc.
-  - **SPECspeed®2026**: `spec2026_801.xz_s`, `spec2026_820.cloverleaf_s`, `spec2026_865.roms_s`, `spec2026_881.neutron_s`, etc.
-- **Configuration**: Uses `workloads/scripts/gcc-linux-x86.cfg` for optimized GCC compilation.
-
-### Intel Memory Latency Checker (`mlc`)
-- **Provider**: Intel Corporation
-- **Distribution Format**: Distributed under the *Intel Memory Latency Tools Outbound License Agreement* (`workloads/mlc/mlc_v3.13.tgz`).
-- **License**: Proprietary freeware. Must be obtained directly from Intel Developer Zone.
-- **Use Case**: Hardware validation, measuring baseline memory bandwidth, loaded latency, and cross-socket NUMA / CXL latency curves.
+- **SPEC CPU 2026 (`spec2026_<bench>`)**: Install from `cpu2026-1.0.1.iso` into `workloads/spec2026/`. Compiled and executed via [`scripts/gcc-linux-x86.cfg`](scripts/gcc-linux-x86.cfg) (`ignore_errors = 0`, 24 OpenMP threads / copies). Primary SPECspeed targets: `spec2026_820.cloverleaf_s`, `spec2026_865.roms_s`, `spec2026_849.fotonik3d_s`, `spec2026_881.neutron_s`.
+- **Intel MLC (`mlc`)**: Used for hardware latency/bandwidth validation of the Node 0 / Node 1 uncore setup.
 
 ---
 
-## 5. Automated Setup & Build Guide
+## 6. Automated Setup & Build Guide
 
-The master setup script [`setup_workloads.sh`](file:///home/c425-xeon/thienle/LowTier/workloads/scripts/setup_workloads.sh) automates cloning, patching, submodule checkout, and building of all open-source workloads.
-
-### Usage
+[`scripts/setup_workloads.sh`](scripts/setup_workloads.sh) clones, patches (GCC 12+ compatibility), and compiles open-source workloads and pre-builds configured benchmarks:
 
 ```bash
-# View all available targets and options
 sudo ./workloads/scripts/setup_workloads.sh --help
-
-# Build a single open-source workload
-sudo ./workloads/scripts/setup_workloads.sh stream
 sudo ./workloads/scripts/setup_workloads.sh gapbs
 sudo ./workloads/scripts/setup_workloads.sh silo
 sudo ./workloads/scripts/setup_workloads.sh redis
 sudo ./workloads/scripts/setup_workloads.sh xsbench
-
-# Clone & compile ALL open-source workloads at once
+sudo ./workloads/scripts/setup_workloads.sh stream
 sudo ./workloads/scripts/setup_workloads.sh all
-```
 
-### Build Features
-- **Automatic Shallow Clones**: Clones official repositories from GitHub if the directory is missing.
-- **Compiler Compatibility**: Automatically handles GCC 12+ flag adjustments (`-Wno-error`) and injects C++ header compatibility for standard library ADL streaming (`config/pair_stream.h` in Silo).
-- **Graph Dataset Generation**: Automatically generates synthetic benchmark graphs (`kron`, `urand`) via GAPBS `bench.mk`.
+# Pre-build only the benchmarks listed for a regression run
+sudo ./workloads/scripts/setup_workloads.sh prebuild gapbs_pr_kron silo_tpcc spec2026_820.cloverleaf_s
+```
 
 ---
 
-## 6. Workload Execution & Profiling Tools
+## 7. Workload Execution & Telemetry Scripts
 
-Located in [`workloads/scripts/`](file:///home/c425-xeon/thienle/LowTier/workloads/scripts):
+Located in [`workloads/scripts/`](scripts/):
 
-| Script | Purpose |
-|---|---|
-| [`run_workloads.sh`](file:///home/c425-xeon/thienle/LowTier/workloads/scripts/run_workloads.sh) | **Master evaluation runner**. Configures tiered CPU topology (offlines CPUs 32..64), clears memory caches, preloads datasets to Node 1, runs `bpftrace` NUMA latency probes, starts `perf stat`, tunes online migration prefetching parameters, and logs results. |
-| [`exec_workload.sh`](file:///home/c425-xeon/thienle/LowTier/workloads/scripts/exec_workload.sh) | **Execution dispatcher**. Pure command builder that resolves and formats `numactl --physcpubind=...` execution lines without profiling overhead. |
-| [`run_with_stats.sh`](file:///home/c425-xeon/thienle/LowTier/workloads/scripts/run_with_stats.sh) | **Runtime telemetry monitor**. Wraps the workload execution and samples memory migration rates, page faults, CPU utilization, and latency metrics at 1-second intervals. |
+| File | Purpose |
+| :--- | :--- |
+| [`run_workloads.sh`](scripts/run_workloads.sh) | **Master benchmark runner**. Configures machine hardware, cleans caches, preloads GAPBS graphs to Node 1, configures kernel tiering & `/sys/kernel/mm/page_prefetch/`, starts telemetry, runs the workload with timeout guard, compiles reports, and restores hardware (unless `KEEP_MACHINE_CONFIG=1`). Supports `--get-log-path` for side-effect-free log lookup. |
+| [`exec_workload.sh`](scripts/exec_workload.sh) | **Execution dispatcher**. Resolves `numactl --physcpubind=1..24` commands, GAPBS preload commands, and target binary names (`--get-cmd`, `--get-preload-cmd`, `--get-target-exe`). |
+| [`setup_machine.sh`](scripts/setup_machine.sh) | **Hardware configurator**. Locks CPU clocks (3.0 GHz), Pkg 0/1 uncore (2.5 / 1.3 GHz), and offlines CPUs `32..63` (skips hotplug if already offline; `--restore` re-enables all CPUs and defaults). |
+| [`setup_kernel.sh`](scripts/setup_kernel.sh) | **Kernel tiering & prefetch configurator**. Configures THP, watermarks, `/sys/kernel/mm/page_prefetch/`, kernel modules (`tierinit`, `kswapdrst`, `async_promote`), baseline daemons (`pact`, `colloid-mon`, `tier-prefetch-mon`, Memtis cgroup/ksamplingd), and safe teardown. |
+| [`monitor_performance.sh`](scripts/monitor_performance.sh) | **Telemetry orchestrator**. Collects `/proc/vmstat` deltas (`MIG_WAIT_*`, `MIG_COPY_NS`, faults, migrations), migration daemon CPU time, uncore DRAM traffic, and AutoNUMA PMU stats. |
+| [`tier_ts_mon.c`](scripts/tier_ts_mon.c) | **Zero-overhead C telemetry sampler** (Core 28 / Node 1). Samples IMC/UPI DRAM traffic, `/proc/vmstat`, `/proc/perfnomad`, and optional AutoNUMA core PMUs into per-second CSVs with zero forks or heap allocations. |
+| [`cpu_config.sh`](scripts/cpu_config.sh) | Centralized CPU core allocation map (`WORKLOAD_CORES=24`, daemon cores `28–31`, offline CPUs `32–64`). |
+| [`common.sh`](scripts/common.sh) | Shared `log_echo` and `read_sysfs` shell helpers. |
+| [`calc_overhead.py`](scripts/calc_overhead.py) | Parses `workloads/output/<kernel>/regress_*.log` into summary tables and Excel-ready CSV/TSV reports. |
+| [`gcc-linux-x86.cfg`](scripts/gcc-linux-x86.cfg) | SPEC CPU 2026 GCC configuration file. |
 
-### Running a Workload Manually
+### Running Workloads Manually
 
 ```bash
-# Run STREAM Hot variant
-sudo ./workloads/scripts/run_workloads.sh stream_hot
-
-# Run GAPBS Betweenness Centrality on Kron graph
-sudo ./workloads/scripts/run_workloads.sh gapbs_bc kron
-
-# Run Silo TPC-C benchmark
+# Single standalone run (offlines CPUs 32..63 for the run and restores them on exit)
+sudo ./workloads/scripts/run_workloads.sh gapbs_pr_kron
 sudo ./workloads/scripts/run_workloads.sh silo_tpcc
-
-# Run Redis in-memory benchmark
-sudo ./workloads/scripts/run_workloads.sh redis
-
-# Run SPEC CPU 2026 Cloverleaf benchmark
 sudo ./workloads/scripts/run_workloads.sh spec2026_820.cloverleaf_s
+
+# Run with explicit tier ratio, THP mode, and prefetch parameters
+sudo TIER_RATIO=1:8 THP_MODE=always PREFETCH_ADAPTIVE=1 PREFETCH_NAIVE=1 \
+     PREFETCH_MIN_DISTANCE=min0_max6 PREFETCH_HINT=0 \
+     ./workloads/scripts/run_workloads.sh gapbs_bc_kron
 ```
 
 ---
 
-## 7. Memory Footprint (RSS) & Tier Ratios
+## 8. Memory Footprint (RSS) & Tier Ratios
 
-The memory footprint (Resident Set Size) of each benchmark is calibrated in `manage_kernels.sh` to determine fast-tier (Node 0) and slow-tier (Node 1) sizing:
+Fast-tier Node 0 size is computed in [`baselines/scripts/manage_kernels.sh`](../baselines/scripts/manage_kernels.sh) from calibrated RSS (`get_rss`) and ratio `F:S`:
 
-$$\text{FastTier}(\text{GB}) = \frac{\text{RSS} \times \text{FastRatio}}{\text{FastRatio} + \text{SlowRatio}} + \text{OS Headroom}$$
+$$\text{FastTier (GiB)} = \text{round}\left(\frac{\text{RSS} \times F}{F + S} + \text{OS\_HEADROOM}\right), \quad \text{OS\_HEADROOM} = 3\text{ GiB}$$
 
-### Measured RSS Reference
+Within-1 GiB peers are snapped in `get_rss()` (preserving original measured values in comments) to share identical `memmap` boots across ratios:
 
-| Workload Target | Measured RSS | Default Node 0 Allocation (1:1 Ratio) |
-|---|---|---|
-| `gapbs_bc_kron` | ~19.5 GB | 13 GB (Fast) : 35 GB (Slow) |
-| `gapbs_tc_kron` | ~37.5 GB | 22 GB (Fast) : 26 GB (Slow) |
-| `gapbs_sssp_kron` | ~33.8 GB | 20 GB (Fast) : 28 GB (Slow) |
-| `gapbs_pr_kron` | ~17.8 GB | 12 GB (Fast) : 36 GB (Slow) |
-| `silo_tpcc` | ~17.9 GB | 12 GB (Fast) : 36 GB (Slow) |
-| `silo_ycsb` | ~40.0 GB | 23 GB (Fast) : 25 GB (Slow) |
-| `redis` | ~26.3 GB | 16 GB (Fast) : 32 GB (Slow) |
-| `xsbench` | ~18.1 GB | 12 GB (Fast) : 36 GB (Slow) |
-| `stream_hot` | ~18.0 GB | 12 GB (Fast) : 36 GB (Slow) |
-| `spec2026_820.cloverleaf_s` | ~22.0 GB | 14 GB (Fast) : 34 GB (Slow) |
-| `spec2026_865.roms_s` | ~22.6 GB | 14 GB (Fast) : 34 GB (Slow) |
+| Workload Target | Configured RSS (Measured) | `1:16` `memmap` | `1:8` `memmap` | `1:4` `memmap` |
+| :--- | :--- | :--- | :--- | :--- |
+| `gapbs_{pr,bfs,cc}_{kron,urand}` | 18 GiB | `44G!4G` | `43G!5G` | `41G!7G` |
+| `gapbs_bc_kron` | 18 GiB (19 GiB) | `44G!4G` | `43G!5G` | `41G!7G` |
+| `gapbs_bc_urand`, `silo_tpcc` | 20 GiB | `44G!4G` | `43G!5G` | `41G!7G` |
+| `spec2026_820.cloverleaf_s` | 22 GiB | `44G!4G` | `43G!5G` | `41G!7G` |
+| `spec2026_865.roms_s` | 22 GiB (23 GiB) | `44G!4G` | `43G!5G` | `41G!7G` |
+| `redis` | 26 GiB | `43G!5G` | `42G!6G` | `40G!8G` |
+| `gapbs_sssp_kron` / `gapbs_sssp_urand` | 34 / 36 GiB | `43G!5G` | `41G!7G` | `38G!10G` |
+| `gapbs_tc_kron` / `silo_ycsb` | 38 / 40 GiB | `43G!5G` | `41G!7G` | `37G!11G` |
+| `spec2026_849.fotonik3d_s` / `881.neutron_s` | 49 GiB (48 / 49 GiB) | `42G!6G` | `40G!8G` | `35G!13G` |
 
 ---
 
-## 8. Directory Structure
+## 9. Directory Structure
 
-```
+```text
 workloads/
-├── README.md               # This documentation
+├── README.md
 ├── scripts/
-│   ├── setup_workloads.sh  # Automated workload clone & build script
-│   ├── run_workloads.sh    # Evaluation runner with bpftrace & perf
-│   ├── exec_workload.sh    # Pure execution dispatcher
-│   └── run_with_stats.sh   # Per-second telemetry monitor
-└── output/                 # Output evaluation logs & latency statistics
+│   ├── common.sh
+│   ├── cpu_config.sh
+│   ├── setup_workloads.sh
+│   ├── setup_machine.sh
+│   ├── setup_kernel.sh
+│   ├── exec_workload.sh
+│   ├── run_workloads.sh
+│   ├── monitor_performance.sh
+│   ├── tier_ts_mon.c
+│   ├── calc_overhead.py
+│   ├── run_redis.sh
+│   └── gcc-linux-x86.cfg
+├── stream/
+└── output/                  # Per-kernel regress_*.log and timeseries_*.csv outputs
 ```
