@@ -9,6 +9,8 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="${ROOT_DIR:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
+source "${SCRIPT_DIR}/common.sh"
+source "${SCRIPT_DIR}/cpu_config.sh"
 
 # ------------------------------------------------------------------------------
 # Fixed Machine & Hardware Parameters
@@ -18,26 +20,6 @@ UNCORE_PKG1_TARGET=1300000  # Pkg 1 (Slow tier): 1.3 GHz
 CPU_GOVERNOR="performance"
 CPU_MIN_FREQ=3000000        # Sustainable all-core Turbo clock: 3.0 GHz (Xeon Gold 6448Y)
 CPU_MAX_FREQ=3000000        # Clamped to 3.0 GHz to eliminate dynamic Turbo jitter
-WORKLOAD_CORES=24           # 24 physical cores (0..23) for workload
-SELECTED_CPUS="0-23"
-
-# ------------------------------------------------------------------------------
-# Helper: Print log message with optional tee to REGRESS_LOG_FILE
-# ------------------------------------------------------------------------------
-log_echo() {
-    echo -e "$@"
-    if [ -n "${REGRESS_LOG_FILE:-}" ]; then
-        echo -e "$@" >> "${REGRESS_LOG_FILE}"
-    fi
-}
-
-# ------------------------------------------------------------------------------
-# Helper: Safely read sysfs attribute file
-# ------------------------------------------------------------------------------
-read_sysfs() {
-    local file="$1"
-    [ -f "$file" ] && cat "$file" 2>/dev/null || echo ""
-}
 
 # ------------------------------------------------------------------------------
 # Helper: Resolve Intel uncore frequency sysfs directory for package (0 or 1)
@@ -65,12 +47,28 @@ set_freq_bounds() {
 }
 
 # ------------------------------------------------------------------------------
-# Helper: Online or offline hyperthreads (CPUs 32..64)
+# Helper: Lock a single CPU's governor and clamped frequency
+# ------------------------------------------------------------------------------
+lock_cpu_freq() {
+    local cpu="$1"
+    [ -w "$cpu/cpufreq/scaling_governor" ] && echo "${CPU_GOVERNOR}" > "$cpu/cpufreq/scaling_governor" 2>/dev/null || true
+    set_freq_bounds "$cpu/cpufreq/scaling_min_freq" "$cpu/cpufreq/scaling_max_freq" "${CPU_MIN_FREQ}" "${CPU_MAX_FREQ}"
+}
+
+# ------------------------------------------------------------------------------
+# Helper: Online or offline CPUs (${OFFLINE_CPU_START}..${OFFLINE_CPU_END})
 # ------------------------------------------------------------------------------
 set_cpus_online() {
-    local state="$1"
-    for cpu in /sys/devices/system/cpu/cpu{32..64}/online; do
-        [ -f "$cpu" ] && echo "$state" > "$cpu" 2>/dev/null || true
+    local state="$1" c cpu cur
+    CPUS_CHANGED=0
+    for (( c = OFFLINE_CPU_START; c <= OFFLINE_CPU_END; c++ )); do
+        cpu="/sys/devices/system/cpu/cpu${c}/online"
+        [ -f "$cpu" ] || continue
+        read -r cur < "$cpu" 2>/dev/null || continue
+        if [ "$cur" != "$state" ]; then
+            echo "$state" > "$cpu" 2>/dev/null || true
+            CPUS_CHANGED=1
+        fi
     done
 }
 
@@ -144,19 +142,36 @@ configure_machine() {
 
     # 3. CPU Governor & Frequency Pinning: Lock all online cores symmetrically to 3.0 GHz (min=max)
     for cpu in /sys/devices/system/cpu/cpu[0-9]*; do
-        [ -w "$cpu/cpufreq/scaling_governor" ] && echo "${CPU_GOVERNOR}" > "$cpu/cpufreq/scaling_governor" 2>/dev/null || true
-        set_freq_bounds "$cpu/cpufreq/scaling_min_freq" "$cpu/cpufreq/scaling_max_freq" "${CPU_MIN_FREQ}" "${CPU_MAX_FREQ}"
+        lock_cpu_freq "$cpu"
     done
 
     # 3.1. Display verified profile summary (captures Pkg 1 uncore before CPUs 32..64 go offline)
     show_status
 
-    # 4. CPU Topology: Offline hyperthreads 32..64, leaving physical cores 0..31 online
-    log_echo "[*] Configuring tiered CPU topology: Offlining CPUs 32..64..."
+    # 4. CPU Topology: Offline CPUs ${OFFLINE_CPU_START}..${OFFLINE_CPU_END}, leaving Socket 0 physical cores online
     set_cpus_online 0
+    if [ "${CPUS_CHANGED}" -eq 1 ]; then
+        log_echo "[*] Configured tiered CPU topology: Offlined CPUs ${OFFLINE_CPU_START}..${OFFLINE_CPU_END}."
 
-    # 4.1. Display verified profile summary
-    show_status
+        # 4.1. Workaround for Linux 5.13-rc6 (Nomad) CPU hotplug ordering bug:
+        #      migration_offline_cpu (CPUHP_AP_ONLINE_DYN) runs before vmstat_cpu_dead
+        #      (CPUHP_MM_VMSTAT_DEAD) clears Node 1 from N_CPU, leaving node_demotion[0]=-1.
+        #      Bouncing one Node 0 CPU afterward re-triggers set_migration_target_nodes().
+        local kver="$(uname -r)"
+        if [[ "${kver,,}" =~ nomad ]]; then
+            local bounce_cpu="/sys/devices/system/cpu/cpu${PREFETCH_MON_CPU}"
+            if [ -f "${bounce_cpu}/online" ]; then
+                echo 0 > "${bounce_cpu}/online" 2>/dev/null || true
+                echo 1 > "${bounce_cpu}/online" 2>/dev/null || true
+                lock_cpu_freq "${bounce_cpu}"
+            fi
+        fi
+
+        # 4.2. Display verified post-hotplug profile summary
+        show_status
+    else
+        log_echo "[+] Tiered CPU topology already active (CPUs ${OFFLINE_CPU_START}..${OFFLINE_CPU_END} offline); skipping hotplug."
+    fi
 }
 
 # ------------------------------------------------------------------------------

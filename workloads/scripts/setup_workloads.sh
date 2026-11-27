@@ -1,8 +1,8 @@
 #!/bin/bash
 # ===================================================================
 # Master Workload Setup & Build Script
-# Usage: ./setup_workloads.sh [--help] [TARGET | all]
-# Targets: stream | gapbs | silo | redis | xsbench | all
+# Usage: sudo ./setup_workloads.sh [--help] [TARGET [ARGS...]]
+# Targets: stream | gapbs | silo | redis | xsbench | spec2026 | prebuild | all
 # ===================================================================
 
 set -e
@@ -11,7 +11,11 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="${ROOT_DIR:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
 WORKLOAD_DIR="${ROOT_DIR}/workloads"
+REGRESSION_LIST="${REGRESSION_LIST:-${ROOT_DIR}/regression/regression_list}"
+SPEC2026_DIR="${SPEC2026_DIR:-${WORKLOAD_DIR}/spec2026}"
+SPEC_CONFIG="${SPEC_CONFIG:-${WORKLOAD_DIR}/scripts/gcc-linux-x86.cfg}"
 NUM_JOBS="$(nproc)"
+BUILT_DIRS=()
 
 # Output color formatting
 RED='\033[0;31m'
@@ -23,7 +27,7 @@ NC='\033[0m'
 check_root() {
     if [ "$EUID" -ne 0 ]; then
         echo -e "${RED}ERROR: This script must be run with root/sudo privileges.${NC}"
-        echo "Usage: sudo ./setup_workloads.sh [OPTION | TARGET_NAME]"
+        echo "Usage: sudo ./setup_workloads.sh [TARGET [ARGS...]]"
         exit 1
     fi
 }
@@ -33,28 +37,22 @@ show_help() {
     echo " Workload Cloning, Setup & Compilation Script"
     echo "=========================================================================================="
     echo "Usage:"
-    echo "  sudo ./setup_workloads.sh [OPTION | TARGET_NAME]"
-    echo ""
-    echo "Options:"
-    echo "  -h, --help     Show this help message and exit"
-    echo "  all            Setup and compile ALL workloads [Default]"
+    echo "  sudo ./setup_workloads.sh [TARGET [ARGS...]]"
     echo ""
     echo "Available Targets:"
-    echo "  stream         Build STREAM Classic, Hot & Multi-Phase Benchmarks"
-    echo "  gapbs          Clone & Build GAPBS Suite + all graphs (unweighted & weighted: kron27, urand27, twitter)"
-    echo "  silo           Clone & Build Silo OLTP Database (TPC-C)"
+    echo "  stream         Build STREAM benchmarks (stream, stream_copy)"
+    echo "  gapbs          Clone & Build GAPBS binaries + graph datasets if missing"
+    echo "  silo           Clone & Build Silo OLTP Database (dbtest)"
     echo "  redis          Clone & Build Redis In-Memory Key-Value Server"
     echo "  xsbench        Clone & Build XSBench Nuclear Reactor Simulation Benchmark"
-    echo ""
-    echo "Examples:"
-    echo "  sudo ./setup_workloads.sh               # Builds all workloads and datasets"
-    echo "  sudo ./setup_workloads.sh gapbs         # Builds GAPBS suite & all graphs"
+    echo "  spec2026       Clean & pre-build SPEC CPU 2026 targets (args or regression_list)"
+    echo "  prebuild       Clean & pre-build benchmarks listed as args (or regression_list)"
+    echo "  all            Setup and compile ALL workloads [Default]"
     echo "=========================================================================================="
     exit 0
 }
 
-# Check for help flag
-if [ "$1" == "-h" ] || [ "$1" == "--help" ]; then
+if [ "${1:-}" == "-h" ] || [ "${1:-}" == "--help" ]; then
     show_help
 fi
 
@@ -88,29 +86,17 @@ setup_stream() {
         git clone https://github.com/jeffhammond/STREAM.git "${WORKLOAD_DIR}/stream"
     fi
     cd "${WORKLOAD_DIR}/stream"
-    clean_repo
-
-    EXTRA_FLAGS=""
-    [ "$GCC_MAJOR" -ge 12 ] && EXTRA_FLAGS="-Wno-error"
-
-    # High memory footprint: 800M elements * 8 bytes * 3 arrays = 19.2 GB memory footprint
-    STREAM_FLAGS="-O3 -fopenmp -mcmodel=medium -DSTREAM_ARRAY_SIZE=800000000ULL -DNTIMES=40 ${EXTRA_FLAGS}"
-
-    # Compile classic STREAM
-    if [ -f "stream.c" ]; then
-        echo "Compiling stream.c (19.2 GB footprint, -DSTREAM_ARRAY_SIZE=800000000ULL -DNTIMES=40)..."
-        gcc ${STREAM_FLAGS} stream.c -o stream
+    if [ -f "Makefile" ]; then
+        make clean
+        make -j${NUM_JOBS}
+    else
+        EXTRA_FLAGS=""
+        [ "$GCC_MAJOR" -ge 12 ] && EXTRA_FLAGS="-Wno-error"
+        STREAM_FLAGS="-O3 -fopenmp -mcmodel=medium -DSTREAM_ARRAY_SIZE=800000000ULL -DNTIMES=40 ${EXTRA_FLAGS}"
+        [ -f "stream.c" ] && gcc ${STREAM_FLAGS} stream.c -o stream
+        [ -f "stream_copy.c" ] && gcc ${STREAM_FLAGS} -DTUNED stream_copy.c -o stream_copy
     fi
-    # Compile hot-working-set variant
-    if [ -f "stream_hot.c" ]; then
-        echo "Compiling stream_hot.c (18.0 GB worsened-latency)..."
-        gcc -O3 -fopenmp -mcmodel=medium $EXTRA_FLAGS stream_hot.c -o stream_hot
-    fi
-    # Compile multi-phase memory footprint variant
-    if [ -f "stream_phase.c" ]; then
-        echo "Compiling stream_phase.c (18.0 GB worsened-latency)..."
-        gcc -O3 -fopenmp -mcmodel=medium $EXTRA_FLAGS stream_phase.c -o stream_phase
-    fi
+    BUILT_DIRS+=("${WORKLOAD_DIR}/stream")
     echo -e "${GREEN}STREAM binaries compiled successfully!${NC}"
 }
 
@@ -136,11 +122,18 @@ setup_gapbs() {
 
     mkdir -p benchmark/out benchmark/graphs 2>/dev/null || true
 
-    # Build binaries and default graph datasets
-    echo "Building all GAPBS benchmark graphs into default directory (benchmark/graphs) via bench.mk..."
-    make -j${NUM_JOBS} bench-graphs || true
+    # Clean & rebuild binaries (preserves pre-generated benchmark/graphs/*.sg & *.wsg)
+    make clean
+    make -j${NUM_JOBS} all
 
-    echo -e "${GREEN}GAPBS workloads and all datasets setup successfully in default directory (benchmark/graphs)!${NC}"
+    # Build graph datasets if missing (or when explicitly requested)
+    if [ ! -f "benchmark/graphs/kron.sg" ] || [ ! -f "benchmark/graphs/urand.sg" ] || [ "${GAPBS_BUILD_GRAPHS:-0}" = "1" ]; then
+        echo "Building GAPBS benchmark graphs into benchmark/graphs via bench.mk..."
+        make -j${NUM_JOBS} bench-graphs || true
+    fi
+
+    BUILT_DIRS+=("${WORKLOAD_DIR}/gapbs")
+    echo -e "${GREEN}GAPBS workloads and datasets ready in ${WORKLOAD_DIR}/gapbs!${NC}"
 }
 
 # -------------------------------------------------------------------
@@ -213,6 +206,7 @@ EOF
 
     MODE=perf make -j${NUM_JOBS} CC="${CC_BIN}" CXX="${CXX_BIN}" dbtest
 
+    BUILT_DIRS+=("${WORKLOAD_DIR}/silo")
     echo -e "${GREEN}Silo DB binary compiled successfully!${NC}"
 }
 
@@ -240,6 +234,7 @@ setup_redis() {
 
     # Build core Redis server and benchmark binaries
     make build redis -j${NUM_JOBS} C_EXTRA_FLAGS="-Wno-error"
+    BUILT_DIRS+=("${WORKLOAD_DIR}/redis_src")
     echo -e "${GREEN}Redis binaries compiled successfully!${NC}"
 }
 
@@ -268,14 +263,107 @@ setup_xsbench() {
 
         make clean
         make -j${NUM_JOBS}
+        BUILT_DIRS+=("${WORKLOAD_DIR}/xsbench")
         echo -e "${GREEN}XSBench binary compiled successfully!${NC}"
     fi
+}
+
+# -------------------------------------------------------------------
+# SPEC CPU 2026: Clean and pre-build selected benchmarks
+# -------------------------------------------------------------------
+setup_spec2026() {
+    local targets=("$@")
+    echo ""
+    echo "-------------------------------------------------------------------"
+    echo " Cleaning & Pre-building SPEC CPU 2026 Benchmarks..."
+    echo "-------------------------------------------------------------------"
+
+    if [ ! -f "${SPEC2026_DIR}/shrc" ] || [ ! -f "${SPEC2026_DIR}/bin/harness/runcpu" ]; then
+        echo -e "${YELLOW}[WARNING] SPEC CPU 2026 not installed in ${SPEC2026_DIR}; skipping.${NC}"
+        return 1
+    fi
+    if [ ! -f "${SPEC_CONFIG}" ]; then
+        echo -e "${RED}ERROR: SPEC config not found at ${SPEC_CONFIG}${NC}"
+        return 1
+    fi
+
+    if [ ${#targets[@]} -eq 0 ] && [ -f "${REGRESSION_LIST}" ]; then
+        local b BENCHMARKS=()
+        # shellcheck source=/dev/null
+        source "${REGRESSION_LIST}"
+        for b in "${BENCHMARKS[@]}"; do
+            [[ "$b" == spec2026_* ]] && targets+=("$b")
+        done
+    fi
+    if [ ${#targets[@]} -eq 0 ]; then
+        targets=(820.cloverleaf_s 849.fotonik3d_s 865.roms_s 881.neutron_s)
+    fi
+
+    local spec_benches=() t bname
+    for t in "${targets[@]}"; do
+        bname="${t#spec2026_}"
+        if [ ! -d "${SPEC2026_DIR}/benchspec/CPU/${bname}" ]; then
+            echo -e "${RED}ERROR: Unknown SPEC CPU 2026 benchmark '${bname}'${NC}"
+            return 1
+        fi
+        spec_benches+=("${bname}")
+    done
+
+    echo "SPEC CPU 2026 targets: ${spec_benches[*]}"
+    # Wipe build/ and exe/ directly so leftover dirs from other users (e.g. non-root) are also cleaned
+    for bname in "${spec_benches[@]}"; do
+        rm -rf "${SPEC2026_DIR}/benchspec/CPU/${bname}/build" "${SPEC2026_DIR}/benchspec/CPU/${bname}/exe"
+        BUILT_DIRS+=("${SPEC2026_DIR}/benchspec/CPU/${bname}/build" "${SPEC2026_DIR}/benchspec/CPU/${bname}/exe")
+    done
+    BUILT_DIRS+=("${SPEC_CONFIG}" "${SPEC2026_DIR}/result")
+    (
+        cd "${SPEC2026_DIR}"
+        # shellcheck source=/dev/null
+        source shrc
+        runcpu --config="${SPEC_CONFIG}" --action=build "${spec_benches[@]}"
+    )
+    echo -e "${GREEN}SPEC CPU 2026 benchmarks pre-built successfully!${NC}"
+}
+
+# -------------------------------------------------------------------
+# Clean & pre-build benchmarks from CLI args or regression_list
+# -------------------------------------------------------------------
+prebuild_benchmarks() {
+    local items=("$@")
+    if [ ${#items[@]} -eq 0 ]; then
+        local BENCHMARKS=()
+        # shellcheck source=/dev/null
+        source "${REGRESSION_LIST}"
+        items=("${BENCHMARKS[@]}")
+    fi
+
+    local need_stream=0 need_gapbs=0 need_silo=0 need_redis=0 need_xsbench=0
+    local spec_targets=() item
+    for item in "${items[@]}"; do
+        case "$item" in
+            stream*)     need_stream=1 ;;
+            gapbs_*)     need_gapbs=1 ;;
+            silo_*)      need_silo=1 ;;
+            redis)       need_redis=1 ;;
+            xsbench)     need_xsbench=1 ;;
+            spec2026_*)  spec_targets+=("$item") ;;
+        esac
+    done
+
+    [ ${need_stream} -eq 1 ] && setup_stream
+    [ ${need_gapbs} -eq 1 ] && setup_gapbs
+    [ ${need_silo} -eq 1 ] && setup_silo
+    [ ${need_redis} -eq 1 ] && setup_redis
+    [ ${need_xsbench} -eq 1 ] && setup_xsbench
+    [ ${#spec_targets[@]} -gt 0 ] && setup_spec2026 "${spec_targets[@]}"
+    return 0
 }
 
 # -------------------------------------------------------------------
 # Target Dispatcher
 # -------------------------------------------------------------------
 TARGET_INPUT="${1:-all}"
+[ $# -gt 0 ] && shift
 
 case "$TARGET_INPUT" in
     stream)
@@ -293,6 +381,12 @@ case "$TARGET_INPUT" in
     xsbench)
         setup_xsbench
         ;;
+    spec2026)
+        setup_spec2026 "$@"
+        ;;
+    prebuild)
+        prebuild_benchmarks "$@"
+        ;;
     all)
         echo "=== Setting up ALL workloads in: ${WORKLOAD_DIR} ==="
         setup_stream
@@ -300,6 +394,9 @@ case "$TARGET_INPUT" in
         setup_silo
         setup_redis
         setup_xsbench
+        if [ -f "${SPEC2026_DIR}/shrc" ]; then
+            setup_spec2026 "$@"
+        fi
         echo ""
         echo "==================================================================="
         echo -e " ${GREEN}ALL WORKLOADS SETUP & COMPILED SUCCESSFULLY!${NC}"
@@ -314,8 +411,8 @@ case "$TARGET_INPUT" in
 esac
 
 # -------------------------------------------------------------------
-# Restore file ownership to invoking user if executed via sudo
+# Restore file ownership for rebuilt paths only if executed via sudo
 # -------------------------------------------------------------------
-if [ -n "${SUDO_USER:-}" ]; then
-    chown -R "${SUDO_USER}:${SUDO_USER}" "${WORKLOAD_DIR}" 2>/dev/null || true
+if [ -n "${SUDO_USER:-}" ] && [ ${#BUILT_DIRS[@]} -gt 0 ]; then
+    chown -R "${SUDO_USER}:${SUDO_USER}" "${BUILT_DIRS[@]}" 2>/dev/null || true
 fi

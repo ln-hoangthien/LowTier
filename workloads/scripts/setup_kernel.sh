@@ -10,6 +10,8 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="${ROOT_DIR:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
 KERNEL_VER="$(uname -r)"
+source "${SCRIPT_DIR}/common.sh"
+source "${SCRIPT_DIR}/cpu_config.sh"
 
 # Default parameter resolution
 THP_MODE="${THP_MODE:-madvise}"
@@ -22,24 +24,6 @@ PREFETCH_DEMOTE_DISTANCE="${PREFETCH_DEMOTE_DISTANCE:-2}"
 PREFETCH_MIN_DISTANCE="${PREFETCH_MIN_DISTANCE:-0}"
 PREFETCH_MAX_DISTANCE="${PREFETCH_MAX_DISTANCE:-12}"
 TARGET_EXE_NAME="${TARGET_EXE_NAME:-pr}"
-
-# ------------------------------------------------------------------------------
-# Helper: Print log message with optional tee to REGRESS_LOG_FILE
-# ------------------------------------------------------------------------------
-log_echo() {
-    echo -e "$@"
-    if [ -n "${REGRESS_LOG_FILE:-}" ]; then
-        echo -e "$@" >> "${REGRESS_LOG_FILE}"
-    fi
-}
-
-# ------------------------------------------------------------------------------
-# Helper: Safely read sysfs attribute file
-# ------------------------------------------------------------------------------
-read_sysfs() {
-    local file="$1"
-    [ -f "$file" ] && cat "$file" 2>/dev/null || echo ""
-}
 
 # ------------------------------------------------------------------------------
 # Helper: Write and verify kernel sysfs attribute
@@ -91,31 +75,66 @@ compute_memtis_node0_quota() {
 }
 
 # ------------------------------------------------------------------------------
+# Helper: Detect stuck kmigraterd spin loop (Memtis 5.15 LRU underflow bug)
+# ------------------------------------------------------------------------------
+is_kmigraterd_stuck() {
+    local pid st1 t1 st2 t2
+    for pid in $(pgrep -x 'kmigraterd[0-9]+' 2>/dev/null); do
+        read -r st1 t1 <<< "$(awk '{print $3, $14 + $15}' "/proc/${pid}/stat" 2>/dev/null || echo "S 0")"
+        [ "${st1}" = "R" ] || continue
+        sleep 1
+        read -r st2 t2 <<< "$(awk '{print $3, $14 + $15}' "/proc/${pid}/stat" 2>/dev/null || echo "S 0")"
+        [ "${st2}" = "R" ] && [ $(( t2 - t1 )) -ge 50 ] && return 0
+    done
+    return 1
+}
+
+# ------------------------------------------------------------------------------
 # Helper: Safely drain and reset Memtis workload cgroup
 # ------------------------------------------------------------------------------
 reset_memtis_cgroup() {
     local memtis_cgroup="/sys/fs/cgroup/memtis_workload"
-    [ -d "${memtis_cgroup}" ] || return 0
+    if [ -d "${memtis_cgroup}" ]; then
+        # Short-circuit in-flight demote_node() warm-page rescans before calling kthread_stop().
+        # Raise max_at_node0 to 512 GiB (never "max", which maps to PAGE_COUNTER_MAX != ULONG_MAX).
+        [ -f /sys/kernel/mm/htmm/htmm_nowarm ] && echo 1 > /sys/kernel/mm/htmm/htmm_nowarm 2>/dev/null || true
+        [ -f "${memtis_cgroup}/memory.max_at_node0" ] && echo 549755813888 > "${memtis_cgroup}/memory.max_at_node0" 2>/dev/null || true
 
-    # Disable HTMM first to restore kswapd and stop kmigraterd cleanly before migrating PIDs out
-    # Do not write "max" to memory.max_at_node0 (page_counter_memparse maps "max" to PAGE_COUNTER_MAX != ULONG_MAX, triggering __GFP_THISNODE OOMs)
-    [ -f "${memtis_cgroup}/memory.htmm_enabled" ] && echo "disabled" > "${memtis_cgroup}/memory.htmm_enabled" 2>/dev/null || true
-    if [ -f "${memtis_cgroup}/cgroup.procs" ]; then
-        for pid in $(cat "${memtis_cgroup}/cgroup.procs" 2>/dev/null); do
-            echo "$pid" > /sys/fs/cgroup/cgroup.procs 2>/dev/null || true
-        done
+        if [ -f "${memtis_cgroup}/cgroup.procs" ]; then
+            for pid in $(cat "${memtis_cgroup}/cgroup.procs" 2>/dev/null); do
+                echo "$pid" > /sys/fs/cgroup/cgroup.procs 2>/dev/null || true
+            done
+        fi
+        sleep 0.5
+
+        if is_kmigraterd_stuck; then
+            log_echo "\033[1;33m[WARNING] kmigraterd is stuck spinning (Memtis LRU underflow); skipping htmm_enabled=disabled and scheduling clean reboot.\033[0m"
+            touch /run/lowtier_need_reboot 2>/dev/null || true
+        elif [ -f "${memtis_cgroup}/memory.htmm_enabled" ]; then
+            ( echo "disabled" > "${memtis_cgroup}/memory.htmm_enabled" ) </dev/null >/dev/null 2>&1 &
+            local dis_pid=$!
+            for _ in {1..20}; do
+                kill -0 "${dis_pid}" 2>/dev/null || break
+                sleep 0.5
+            done
+            if kill -0 "${dis_pid}" 2>/dev/null; then
+                log_echo "\033[1;33m[WARNING] memory.htmm_enabled=disabled stalled >10s (kthread_stop); scheduling clean reboot.\033[0m"
+                touch /run/lowtier_need_reboot 2>/dev/null || true
+            fi
+        fi
+
+        rmdir "${memtis_cgroup}" 2>/dev/null || true
     fi
-    rmdir "${memtis_cgroup}" 2>/dev/null || true
+    [ -f /sys/kernel/mm/htmm/htmm_nowarm ] && echo 0 > /sys/kernel/mm/htmm/htmm_nowarm 2>/dev/null || true
 }
 
 # ------------------------------------------------------------------------------
-# Helper: Stop Memtis ksamplingd and disable HTMM migration mode
+# Helper: Stop Memtis ksamplingd daemon (syscall 450)
 # ------------------------------------------------------------------------------
 stop_memtis_ksamplingd() {
     if pgrep -x ksamplingd >/dev/null 2>&1; then
         python3 -c "import ctypes; ctypes.CDLL(None).syscall(450, -1)" 2>/dev/null || true
     fi
-    [ -f /sys/kernel/mm/htmm/htmm_mode ] && echo 0 > /sys/kernel/mm/htmm/htmm_mode 2>/dev/null || true
 }
 
 # ------------------------------------------------------------------------------
@@ -368,6 +387,8 @@ configure_kernel() {
     # AutoNUMA / Generic Setup
     # ------------------------------------
     elif [[ "${KERNEL_VER,,}" =~ generic || "${KERNEL_VER,,}" =~ autonuma ]]; then
+        ensure_module_loaded "tierinit" "${ROOT_DIR}/baselines/autonuma" "tierinit" "AutoNUMA" || true
+
         log_echo "[*] Activating AutoNUMA + Tiered Balancing (mode 3) and demotion..."
         sysctl -w kernel.numa_balancing=3 >/dev/null 2>&1 || sysctl -w kernel.numa_balancing=2 >/dev/null 2>&1 || sysctl -w kernel.numa_balancing=1 >/dev/null 2>&1 || true
         echo true > /sys/kernel/mm/numa/demotion_enabled 2>/dev/null || true
@@ -410,14 +431,16 @@ configure_kernel() {
         cur_min="$(read_sysfs "${prefetch_sysfs}/min_distance")"
         cur_max="$(read_sysfs "${prefetch_sysfs}/max_distance")"
 
-        local engine_str="$([ "$cur_naive" == "1" ] && echo "naive" || echo "deep-tune")"
+        local engine_str="deep-tune"
+        [ "$cur_naive" == "1" ] && engine_str="naive"
         if [ "$cur_en" == "0" ]; then
             log_echo "[*] Migration Prefetch Online Parameters (${prefetch_sysfs}): enabled=0 (disabled), hint=${cur_hint:-0}"
         elif [ -f "${prefetch_sysfs}/promote_distance" ]; then
             local extra_info=""
             [ -n "$cur_min" ] && extra_info+=", min_dist=${cur_min}"
             [ -n "$cur_max" ] && extra_info+=", max_dist=${cur_max}"
-            local mode_str="$([ "$cur_adap" == "1" ] && echo "adaptive" || echo "static")"
+            local mode_str="static"
+            [ "$cur_adap" == "1" ] && mode_str="adaptive"
             local tier_info=" (engine=${engine_str}, promote=${cur_prom:-$PREFETCH_PROMOTE_DISTANCE}, demote=${cur_dem:-$PREFETCH_DEMOTE_DISTANCE}, mode=${mode_str}${extra_info})"
             log_echo "[*] Migration Prefetch Online Parameters (${prefetch_sysfs}): enabled=${cur_en}${tier_info}, hint=${cur_hint:-0}"
         else
@@ -487,10 +510,9 @@ autotie_start() {
         local mon_bin="${ROOT_DIR}/baselines/tier-prefetch-mon/tier-prefetch-mon"
         local prefetch_mon_log="${TARGET_DIR:-/tmp}/prefetch_mon_${FILENAME_SUFFIX:-run}.log"
         if [ "${PREFETCH_ENABLED:-1}" != "0" ] && [ "${PREFETCH_ADAPTIVE:-1}" == "1" ] && [ -x "${mon_bin}" ]; then
-            local mon_cpu_mask="${CPU_MASK:-0xffffff}"
             local mon_interval_ms="${PREFETCH_MON_INTERVAL_MS:-50}"
-            log_echo "[+] Starting tier-prefetch-mon daemon immediately for ${KERNEL_VER} (cpu_mask=${mon_cpu_mask}, interval=${mon_interval_ms}ms, cpu=31)..."
-            taskset -c 31 "${mon_bin}" --daemon --interval-ms "${mon_interval_ms}" --cpu-mask "${mon_cpu_mask}" > "${prefetch_mon_log}" 2>&1 &
+            log_echo "[+] Starting tier-prefetch-mon daemon immediately for ${KERNEL_VER} (cpu_mask=${WORKLOAD_CPU_MASK}, interval=${mon_interval_ms}ms, cpu=${PREFETCH_MON_CPU})..."
+            taskset -c "${PREFETCH_MON_CPU}" "${mon_bin}" --daemon --interval-ms "${mon_interval_ms}" --cpu-mask "${WORKLOAD_CPU_MASK}" > "${prefetch_mon_log}" 2>&1 &
             echo $! > /tmp/tier_prefetch_mon.pid
         fi
     fi
@@ -503,46 +525,92 @@ autotie_start() {
     if [ ${need_pact} -eq 1 ]; then
         local pact_log_file="${TARGET_DIR:-/tmp}/pact_${FILENAME_SUFFIX:-run}.log"
         local pact_margin="${PACT_DEMOTION_MARGIN:-25000}"
+        local is_multi_pid=0
+        local spec_pgrep_pat="_base\\."
+        if [ "${target_exe}" = "runcpu" ] || [ "${target_exe}" = "specperl" ]; then
+            is_multi_pid=1
+        elif [[ "${target_exe}" == *_base.* ]]; then
+            is_multi_pid=1
+            spec_pgrep_pat="${target_exe}"
+        fi
+        : > "${pact_log_file}"
 
         (
-            local target_pid=""
-            local max_attempts=150 # up to 30 seconds for process spawn
-            for attempt in $(seq 1 ${max_attempts}); do
-                if [ "${target_exe}" = "run_redis.sh" ] || [ "${target_exe}" = "redis-server" ]; then
-                    target_pid=$(pgrep -n -x redis-server 2>/dev/null || true)
-                elif [ "${target_exe}" = "runcpu" ] || [ "${target_exe}" = "specperl" ]; then
-                    target_pid=$(pgrep -n -f "_base\." 2>/dev/null || true)
-                elif [ -n "${target_exe}" ] && [ "${target_exe}" != "*" ]; then
-                    target_pid=$(pgrep -n -x "${target_exe}" 2>/dev/null || true)
+            local last_attached_pid=""
+            local attached_any=0
+
+            while true; do
+                local target_pid=""
+                local attempts=0
+                local max_attempts=150 # up to 30 seconds for single-process spawn
+
+                while true; do
+                    if [ "${target_exe}" = "run_redis.sh" ] || [ "${target_exe}" = "redis-server" ]; then
+                        target_pid=$(pgrep -n -x redis-server 2>/dev/null || true)
+                    elif [ ${is_multi_pid} -eq 1 ]; then
+                        target_pid=$(pgrep -n -f "${spec_pgrep_pat}" 2>/dev/null || true)
+                    elif [ -n "${target_exe}" ] && [ "${target_exe}" != "*" ]; then
+                        target_pid=$(pgrep -n -x "${target_exe}" 2>/dev/null || true)
+                    fi
+
+                    if [ -n "${target_pid}" ] && [ "${target_pid}" != "${last_attached_pid}" ]; then
+                        break
+                    fi
+
+                    if [ ${is_multi_pid} -eq 0 ]; then
+                        attempts=$((attempts + 1))
+                        [ ${attempts} -ge ${max_attempts} ] && break
+                    fi
+                    sleep 0.2
+                done
+
+                if [ -z "${target_pid}" ] || [ "${target_pid}" = "${last_attached_pid}" ]; then
+                    if [ ${attached_any} -eq 0 ]; then
+                        echo -e "\033[1;31m[!] WARNING: PACT attacher could not find running workload '${target_exe}'!\033[0m" >&2
+                    fi
+                    break
                 fi
-                [ -n "${target_pid}" ] && break
-                sleep 0.2
+
+                # Brief settle matching original run-pact.sh (sleep 2) so the process completes exec
+                # and initial first-touch overflow before PACT toggles demotion_enabled online.
+                sleep 2
+
+                # For SPEC multi-invocation wrappers, refresh to the newest child in case we woke on a launcher shell
+                if [ ${is_multi_pid} -eq 1 ]; then
+                    local newer_pid=$(pgrep -n -f "${spec_pgrep_pat}" 2>/dev/null || true)
+                    if [ -n "${newer_pid}" ] && [ "${newer_pid}" != "${last_attached_pid}" ]; then
+                        target_pid="${newer_pid}"
+                    fi
+                fi
+
+                if kill -0 "${target_pid}" 2>/dev/null; then
+                    last_attached_pid="${target_pid}"
+                    attached_any=1
+                    echo "[+] PACT daemon attaching immediately to PID ${target_pid} (demotion_margin=${pact_margin})..."
+
+                    # Temporarily expand Thread 0's affinity so PACT discovers all workload cores at startup, then restore
+                    local orig_mask=$(taskset -p "${target_pid}" 2>/dev/null | awk '{print $NF}')
+                    taskset -p -c "${WORKLOAD_CPU_RANGE}" "${target_pid}" >/dev/null 2>&1 || true
+
+                    "${pact_bin}" --workload "${target_pid}" --monitor-cpu "${PACT_MONITOR_CPU}" --migration-cpu "${PACT_MIGRATION_CPU}" --demotion-margin "${pact_margin}" --log-level 2 >> "${pact_log_file}" 2>&1 &
+                    local actual_pact_pid=$!
+                    echo "${actual_pact_pid}" > "${pact_actual_pid_file}"
+
+                    ( sleep 0.5; [ -n "${orig_mask}" ] && taskset -p "${orig_mask}" "${target_pid}" >/dev/null 2>&1 || true ) &
+                    wait "${actual_pact_pid}"
+                    rm -f "${pact_actual_pid_file}"
+
+                    if [ ${is_multi_pid} -eq 1 ]; then
+                        echo false > /sys/kernel/mm/numa/demotion_enabled 2>/dev/null || true
+                    fi
+                fi
+
+                [ ${is_multi_pid} -eq 0 ] && break
             done
-
-            # Brief settle matching original run-pact.sh (sleep 2) so the process completes exec
-            # and initial first-touch overflow before PACT toggles demotion_enabled online.
-            sleep 2
-
-            if [ -n "${target_pid}" ] && kill -0 "${target_pid}" 2>/dev/null; then
-                echo "[+] PACT daemon attaching immediately to PID ${target_pid} (demotion_margin=${pact_margin})..."
-
-                # Temporarily expand Thread 0's affinity so PACT discovers all cores at startup, then restore
-                local orig_mask=$(taskset -p "${target_pid}" 2>/dev/null | awk '{print $NF}')
-                taskset -p -c "${SELECTED_CPUS:-0-23}" "${target_pid}" >/dev/null 2>&1 || true
-
-                "${pact_bin}" --workload "${target_pid}" --monitor-cpu 30 --migration-cpu 29 --demotion-margin "${pact_margin}" --log-level 2 > "${pact_log_file}" 2>&1 &
-                local actual_pact_pid=$!
-                echo "${actual_pact_pid}" > "${pact_actual_pid_file}"
-
-                ( sleep 0.5; [ -n "${orig_mask}" ] && taskset -p "${orig_mask}" "${target_pid}" >/dev/null 2>&1 || true ) &
-                wait "${actual_pact_pid}"
-            else
-                echo -e "\033[1;31m[!] WARNING: PACT attacher could not find running workload '${target_exe}'!\033[0m" >&2
-            fi
         ) &
         local watcher_pid=$!
         echo "${watcher_pid}" > "${pact_watcher_pid_file}"
-        log_echo "[+] PACT PID attacher started (PID ${watcher_pid})."
+        log_echo "[+] PACT PID attacher started (PID ${watcher_pid}, multi_pid=${is_multi_pid})."
     fi
 }
 
@@ -566,8 +634,14 @@ autotie_stop() {
 
     local pact_actual_pid_file="/tmp/pact_actual_pid"
     local pact_watcher_pid_file="/tmp/pact_watcher_pid"
-    local actual_pact_pid=$(cat "${pact_actual_pid_file}" 2>/dev/null || true)
 
+    # Stop watcher first so a multi-PID loop cannot spawn a new PACT during teardown
+    local watcher_pid=$(cat "${pact_watcher_pid_file}" 2>/dev/null || true)
+    if [ -n "${watcher_pid}" ]; then
+        kill -9 "${watcher_pid}" 2>/dev/null || true
+    fi
+
+    local actual_pact_pid=$(cat "${pact_actual_pid_file}" 2>/dev/null || true)
     if [ -n "${actual_pact_pid}" ] && kill -0 "${actual_pact_pid}" 2>/dev/null; then
         log_echo "[*] Waiting for PACT daemon (PID ${actual_pact_pid}) to finalize..."
         for i in {1..20}; do
@@ -575,11 +649,6 @@ autotie_stop() {
             sleep 0.1
         done
         stop_pid_gracefully "${actual_pact_pid}" 0.5
-    fi
-
-    local watcher_pid=$(cat "${pact_watcher_pid_file}" 2>/dev/null || true)
-    if [ -n "${watcher_pid}" ]; then
-        kill -9 "${watcher_pid}" 2>/dev/null || true
     fi
     rm -f "${pact_actual_pid_file}" "${pact_watcher_pid_file}"
 
@@ -589,8 +658,11 @@ autotie_stop() {
     fi
 
     if [[ "${KERNEL_VER,,}" =~ memtis|htmm ]]; then
+        # 1) Stop ksamplingd first while htmm_mode=2 (fast 2ms exit, stops lru_lock/cooling churn)
+        # 2) Stop kmigraterd before setting htmm_mode=0 (avoids promote_node() HTMM_NO_MIG uninitialized-tmp bug)
         stop_memtis_ksamplingd
         reset_memtis_cgroup
+        [ -f /sys/kernel/mm/htmm/htmm_mode ] && echo 0 > /sys/kernel/mm/htmm/htmm_mode 2>/dev/null || true
     elif [[ "${KERNEL_VER,,}" =~ pact ]]; then
         echo false > /sys/kernel/mm/numa/demotion_enabled 2>/dev/null || true
     elif [[ ! "${KERNEL_VER,,}" =~ hybridtier ]]; then
@@ -599,18 +671,22 @@ autotie_stop() {
 }
 
 # ------------------------------------------------------------------------------
-# Baseline Autotie: Wrap workload command with required preload environment
+# Baseline Autotie: Wrap workload command with stack limit & preload environment
 # ------------------------------------------------------------------------------
 autotie_wrap() {
     shift
+    local prefix=""
+    if command -v prlimit >/dev/null 2>&1; then
+        prefix="prlimit --stack=unlimited -- "
+    fi
     if [[ "${KERNEL_VER,,}" =~ hybridtier ]]; then
         local hybrid_hook="$(get_hybridtier_hook)"
         if [ -f "${hybrid_hook}" ]; then
-            echo "env LD_PRELOAD=\"${hybrid_hook}\${LD_PRELOAD:+:\$LD_PRELOAD}\" TARGET_EXE_NAME=\"${TARGET_EXE_NAME}\" $*"
+            echo "${prefix}env LD_PRELOAD=\"${hybrid_hook}\${LD_PRELOAD:+:\$LD_PRELOAD}\" TARGET_EXE_NAME=\"${TARGET_EXE_NAME}\" $*"
             return 0
         fi
     fi
-    echo "$*"
+    echo "${prefix}$*"
 }
 
 # ------------------------------------------------------------------------------

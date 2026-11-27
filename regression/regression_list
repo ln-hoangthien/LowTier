@@ -4,9 +4,10 @@
 
 # Tier ratios (Fast:Slow relative to RSS)
 TIER_RATIOS=(
+    1:16
     1:8
-    # 1:4
-    1:2
+    1:4
+    # 1:2
     # 1:1
     #2:1
     #4:1
@@ -41,7 +42,7 @@ PREFETCH_BOUNDS=(
 # 1 = Adaptive distance enabled (scales distance dynamically based on Little's Law)
 # Uncomment / comment to select which condition(s) to evaluate:
 PREFETCH_ADAPTIVE_MODES=(
-    0    # Non-adaptive (Static)
+    # 0    # Non-adaptive (Static)
     1    # Adaptive
 )
 
@@ -54,7 +55,7 @@ PREFETCH_ADAPTIVE_MODES=(
 PREFETCH_HINTS=(
     0
     # 1
-    2
+    # 2
     # 3
 )
 
@@ -63,7 +64,7 @@ PREFETCH_HINTS=(
 # 1 = Naive prefetch (Only prefetch 'distance' cachelines ahead)
 # Uncomment / comment to select which engine mode(s) to evaluate:
 PREFETCH_NAIVE_MODES=(
-    0    # Deep-tune
+    # 0    # Deep-tune
     1    # Naive
 )
 
@@ -83,43 +84,62 @@ THP_MODES=(
 )
 
 # Benchmarks to evaluate
-# GAPBS benchmarks are grouped by graph file so algorithms sharing the same graph
-# and memmap (e.g., pr/bfs/bc/cc on kron.sg) reuse a single Node 1 vmtouch preload.
+# Grouped by RSS / memmap tier (and by shared GAPBS graph file) to minimize
+# kernel reboots while reusing Node 1 vmtouch preloads across shared graphs.
+# Ordering: 18-22 GiB (4G/5G/7G) -> 49 GiB (6G/8G/13G) -> 34-36 GiB (5G/7G/10G)
+# Putting 34-36 GiB last bridges 1:16->1:8 at 5G and 1:8->1:4 at 7G with 0 reboots
+# (7 boots/kernel = theoretical minimum of 1 boot per distinct memmap).
 BENCHMARKS=(
     ## -----------------------------
-    ## GAPBS — kron.sg (shared graph)
+    ## 18-22 GiB Tier (4G @ 1:16 | 5G @ 1:8 | 7G @ 1:4)
     ## -----------------------------
+    # GAPBS — kron.sg (shared graph, 18 GiB)
     gapbs_pr_kron
-    gapbs_bfs_kron
+    #gapbs_bfs_kron
     gapbs_bc_kron
     gapbs_cc_kron
 
-    ## -----------------------------
-    ## GAPBS — urand.sg (shared graph)
-    ## -----------------------------
+    # GAPBS — urand.sg (shared graph, 18-20 GiB)
     gapbs_pr_urand
-    gapbs_bfs_urand
+    #gapbs_bfs_urand
     gapbs_cc_urand
     gapbs_bc_urand
 
-    ## -----------------------------
-    ## GAPBS — twitter.sg (shared graph)
-    ## -----------------------------
-    gapbs_pr_twitter
-    gapbs_bfs_twitter
-    gapbs_bc_twitter
-    gapbs_cc_twitter
+    # GAPBS — twitter.sg (12 GiB, disabled)
+    #gapbs_pr_twitter
+    #gapbs_bfs_twitter
+    #gapbs_bc_twitter
+    #gapbs_cc_twitter
+
+    # Silo / Redis / XSBench
+    silo_tpcc
+    #silo_ycsb
+    ##silo_queue
+    ##silo_bid
+    ##silo_encstress
+    #redis
+    #xsbench
+
+    # SPEC CPU 2026 — 22 GiB (865 snapped from 23 GiB to share memmap)
+    spec2026_820.cloverleaf_s
+    spec2026_865.roms_s
 
     ## -----------------------------
-    ## GAPBS — TC (*U.sg) & SSSP (*.wsg)
+    ## 49 GiB Tier (6G @ 1:16 | 8G @ 1:8 | 13G @ 1:4)
     ## -----------------------------
-    gapbs_tc_kron
-    gapbs_tc_urand
-    gapbs_tc_twitter
+    spec2026_849.fotonik3d_s
+    spec2026_881.neutron_s
 
+    ## -----------------------------
+    ## 34-36 GiB Tier (5G @ 1:16 | 7G @ 1:8 | 10G @ 1:4)
+    ## Placed last to bridge ratio transitions (5G->5G, 7G->7G) without rebooting
+    ## -----------------------------
     gapbs_sssp_kron
     gapbs_sssp_urand
-    gapbs_sssp_twitter
+    #gapbs_sssp_twitter
+    #gapbs_tc_kron
+    #gapbs_tc_urand
+    #gapbs_tc_twitter
 
     ## GAPBS — web / road (disabled)
     ##gapbs_pr_web
@@ -136,32 +156,8 @@ BENCHMARKS=(
     #gapbs_sssp_road
 
     ## -----------------------------
-
+    ## Other SPEC CPU 2026 (disabled)
     ## -----------------------------
-    ## Silo
-    ## -----------------------------
-    silo_tpcc
-    silo_ycsb
-    ##silo_queue
-    ##silo_bid
-    ##silo_encstress
-    ## -----------------------------
-
-    ## -----------------------------
-    ## Redis
-    ## -----------------------------
-    redis
-    ## -----------------------------
-
-    ## -----------------------------
-    ## XSBench
-    ## -----------------------------
-    xsbench
-    ## -----------------------------
-
-    # -----------------------------
-    # SPEC CPU 2026
-    # -----------------------------
     #spec2026_706.stockfish_r
     #spec2026_707.ntest_r
     #spec2026_708.sqlite_r
@@ -196,7 +192,6 @@ BENCHMARKS=(
     #spec2026_811.tealeaf_s
     #spec2026_816.nab_s
     #spec2026_817.flac_s
-    # spec2026_820.cloverleaf_s
     #spec2026_821.gcc_s
     #spec2026_822.palm_s
     #spec2026_823.llvm_s
@@ -204,17 +199,13 @@ BENCHMARKS=(
     #spec2026_829.abc_s
     #spec2026_834.vpr_s
     #spec2026_835.gem5_s
-    # spec2026_838.diamond_s
+    #spec2026_838.diamond_s
     #spec2026_846.minizinc_s
-    # spec2026_849.fotonik3d_s
     #spec2026_853.ns3_s
-    # spec2026_854.graph500_s
+    #spec2026_854.graph500_s
     #spec2026_857.namd_s
-    # spec2026_865.roms_s
     #spec2026_867.nest_s
     #spec2026_872.marian_s
-    # spec2026_881.neutron_s
-    # -----------------------------
 )
 
 # Baseline kernels to evaluate
@@ -227,14 +218,14 @@ KERNELS=(
     autonuma-prefetch
     nomad
     nomad-prefetch
-    nomad-alto
-    nomad-alto-prefetch
+    # nomad-alto
+    # nomad-alto-prefetch
     hybridtier
     hybridtier-prefetch
     colloid-tpp
     colloid-tpp-prefetch
-    colloid-tpp-alto
-    colloid-tpp-alto-prefetch
+    # colloid-tpp-alto
+    # colloid-tpp-alto-prefetch
     tpp
     tpp-prefetch
 )

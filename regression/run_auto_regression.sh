@@ -24,6 +24,8 @@ SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}"
 LOG_FILE="${SCRIPT_DIR}/auto_regression_orchestrator.log"
 RERUN_LOG_FILE="${SCRIPT_DIR}/failed_reruns.sh"
 RUN_WORKLOADS="${ROOT_DIR}/workloads/scripts/run_workloads.sh"
+SETUP_WORKLOADS="${ROOT_DIR}/workloads/scripts/setup_workloads.sh"
+SETUP_MACHINE="${ROOT_DIR}/workloads/scripts/setup_machine.sh"
 
 # Formatting Colors
 RED='\033[0;31m'
@@ -63,6 +65,10 @@ ensure_cpus_online() {
     for cpu in /sys/devices/system/cpu/cpu[0-9]*/online; do
         [ -f "$cpu" ] && echo 1 > "$cpu" 2>/dev/null || true
     done
+}
+
+restore_machine() {
+    bash "$SETUP_MACHINE" --restore 2>/dev/null || ensure_cpus_online
 }
 
 # ------------------------------------------------------------------------------
@@ -401,7 +407,6 @@ switch_kernel_and_reboot() {
     log "${BLUE} Switching to: '${target_kernel}' with ${target_memmap} ${NC}"
     log "${BLUE}================================================================================${NC}"
 
-    ensure_cpus_online
     local MANAGE_KERNELS="${ROOT_DIR}/baselines/scripts/manage_kernels.sh"
     if is_kernel_installed "$target_kernel"; then
         log "${GREEN}[*] Kernel '${target_kernel}' found in /boot. Updating GRUB default...${NC}"
@@ -411,6 +416,7 @@ switch_kernel_and_reboot() {
         bash "$MANAGE_KERNELS" "$target_kernel" install --memmap "$target_memmap" --reboot
     else
         log "${YELLOW}[!] Source/binary for '${target_kernel}' not built. Compiling and installing...${NC}"
+        ensure_cpus_online
         bash "$MANAGE_KERNELS" "$target_kernel" build --memmap "$target_memmap" --reboot
     fi
 
@@ -436,9 +442,9 @@ record_failed_rerun() {
         chmod +x "$RERUN_LOG_FILE"
     fi
 
-    local env_vars="TIER_RATIO='${ratio}' THP_MODE='${thp}' THP='${thp}'"
+    local env_vars="TIER_RATIO='${ratio}' THP_MODE='${thp}'"
     if is_prefetch_kernel "$kernel"; then
-        env_vars+=" PREFETCH_PROMOTE_DISTANCE='${dist}' PREFETCH_DEMOTE_DISTANCE='${dist}' PREFETCH_DISTANCE='${dist}' PREFETCH_MIN_DISTANCE='${bound}' PREFETCH_MAX_DISTANCE='${bound}' PREFETCH_ADAPTIVE='${adaptive}' PREFETCH_HINT='${hint}' PREFETCH_NAIVE='${naive}'"
+        env_vars+=" PREFETCH_PROMOTE_DISTANCE='${dist}' PREFETCH_DEMOTE_DISTANCE='${dist}' PREFETCH_MIN_DISTANCE='${bound}' PREFETCH_ADAPTIVE='${adaptive}' PREFETCH_HINT='${hint}' PREFETCH_NAIVE='${naive}'"
     fi
 
     {
@@ -455,20 +461,28 @@ record_failed_rerun() {
 # Execute workload with inline prefetch, ratio, and THP environment options
 # ------------------------------------------------------------------------------
 run_target_benchmark() {
-    local bench="$1" ratio="${2:-}" dist="${3:-}" adaptive="${4:-}" bound="${5:-}" thp="${6:-}" hint="${7:-0}" naive="${8:-0}"
+    local bench="$1" ratio="${2:-}" dist="${3:-}" adaptive="${4:-}" bound="${5:-}" thp="${6:-}" hint="${7:-0}" naive="${8:-0}" extra_flag="${9:-}"
 
+    KEEP_MACHINE_CONFIG=1 \
     TIER_RATIO="${ratio}" \
     THP_MODE="${thp}" \
-    THP="${thp}" \
     PREFETCH_PROMOTE_DISTANCE="${dist}" \
     PREFETCH_DEMOTE_DISTANCE="${dist}" \
-    PREFETCH_DISTANCE="${dist}" \
     PREFETCH_MIN_DISTANCE="${bound}" \
-    PREFETCH_MAX_DISTANCE="${bound}" \
     PREFETCH_ADAPTIVE="${adaptive}" \
     PREFETCH_HINT="${hint}" \
     PREFETCH_NAIVE="${naive}" \
-    bash "$RUN_WORKLOADS" "$bench"
+    bash "$RUN_WORKLOADS" ${extra_flag:+"$extra_flag"} "$bench"
+}
+
+# ------------------------------------------------------------------------------
+# Persist regression execution state to disk
+# ------------------------------------------------------------------------------
+save_state() {
+    local idx="$1" last_exec="${2:-}" exec_attempts="${3:-0}"
+    printf "CURRENT_INDEX=%s\nSTARTED_TIME=%s\nLAST_EXEC_INDEX=%s\nEXEC_ATTEMPTS=%s\n" \
+        "$idx" "${STARTED_TIME:-$(date +%s)}" "$last_exec" "$exec_attempts" > "$STATE_FILE"
+    sync
 }
 
 # ------------------------------------------------------------------------------
@@ -483,6 +497,8 @@ execute_step() {
     source "$STATE_FILE"
     local total="${#TARGET_ITEMS[@]}"
     local start_idx="${CURRENT_INDEX:-0}"
+    local steps_run_this_boot=0
+    trap 'trap - INT TERM; restore_machine; exit 130' INT TERM
 
     for ((idx = start_idx; idx < total; idx++)); do
         IFS='|' read -r CURRENT_KERNEL CURRENT_BENCHMARK CURRENT_RATIO CURRENT_DIST CURRENT_ADAPTIVE CURRENT_BOUND CURRENT_THP CURRENT_HINT CURRENT_NAIVE <<< "${TARGET_ITEMS[$idx]}"
@@ -511,6 +527,7 @@ execute_step() {
             echo "REBOOT_ATTEMPTS=${attempts}" >> "$STATE_FILE"
 
             log "${YELLOW}[!] Current system does not match target '${CURRENT_KERNEL}' or ${CURRENT_MEMMAP} (Attempt ${attempts}/3).${NC}"
+            trap - INT TERM
             switch_kernel_and_reboot "$CURRENT_KERNEL" "$CURRENT_MEMMAP"
             return 0
         fi
@@ -520,23 +537,55 @@ execute_step() {
         LAST_REBOOT_MEMMAP=""
         REBOOT_ATTEMPTS=0
 
-        # Reboot once if >2 GiB of Node 0 memory is still occupied after prior runs (prevents intra-boot leaks)
-        if [ "${DRIFT_REBOOT_INDEX:-}" != "${idx}" ] && [ -f /sys/devices/system/node/node0/meminfo ]; then
-            local n0_total_kb=$(awk '$3 == "MemTotal:" {print $4}' /sys/devices/system/node/node0/meminfo 2>/dev/null || echo 0)
-            local n0_free_kb=$(awk '$3 == "MemFree:" {print $4}' /sys/devices/system/node/node0/meminfo 2>/dev/null || echo 0)
-            if [ "${n0_total_kb}" -gt 0 ] && [ $(( n0_total_kb - n0_free_kb )) -gt 2097152 ]; then
-                log "${YELLOW}[!] Node 0 memory drift detected ($(( (n0_total_kb - n0_free_kb) / 1024 )) MiB used > 2048 MiB). Rebooting for clean headroom...${NC}"
-                printf "CURRENT_INDEX=%s\nSTARTED_TIME=%s\nDRIFT_REBOOT_INDEX=%s\nLAST_EXEC_INDEX=%s\nEXEC_ATTEMPTS=%s\n" \
-                    "$idx" "${STARTED_TIME:-$(date +%s)}" "$idx" "${LAST_EXEC_INDEX:-}" "${EXEC_ATTEMPTS:-0}" > "$STATE_FILE"
-                sync && sleep 2 && reboot
-                return 0
+        # Reboot cleanly before next step if a daemon reset was requested or unreclaimable Node 0
+        # memory drifted above 3 GiB after a prior benchmark in this boot (never on a fresh boot)
+        local reboot_reason=""
+        if [ -f /run/lowtier_need_reboot ]; then
+            rm -f /run/lowtier_need_reboot
+            reboot_reason="Kernel daemon reset requested (/run/lowtier_need_reboot). Rebooting for clean state..."
+        elif [ "${steps_run_this_boot}" -gt 0 ] && [ -f /sys/devices/system/node/node0/meminfo ]; then
+            local n0_unreclaim_kb
+            n0_unreclaim_kb=$(awk '
+                $3 == "MemTotal:"     { t = $4 }
+                $3 == "MemFree:"      { f = $4 }
+                $3 == "FilePages:"    { fp = $4 }
+                $3 == "SReclaimable:" { sr = $4 }
+                END { u = t - f - fp - sr; print (t > 0 && u > 0) ? u : 0 }
+            ' /sys/devices/system/node/node0/meminfo 2>/dev/null || echo 0)
+            if [ "${n0_unreclaim_kb}" -gt 3145728 ]; then
+                reboot_reason="Node 0 memory drift detected ($(( n0_unreclaim_kb / 1024 )) MiB unreclaimable > 3072 MiB). Rebooting for clean headroom..."
             fi
+        fi
+        if [ -n "${reboot_reason}" ]; then
+            log "${YELLOW}[!] ${reboot_reason}${NC}"
+            save_state "$idx" "${LAST_EXEC_INDEX:-}" "${EXEC_ATTEMPTS:-0}"
+            trap - INT TERM
+            sleep 2 && reboot
+            return 0
         fi
 
         # Crash-loop skip guard: track mid-benchmark panics/reboots per step
         local max_exec_attempts="${MAX_EXEC_ATTEMPTS:-3}"
         local last_exec_idx="${LAST_EXEC_INDEX:-}"
         local exec_attempts="${EXEC_ATTEMPTS:-0}"
+
+        # If a prior attempt already wrote a completed log before a teardown panic/reboot,
+        # preserve it and advance instead of overwriting/retrying it.
+        if [ "${last_exec_idx}" == "${idx}" ]; then
+            local prev_log
+            prev_log=$(run_target_benchmark "$CURRENT_BENCHMARK" "$CURRENT_RATIO" "$CURRENT_DIST" "$CURRENT_ADAPTIVE" "${CURRENT_BOUND:-}" "${CURRENT_THP:-}" "${CURRENT_HINT}" "${CURRENT_NAIVE}" --get-log-path 2>/dev/null || true)
+            if [ -n "${prev_log}" ] && [ -f "${prev_log}" ] && \
+               [ "$(stat -c %Y "${prev_log}" 2>/dev/null || echo 0)" -ge "${STARTED_TIME:-0}" ] && \
+               grep -qF "[+] Workload completed (status=0)." "${prev_log}" 2>/dev/null; then
+                log "${GREEN}[+] Step $((idx + 1))/${total} already completed before teardown reboot (${prev_log}); advancing.${NC}"
+                CURRENT_INDEX=$((idx + 1))
+                LAST_EXEC_INDEX=""
+                EXEC_ATTEMPTS=0
+                save_state "${CURRENT_INDEX}" "" 0
+                continue
+            fi
+        fi
+
         if [ "${last_exec_idx}" == "${idx}" ]; then
             exec_attempts=$((exec_attempts + 1))
         else
@@ -550,26 +599,14 @@ execute_step() {
             CURRENT_INDEX=$((idx + 1))
             LAST_EXEC_INDEX=""
             EXEC_ATTEMPTS=0
-            {
-                echo "CURRENT_INDEX=${CURRENT_INDEX}"
-                echo "STARTED_TIME=${STARTED_TIME:-$(date +%s)}"
-                echo "LAST_EXEC_INDEX="
-                echo "EXEC_ATTEMPTS=0"
-            } > "$STATE_FILE"
-            sync
+            save_state "${CURRENT_INDEX}" "" 0
             continue
         fi
 
         # Persist current step attempt BEFORE launching workload so it survives a kernel panic/reboot
         LAST_EXEC_INDEX="${idx}"
         EXEC_ATTEMPTS="${exec_attempts}"
-        {
-            echo "CURRENT_INDEX=${idx}"
-            echo "STARTED_TIME=${STARTED_TIME:-$(date +%s)}"
-            echo "LAST_EXEC_INDEX=${LAST_EXEC_INDEX}"
-            echo "EXEC_ATTEMPTS=${EXEC_ATTEMPTS}"
-        } > "$STATE_FILE"
-        sync
+        save_state "${idx}" "${LAST_EXEC_INDEX}" "${EXEC_ATTEMPTS}"
 
         # Build informative logging tag for prefetch and THP parameters
         local dist_tag=""
@@ -602,26 +639,21 @@ execute_step() {
         fi
 
         log "${GREEN}Completed benchmark: ${CURRENT_BENCHMARK} (Ratio: ${CURRENT_RATIO}${dist_tag}).${NC}"
+        steps_run_this_boot=$((steps_run_this_boot + 1))
 
-        # Advance to next item and reset crash-loop & drift-reboot counters
+        # Advance to next item and reset crash-loop counters
         CURRENT_INDEX=$((idx + 1))
         LAST_EXEC_INDEX=""
         EXEC_ATTEMPTS=0
-        DRIFT_REBOOT_INDEX=""
-        {
-            echo "CURRENT_INDEX=${CURRENT_INDEX}"
-            echo "STARTED_TIME=${STARTED_TIME:-$(date +%s)}"
-            echo "LAST_EXEC_INDEX="
-            echo "EXEC_ATTEMPTS=0"
-            echo "DRIFT_REBOOT_INDEX="
-        } > "$STATE_FILE"
-        sync
+        save_state "${CURRENT_INDEX}" "" 0
     done
 
     # Clean up state and service upon completing all execution steps
+    trap - INT TERM
     log "${GREEN}================================================================================${NC}"
     log "${GREEN} ALL MULTI-KERNEL & MULTI-RATIO REGRESSIONS COMPLETED (${total}/${total})! ${NC}"
     log "${GREEN}================================================================================${NC}"
+    restore_machine
     remove_service
     rm -f "$STATE_FILE"
 }
@@ -640,6 +672,12 @@ start_regression() {
     echo -e "${CYAN} Starting Automated Multi-Kernel & Multi-Ratio Regression Suite (${total} Steps) ${NC}"
     print_regression_config
     echo -e "${CYAN}================================================================================${NC}"
+
+    # Always clean & pre-build configured benchmarks once before starting reboots
+    ensure_cpus_online
+    log "${CYAN}Cleaning and pre-building configured benchmarks (${BENCHMARKS[*]})...${NC}"
+    bash "$SETUP_WORKLOADS" prebuild "${BENCHMARKS[@]}"
+    log "${GREEN}Completed benchmark clean & pre-build.${NC}"
 
     echo "CURRENT_INDEX=0" > "$STATE_FILE"
     echo "STARTED_TIME=$(date +%s)" >> "$STATE_FILE"
@@ -709,16 +747,15 @@ show_status() {
 # Cancel running regression, bring CPUs online, and reset state
 # ------------------------------------------------------------------------------
 abort_regression() {
-    local clean_logs="${1:-0}"
+    local clean_all="${1:-0}"
     log "${YELLOW}Aborting automated regression and cleaning up...${NC}"
-    ensure_cpus_online
+    restore_machine
     remove_service
-    rm -f "$STATE_FILE"
-    if [ "${clean_logs}" == "1" ]; then
-        rm -f "$LOG_FILE" "$RERUN_LOG_FILE"
+    if [ "${clean_all}" == "1" ]; then
+        rm -f "$STATE_FILE" "$LOG_FILE" "$RERUN_LOG_FILE"
         echo -e "${GREEN}Automated regression reset (state and logs cleared).${NC}"
     else
-        log "${GREEN}Automated regression stopped.${NC}"
+        log "${GREEN}Automated regression stopped (state preserved for resume).${NC}"
     fi
 }
 
@@ -752,10 +789,10 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
             echo "Usage: sudo $0 [start | resume | status | stop | reset]"
             echo ""
             echo "Commands:"
-            echo "  start (default) : Start fresh automated regression (clears old logs & failed_reruns.sh)"
+            echo "  start (default) : Clean & pre-build benchmarks, then start fresh automated regression"
             echo "  resume          : Resume regression from current state step (preserves logs)"
             echo "  status          : Display current progress and active target"
-            echo "  stop / abort    : Cancel running regression and remove autostart service (keeps logs)"
+            echo "  stop / abort    : Cancel running regression and remove autostart service (keeps state & logs)"
             echo "  reset           : Clear state, logs, failed_reruns.sh, remove service, and online CPUs"
             ;;
         *)

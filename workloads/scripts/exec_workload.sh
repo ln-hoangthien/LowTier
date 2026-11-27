@@ -11,12 +11,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="${ROOT_DIR:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
 WORKLOAD_DIR="${ROOT_DIR}/workloads"
 
-# Workload cores (default 24: cores 0..23; cores 24..32 reserved for kswapd/bpftrace/perf)
-export WORKLOAD_CORES="${WORKLOAD_CORES:-24}"
+# Centralized CPU layout (workload cores, daemon cores, derived masks)
+source "${SCRIPT_DIR}/cpu_config.sh"
+export WORKLOAD_CORES
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-${WORKLOAD_CORES}}"
 export OMP_PROC_BIND="${OMP_PROC_BIND:-true}"
 export OMP_PLACES="${OMP_PLACES:-cores}"
-SELECTED_CPUS="${SELECTED_CPUS:-$(seq -s, 0 $(( WORKLOAD_CORES - 1 )))}"
 
 # Graph Datasets Directory
 GAPBS_DIR="${WORKLOAD_DIR}/gapbs"
@@ -47,8 +47,6 @@ export REDIS_EXTRA_ARGS="${REDIS_EXTRA_ARGS:-}"
 
 # Configurable SPEC CPU 2026 execution parameters
 export SPEC2026_DIR="${SPEC2026_DIR:-${WORKLOAD_DIR}/spec2026}"
-export SPEC="${SPEC:-${SPEC2026_DIR}}"
-export SPECPERLLIB="${SPECPERLLIB:-${SPEC2026_DIR}/bin/common:${SPEC2026_DIR}/bin/lib:${SPEC2026_DIR}/bin}"
 export SPEC_CONFIG="${SPEC_CONFIG:-${WORKLOAD_DIR}/scripts/gcc-linux-x86.cfg}"
 export SPEC_COPIES="${SPEC_COPIES:-${WORKLOAD_CORES}}"
 export SPEC_THREADS="${SPEC_THREADS:-${WORKLOAD_CORES}}"
@@ -78,19 +76,19 @@ show_help() {
     echo "  GAPBS_NUM_TRIALS        Default trial count for all GAPBS algorithms"
     echo "  GAPBS_<ALGO>_NUM_TRIALS Per-algorithm trials (BC, TC, PR, BFS, SSSP, CC)"
     echo "  GAPBS_PR_ITERS          PageRank max iterations (default: 100)"
-    echo "  GAPBS_PR_TOL            PageRank tolerance (default: 1e-4)"
+    echo "  GAPBS_PR_TOL            PageRank tolerance (default: 1e-7)"
     echo "  GAPBS_BC_ITERS          Betweenness Centrality iterations (default: 4)"
     echo "  GAPBS_SSSP_DELTA        SSSP delta step (default: 50000 for road, 2 for others)"
     echo "  GAPBS_EXTRA_ARGS        Additional arguments passed to GAPBS binaries"
     echo ""
     echo "Environment Variable Overrides (Silo):"
-    echo "  SILO_RUNTIME            Benchmark runtime in seconds (default: 100)"
+    echo "  SILO_RUNTIME            Benchmark runtime in seconds (default: 180)"
     echo "  SILO_BID_RUNTIME        Benchmark runtime for silo_bid in seconds (default: 20)"
     echo ""
     echo "Environment Variable Overrides (Redis):"
     echo "  REDIS_KEYS              Keyspace length (default: 4300000)"
-    echo "  REDIS_REQUESTS          Total request count (default: 4300000)"
-    echo "  REDIS_DATA_SIZE         Payload size in bytes (default: 8192 -> ~22GB RSS)"
+    echo "  REDIS_REQUESTS          Total request count (default: 35000000)"
+    echo "  REDIS_DATA_SIZE         Payload size in bytes (default: 8192 -> ~26GB RSS)"
     echo "  REDIS_CLIENTS           Parallel client connections (default: 50)"
     echo "  REDIS_THREADS           Benchmark worker threads (default: 4)"
     echo "  REDIS_TESTS             Benchmark tests to execute (default: set,get)"
@@ -135,9 +133,6 @@ show_help() {
 
 resolve_target_exe() {
     local t="$1"
-    if [[ "$t" =~ ^(gapbs_[a-z]+)_(kron|urand|twitter|web|road)$ ]]; then
-        t="${BASH_REMATCH[1]}"
-    fi
     case "$t" in
         stream)         echo "stream" ;;
         stream_copy)    echo "stream_copy" ;;
@@ -150,7 +145,18 @@ resolve_target_exe() {
         silo_*)         echo "dbtest" ;;
         redis)          echo "redis-server" ;;
         xsbench)        echo "XSBench" ;;
-        spec2026_*)     echo "runcpu" ;;
+        spec2026_*)
+            local bname="${t#spec2026_}"
+            local exe_file
+            exe_file=$(ls "${SPEC2026_DIR}/benchspec/CPU/${bname}/exe/"*_base.* 2>/dev/null | grep -vE '(_compare_|stats_|testrunner_)' | head -n 1 || true)
+            if [ -n "${exe_file}" ]; then
+                basename "${exe_file}"
+            else
+                local exename
+                exename=$(awk -F"'" '/^\$exename[[:space:]]*=/ {print $2; exit}' "${SPEC2026_DIR}/benchspec/CPU/${bname}/Spec/object.pm" 2>/dev/null || true)
+                [ -n "${exename}" ] && echo "${exename}_base.mytest" || echo "runcpu"
+            fi
+            ;;
         *)              echo "" ;;
     esac
 }
@@ -180,11 +186,6 @@ while [ $# -gt 0 ]; do
 done
 set -- "${PARSED_OPTS[@]}"
 
-if [ "$MODE" == "GET_TARGET_EXE" ]; then
-    resolve_target_exe "$1"
-    exit 0
-fi
-
 if [ -z "$1" ] || [ "$1" == "-h" ] || [ "$1" == "--help" ]; then
     show_help
 fi
@@ -192,11 +193,15 @@ fi
 TARGET="$1"
 DATASET_INPUT="${2:-kron}"
 
-
-# Decompose composite GAPBS benchmark alias if present (e.g. gapbs_bc_kron -> gapbs_bc kron)
+# Decompose composite GAPBS benchmark alias once (e.g. gapbs_bc_kron -> gapbs_bc kron)
 if [[ "$TARGET" =~ ^(gapbs_[a-z]+)_(kron|urand|twitter|web|road)$ ]]; then
     [ -z "$2" ] && DATASET_INPUT="${BASH_REMATCH[2]}"
     TARGET="${BASH_REMATCH[1]}"
+fi
+
+if [ "$MODE" == "GET_TARGET_EXE" ]; then
+    resolve_target_exe "$TARGET"
+    exit 0
 fi
 
 resolve_graph_file() {
@@ -317,7 +322,7 @@ resolve_cmd() {
             cmd="${RUN_PREFIX} ${GAPBS_DIR}/sssp -f ${graph_file} -n ${GAPBS_SSSP_NUM_TRIALS} -d ${delta} ${GAPBS_EXTRA_ARGS}"
             ;;
         silo_tpcc)
-            cmd="${RUN_PREFIX} ${SILO_BIN} --verbose --bench tpcc --num-threads ${WORKLOAD_CORES} --scale-factor 200 --parallel-loading --runtime ${SILO_TPCC_RUNTIME}"
+            cmd="${RUN_PREFIX} ${SILO_BIN} --verbose --bench tpcc --num-threads ${WORKLOAD_CORES} --scale-factor 150 --parallel-loading --runtime ${SILO_TPCC_RUNTIME}"
             ;;
         silo_ycsb)
             cmd="${RUN_PREFIX} ${SILO_BIN} --verbose --bench ycsb --num-threads ${WORKLOAD_CORES} --scale-factor 240000 --parallel-loading --runtime ${SILO_YCSB_RUNTIME}"
@@ -344,18 +349,11 @@ resolve_cmd() {
                 echo "Error: Unknown SPEC CPU 2026 benchmark '$bname'" >&2
                 exit 1
             fi
-            local r_tag="${RATIO_TAG:-default}"
-            local spec_kernel="${KERNEL_VER:-$(uname -r)}"
-            local SPEC_OUT_ROOT="${TARGET_DIR:-${WORKLOAD_DIR}/output/${spec_kernel}}/spec2026"
-            mkdir -p "${SPEC_OUT_ROOT}"
-            local spec_out_args=""
-            if [[ "${SPEC_EXTRA_ARGS:-}" != *"--output_root"* ]]; then
-                spec_out_args+=" --output_root=${SPEC_OUT_ROOT}"
+            local nobuild_flag=""
+            if [[ "${SPEC_EXTRA_ARGS:-}" != *"--rebuild"* ]] && [[ "${SPEC_EXTRA_ARGS:-}" != *"--nobuild"* ]] && [[ "${SPEC_EXTRA_ARGS:-}" != *"--action"* ]]; then
+                nobuild_flag=" --nobuild"
             fi
-            if [[ "${SPEC_EXTRA_ARGS:-}" != *"--expid"* ]]; then
-                spec_out_args+=" --expid=${r_tag}"
-            fi
-            local SPEC_BASE_CMD="${RUN_PREFIX} ${SPEC2026_DIR}/bin/runcpu --config=${SPEC_CONFIG} --copies=${SPEC_COPIES} --threads=${SPEC_THREADS} --size=ref${spec_out_args}"
+            local SPEC_BASE_CMD="${RUN_PREFIX} ${SPEC2026_DIR}/bin/runcpu --config=${SPEC_CONFIG} --copies=${SPEC_COPIES} --threads=${SPEC_THREADS} --size=ref${nobuild_flag}"
             cmd="${SPEC_BASE_CMD} ${bname}${SPEC_EXTRA_ARGS:+ $SPEC_EXTRA_ARGS}"
             ;;
         *)

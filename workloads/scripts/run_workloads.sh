@@ -10,6 +10,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="${ROOT_DIR:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
 OUTPUT_DIR="${ROOT_DIR}/workloads/output"
 mkdir -p "${OUTPUT_DIR}"
+source "${SCRIPT_DIR}/common.sh"
 
 # ------------------------------------------------------------------------------------------
 # Help / Usage Banner & Early Option Parsing
@@ -46,13 +47,11 @@ if [ -z "${1:-}" ] || [ "$1" == "-h" ] || [ "$1" == "--help" ]; then
     show_help
 fi
 
-# Log message to both stdout and REGRESS_LOG_FILE
-log_echo() {
-    echo -e "$@"
-    if [ -n "${REGRESS_LOG_FILE:-}" ]; then
-        echo -e "$@" >> "${REGRESS_LOG_FILE}"
-    fi
-}
+GET_LOG_PATH=0
+if [ "${1:-}" == "--get-log-path" ]; then
+    GET_LOG_PATH=1
+    shift
+fi
 
 # ------------------------------------------------------------------------------------------
 # Parameter Normalization & Validation
@@ -136,7 +135,6 @@ resolve_workload_target() {
 resolve_output_paths() {
     KERNEL_VER="$(uname -r)"
     TARGET_DIR="${TARGET_DIR:-${OUTPUT_DIR}/${KERNEL_VER}}"
-    mkdir -p "${TARGET_DIR}"
 
     FILENAME_SUFFIX="${TARGET}${DATASET:+_${DATASET}}${RATIO_TAG:+_${RATIO_TAG}}"
     if [[ "${KERNEL_VER,,}" =~ prefetch ]]; then
@@ -147,7 +145,8 @@ resolve_output_paths() {
             adapt_tag="_static"
         fi
 
-        local engine_tag="$([ "${PREFETCH_NAIVE:-0}" == "1" ] && echo "_naive" || echo "_deeptune")"
+        local engine_tag="_deeptune"
+        [ "${PREFETCH_NAIVE:-0}" == "1" ] && engine_tag="_naive"
         if [ "${PREFETCH_ENABLED:-1}" == "0" ] || ([ "${PREFETCH_PROMOTE_DISTANCE:-0}" == "0" ] && [ "${PREFETCH_DEMOTE_DISTANCE:-0}" == "0" ]); then
             FILENAME_SUFFIX+="_0"
         else
@@ -157,6 +156,11 @@ resolve_output_paths() {
     FILENAME_SUFFIX+="_${THP_MODE}"
 
     REGRESS_LOG_FILE="${TARGET_DIR}/regress_${FILENAME_SUFFIX}.log"
+    if [ "${GET_LOG_PATH}" -eq 1 ]; then
+        echo "${REGRESS_LOG_FILE}"
+        exit 0
+    fi
+    mkdir -p "${TARGET_DIR}"
     rm -f "${REGRESS_LOG_FILE}"
 }
 
@@ -178,7 +182,8 @@ if [ "$EUID" -ne 0 ]; then
         PREFETCH_DEMOTE_DISTANCE="${PREFETCH_DEMOTE_DISTANCE}" \
         PREFETCH_MIN_DISTANCE="${PREFETCH_MIN_DISTANCE}" \
         PREFETCH_MAX_DISTANCE="${PREFETCH_MAX_DISTANCE}" \
-        PREFETCH_HINT="${PREFETCH_HINT}" "$0" "$@"
+        PREFETCH_HINT="${PREFETCH_HINT}" \
+        KEEP_MACHINE_CONFIG="${KEEP_MACHINE_CONFIG:-0}" "$0" "$@"
 fi
 
 # Redis disables THP via prctl(PR_SET_THP_DISABLE) when THP=always, and pre-main jemalloc
@@ -192,23 +197,10 @@ fi
 # Helper Functions
 # ------------------------------------------------------------------------------------------
 
-# Safely read sysfs attribute file
-read_sysfs() {
-    local file="$1"
-    [ -f "$file" ] && cat "$file" 2>/dev/null || echo ""
-}
-
-# Query current Node 0 free memory in MB
-get_node0_free_mb() {
-    local kb
-    kb=$(awk '/Node 0 MemFree/{print $4}' /sys/devices/system/node/node0/meminfo 2>/dev/null || echo 0)
-    echo $(( kb / 1024 ))
-}
-
-# Query current Node 1 free memory in MB
-get_node1_free_mb() {
-    local kb
-    kb=$(awk '/Node 1 MemFree/{print $4}' /sys/devices/system/node/node1/meminfo 2>/dev/null || echo 0)
+# Query current free memory in MB for a NUMA node
+get_node_free_mb() {
+    local node="$1" kb
+    kb=$(awk -v n="${node}" '$2 == n && $3 == "MemFree:" {print $4}' "/sys/devices/system/node/node${node}/meminfo" 2>/dev/null || echo 0)
     echo $(( kb / 1024 ))
 }
 
@@ -258,8 +250,8 @@ clean_memory_caches() {
     fi
     echo 1 > /proc/sys/vm/compact_memory 2>/dev/null || true
     sleep 1
-    local free0_mb=$(get_node0_free_mb)
-    local free1_mb=$(get_node1_free_mb)
+    local free0_mb=$(get_node_free_mb 0)
+    local free1_mb=$(get_node_free_mb 1)
     log_echo "[+] Clean Headroom at T=0: Node 0 = ${free0_mb} MB free | Node 1 = ${free1_mb} MB free"
 }
 
@@ -268,10 +260,11 @@ PRELOAD_CMD=""
 STATUS=1
 cleanup() {
     trap - INT TERM EXIT
-    killall -9 pact bpftrace perf redis-server dbtest XSBench pr bc bfs cc sssp tc specperl runcpu specmake 2>/dev/null || true
+    killall -9 pact perf redis-server dbtest XSBench pr bc bfs cc sssp tc specperl runcpu specmake 2>/dev/null || true
+    pkill -9 -f "_base\." 2>/dev/null || true
 
     # Clean up telemetry temporary state
-    "${SCRIPT_DIR}/monitor_performance.sh" --cleanup 2>/dev/null || true
+    PERF_SESSION_ID="$$" "${SCRIPT_DIR}/monitor_performance.sh" --cleanup 2>/dev/null || true
 
     # Stop any active baseline autotie daemons
     "${SCRIPT_DIR}/setup_kernel.sh" --autotie-stop 2>/dev/null || true
@@ -281,8 +274,10 @@ cleanup() {
     [ "${STATUS:-1}" -eq 0 ] && [ -n "${PRELOAD_CMD:-}" ] && keep_cache=1
     KEEP_PRELOAD_CACHE="${keep_cache}" "${SCRIPT_DIR}/setup_kernel.sh" --cleanup 2>/dev/null || true
 
-    # Restore machine hardware configuration (hyperthreads, turbo, governor)
-    "${SCRIPT_DIR}/setup_machine.sh" --restore 2>/dev/null || true
+    # Restore machine hardware configuration unless caller keeps CPUs/clocks pinned across consecutive steps
+    if [ "${KEEP_MACHINE_CONFIG:-0}" != "1" ]; then
+        "${SCRIPT_DIR}/setup_machine.sh" --restore 2>/dev/null || true
+    fi
 
     # Ensure all generated output files and directories have correct user ownership
     if [ -n "${SUDO_USER:-}" ]; then
@@ -379,8 +374,9 @@ log_echo "----------------------------------------------------------------------
 WORKLOAD_EXEC_CMD=$(THP_MODE="${THP_MODE}" TARGET_EXE_NAME="${TARGET_EXE_NAME}" "${SCRIPT_DIR}/setup_kernel.sh" --wrap-cmd ${WORKLOAD_CMD})
 log_echo "[run_workloads] Running workload: ${WORKLOAD_EXEC_CMD}"
 
-# 1. Start baseline telemetry capture
-"${SCRIPT_DIR}/monitor_performance.sh" --start
+# 1. Start baseline telemetry capture & 1s background time-series sampler (see cpu_config.sh)
+TS_CSV_FILE="${TARGET_DIR}/timeseries_${FILENAME_SUFFIX}.csv"
+PERF_SESSION_ID="$$" TS_OUT_FILE="${TS_CSV_FILE}" "${SCRIPT_DIR}/monitor_performance.sh" --start
 
 # 2. Start asynchronous baseline autotie watcher (PACT daemon / tier-prefetch-mon)
 THP_MODE="${THP_MODE}" \
@@ -392,9 +388,9 @@ FILENAME_SUFFIX="${FILENAME_SUFFIX}" \
 REGRESS_LOG_FILE="${REGRESS_LOG_FILE}" \
 "${SCRIPT_DIR}/setup_kernel.sh" --autotie-start
 
-# 3. Execute the workload command with timeout, GNU time, and perf stat (Slow-tier latency & prefetch counters)
+# 3. Execute the workload command directly under timeout and GNU time (0 perf/PEBS hook overhead;
+#    faults, context switches, and CPU time come from getrusage(), tiering stats from /proc/vmstat)
 log_echo "------------------------------------------------------------------------------------------"
-PERF_EVENTS="mem_trans_retired.load_latency_gt_256,l2_rqsts.all_hwpf,l2_rqsts.swpf_hit,l2_rqsts.swpf_miss"
 if [ -z "${WORKLOAD_TIMEOUT:-}" ]; then
     if [[ "${TARGET,,}" == spec* ]]; then
         WORKLOAD_TIMEOUT=7200  # 2 hours for SPEC CPU 2026
@@ -404,17 +400,25 @@ if [ -z "${WORKLOAD_TIMEOUT:-}" ]; then
 fi
 log_echo "[run_workloads] Workload timeout: ${WORKLOAD_TIMEOUT}s (SIGKILL after +30s)"
 timeout --kill-after=30 "${WORKLOAD_TIMEOUT}" \
-    /usr/bin/time -v perf stat -e "${PERF_EVENTS}" bash -c "exec ${WORKLOAD_EXEC_CMD}" 2>&1 | tee -a "${REGRESS_LOG_FILE}"
+    /usr/bin/time -v bash -c "exec ${WORKLOAD_EXEC_CMD}" 2>&1 | tee -a "${REGRESS_LOG_FILE}"
 STATUS="${PIPESTATUS[0]}"
+
+# XSBench returns 1 on custom -g/-p params (hardcoded reference checksum mismatch) even on normal completion
+if [ "${TARGET}" = "xsbench" ] && [ "${STATUS}" -eq 1 ] && \
+   grep -q "Simulation complete\." "${REGRESS_LOG_FILE}" 2>/dev/null && \
+   grep -q "Verification checksum:" "${REGRESS_LOG_FILE}" 2>/dev/null; then
+    STATUS=0
+fi
 if [ "${STATUS}" -eq 124 ] || [ "${STATUS}" -eq 137 ]; then
     log_echo "\033[1;31m[ERROR] Workload '${TARGET}' TIMED OUT after ${WORKLOAD_TIMEOUT}s (exit=${STATUS}) — likely kernel livelock/hang.\033[0m"
 fi
 
 # 4. Calculate delta and print performance report before dropping caches
-"${SCRIPT_DIR}/monitor_performance.sh" --stop ${WORKLOAD_EXEC_CMD} 2>&1 | tee -a "${REGRESS_LOG_FILE}"
+PERF_SESSION_ID="$$" "${SCRIPT_DIR}/monitor_performance.sh" --stop ${WORKLOAD_EXEC_CMD} 2>&1 | tee -a "${REGRESS_LOG_FILE}"
 
 log_echo "------------------------------------------------------------------------------------------"
-log_echo "[+] Workload completed. Compiling final statistics..."
+log_echo "[+] Workload completed (status=${STATUS}). Compiling final statistics..."
+sync
 
 # 5. Terminate any residual workload processes and clean caches
 # (preserve Node 1 graph pagecache on successful GAPBS runs so back-to-back configs reuse it)
