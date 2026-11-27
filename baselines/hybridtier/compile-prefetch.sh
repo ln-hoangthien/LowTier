@@ -10,7 +10,7 @@ ROOT_DIR="${ROOT_DIR:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
 HYBRIDTIER_DIR="${ROOT_DIR}/baselines/hybridtier"
 KERNEL_DIR="${HYBRIDTIER_DIR}/linux"
 LOGF="${HYBRIDTIER_DIR}/log"
-PATCHES=("${HYBRIDTIER_DIR}/hybridtier.patch" "${HYBRIDTIER_DIR}/hybridtier-prefetch.patch")
+PATCHES=("${HYBRIDTIER_DIR}/hybridtier.patch" "${HYBRIDTIER_DIR}/hybridtier-prefetch.patch" "${HYBRIDTIER_DIR}/hybridtier-mig-stats.patch")
 UBUNTU_FIXES_CONFIG="${UBUNTU_FIXES_CONFIG:-${ROOT_DIR}/baselines/scripts/ubuntu_fixes.config}"
 
 [[ -d "$KERNEL_DIR" ]] || { echo "ERROR: kernel tree not found at $KERNEL_DIR"; exit 1; }
@@ -59,7 +59,7 @@ fi
 # Kernel Configuration Adjustments (scripts/config & merge_config.sh)
 # ------------------------------------------------------------------------------
 # 1. Kernel Naming & Certificate Key Fixes
-scripts/config --set-str CONFIG_LOCALVERSION "-hybridtier-prefetch"
+scripts/config --set-str CONFIG_LOCALVERSION "-Hybridtier-Prefetch"
 scripts/config --disable CONFIG_LOCALVERSION_AUTO
 scripts/config --set-str CONFIG_SYSTEM_TRUSTED_KEYS ""
 scripts/config --set-str CONFIG_SYSTEM_REVOCATION_KEYS ""

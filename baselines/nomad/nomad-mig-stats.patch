@@ -1,0 +1,119 @@
+diff --git a/include/linux/vm_event_item.h b/include/linux/vm_event_item.h
+index 5cc7d31..cd21135 100644
+--- a/include/linux/vm_event_item.h
++++ b/include/linux/vm_event_item.h
+@@ -75,6 +75,11 @@ enum vm_event_item { PGPGIN, PGPGOUT, PSWPIN, PSWPOUT,
+ 		THP_MIGRATION_SUCCESS,
+ 		THP_MIGRATION_FAIL,
+ 		THP_MIGRATION_SPLIT,
++		MIG_WAIT_COUNT,
++		MIG_WAIT_US,
++		MIG_WAIT_HUGE_COUNT,
++		MIG_WAIT_HUGE_US,
++		MIG_COPY_NS,
+ #endif
+ #ifdef CONFIG_COMPACTION
+ 		COMPACTMIGRATE_SCANNED, COMPACTFREE_SCANNED,
+diff --git a/mm/migrate.c b/mm/migrate.c
+index ee780f3..7b6e0ed 100644
+--- a/mm/migrate.c
++++ b/mm/migrate.c
+@@ -14,6 +14,8 @@
+  */
+ 
+ #include <linux/migrate.h>
++#include <linux/ktime.h>
++#include <linux/math64.h>
+ #include <linux/export.h>
+ #include <linux/swap.h>
+ #include <linux/swapops.h>
+@@ -399,9 +401,25 @@ void remove_migration_ptes(struct page *old, struct page *new, bool locked)
+  * get to the page and wait until migration is finished.
+  * When we return from this function the fault will be retried.
+  */
++static inline void mig_record_wait(u64 start_ns, bool is_huge)
++{
++	unsigned long wait_us =
++		(unsigned long)div_u64(ktime_get_ns() - start_ns + 500, 1000);
++
++	if (is_huge) {
++		count_vm_event(MIG_WAIT_HUGE_COUNT);
++		count_vm_events(MIG_WAIT_HUGE_US, wait_us);
++	} else {
++		count_vm_event(MIG_WAIT_COUNT);
++		count_vm_events(MIG_WAIT_US, wait_us);
++	}
++}
++
+ void __migration_entry_wait(struct mm_struct *mm, pte_t *ptep,
+ 				spinlock_t *ptl)
+ {
++	bool is_huge;
++	u64 wait_start_ns;
+ 	pte_t pte;
+ 	swp_entry_t entry;
+ 	struct page *page;
+@@ -424,8 +442,11 @@ void __migration_entry_wait(struct mm_struct *mm, pte_t *ptep,
+ 	 */
+ 	if (!get_page_unless_zero(page))
+ 		goto out;
++	is_huge = PageHuge(page) || PageTransHuge(page);
+ 	pte_unmap_unlock(ptep, ptl);
++	wait_start_ns = ktime_get_ns();
+ 	put_and_wait_on_page_locked(page, TASK_UNINTERRUPTIBLE);
++	mig_record_wait(wait_start_ns, is_huge);
+ 	return;
+ out:
+ 	pte_unmap_unlock(ptep, ptl);
+@@ -449,6 +470,7 @@ void migration_entry_wait_huge(struct vm_area_struct *vma,
+ #ifdef CONFIG_ARCH_ENABLE_THP_MIGRATION
+ void pmd_migration_entry_wait(struct mm_struct *mm, pmd_t *pmd)
+ {
++	u64 wait_start_ns;
+ 	spinlock_t *ptl;
+ 	struct page *page;
+ 
+@@ -459,7 +481,9 @@ void pmd_migration_entry_wait(struct mm_struct *mm, pmd_t *pmd)
+ 	if (!get_page_unless_zero(page))
+ 		goto unlock;
+ 	spin_unlock(ptl);
++	wait_start_ns = ktime_get_ns();
+ 	put_and_wait_on_page_locked(page, TASK_UNINTERRUPTIBLE);
++	mig_record_wait(wait_start_ns, true);
+ 	return;
+ unlock:
+ 	spin_unlock(ptl);
+@@ -1606,6 +1630,7 @@ int migrate_pages(struct list_head *from, new_page_t get_new_page,
+ 		free_page_t put_new_page, unsigned long private,
+ 		enum migrate_mode mode, int reason, unsigned int *nr_succeeded)
+ {
++	u64 mig_start_ns = ktime_get_ns();
+ 	int retry = 1;
+ 	int thp_retry = 1;
+ 	int nr_failed = 0;
+@@ -1751,6 +1776,9 @@ out:
+ 	count_vm_events(THP_MIGRATION_SUCCESS, nr_thp_succeeded);
+ 	count_vm_events(THP_MIGRATION_FAIL, nr_thp_failed);
+ 	count_vm_events(THP_MIGRATION_SPLIT, nr_thp_split);
++	if (*nr_succeeded)
++		count_vm_events(MIG_COPY_NS,
++				(unsigned long)(ktime_get_ns() - mig_start_ns));
+ 	trace_mm_migrate_pages(*nr_succeeded, nr_failed, nr_thp_succeeded,
+ 			       nr_thp_failed, nr_thp_split, mode, reason);
+ 
+diff --git a/mm/vmstat.c b/mm/vmstat.c
+index 866eeef..c68cd0d 100644
+--- a/mm/vmstat.c
++++ b/mm/vmstat.c
+@@ -1312,6 +1312,11 @@ const char * const vmstat_text[] = {
+ 	"thp_migration_success",
+ 	"thp_migration_fail",
+ 	"thp_migration_split",
++	"mig_wait_count",
++	"mig_wait_us",
++	"mig_wait_huge_count",
++	"mig_wait_huge_us",
++	"mig_copy_ns",
+ #endif
+ #ifdef CONFIG_COMPACTION
+ 	"compact_migrate_scanned",

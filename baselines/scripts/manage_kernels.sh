@@ -183,22 +183,22 @@ export -f matches_kernel_target
 # ------------------------------------------------------------------------------
 get_rss() {
     case "$1" in
-        # --- GAPBS Graph Workloads ---
+        # --- GAPBS Graph Workloads (within-1GiB peers snapped to share memmap) ---
         gapbs_pr_kron|gapbs_pr_urand)         echo 18 ;;
         gapbs_pr_twitter)                     echo 12 ;;
         gapbs_tc_kron)                        echo 38 ;;
         gapbs_tc_urand)                       echo 18 ;;
-        gapbs_tc_twitter)                     echo 21 ;;
+        gapbs_tc_twitter)                     echo 20 ;; # Actually 21
         gapbs_bfs_kron|gapbs_bfs_urand)       echo 18 ;;
         gapbs_bfs_twitter)                    echo 12 ;;
-        gapbs_bc_kron)                        echo 19 ;;
+        gapbs_bc_kron)                        echo 18 ;; # Actually 19
         gapbs_bc_urand)                       echo 20 ;;
-        gapbs_bc_twitter)                     echo 13 ;;
+        gapbs_bc_twitter)                     echo 12 ;; # Actually 13
         gapbs_cc_kron|gapbs_cc_urand)         echo 18 ;;
         gapbs_cc_twitter)                     echo 12 ;;
         gapbs_sssp_kron)                      echo 34 ;;
         gapbs_sssp_urand)                     echo 36 ;;
-        gapbs_sssp_twitter)                   echo 23 ;;
+        gapbs_sssp_twitter)                   echo 22 ;; # Actually 23
 
         # --- In-Memory Databases & Microbenchmarks ---
         silo_tpcc)                            echo 20 ;;
@@ -209,8 +209,10 @@ get_rss() {
 
         # --- SPEC CPU Benchmarks ---
         spec2026_708.sqlite_r)                echo 28 ;;
-        spec2026_820.cloverleaf_s)            echo 23 ;;
-        spec2026_865.roms_s)                  echo 23 ;;
+        spec2026_820.cloverleaf_s)            echo 22 ;;
+        spec2026_849.fotonik3d_s)             echo 49 ;; # Actually 48
+        spec2026_865.roms_s)                  echo 22 ;; # Actually 23
+        spec2026_881.neutron_s)               echo 49 ;;
 
         # --- Fallback Default ---
         *)                                    echo 20 ;;
@@ -457,6 +459,22 @@ clean_boot_backups() {
 }
 export -f clean_boot_backups
 
+strip_grub_custom_params() {
+    local grub_file="${1:-/etc/default/grub}"
+    [ -f "$grub_file" ] || return 0
+    sed -i -E \
+        -e '/^GRUB_CMDLINE_LINUX_DEFAULT=/ s/\bmem=[0-9]+[kKmMgGtT]?[bB]?\b//g' \
+        -e '/^GRUB_CMDLINE_LINUX_DEFAULT=/ s/\bnuma=fake=[^ "]*/ /g' \
+        -e '/^GRUB_CMDLINE_LINUX_DEFAULT=/ s/\bmemmap=[^ "]*/ /g' \
+        -e '/^GRUB_CMDLINE_LINUX_DEFAULT=/ s/\bintel_idle\.max_cstate=[^ "]*/ /g' \
+        -e '/^GRUB_CMDLINE_LINUX_DEFAULT=/ s/\bprocessor\.max_cstate=[^ "]*/ /g' \
+        -e '/^GRUB_CMDLINE_LINUX_DEFAULT=/ s/\bidle=[^ "]*/ /g' \
+        -e '/^GRUB_CMDLINE_LINUX_DEFAULT=/ s/[[:space:]]+/ /g' \
+        -e '/^GRUB_CMDLINE_LINUX_DEFAULT=/ s/"[[:space:]]*/"/' \
+        -e '/^GRUB_CMDLINE_LINUX_DEFAULT=/ s/[[:space:]]*"[[:space:]]*$/"/' \
+        "$grub_file"
+}
+
 ensure_cpus_online() {
     for cpu_online in /sys/devices/system/cpu/cpu[0-9]*/online; do
         [ -f "$cpu_online" ] && echo 1 > "$cpu_online" 2>/dev/null || true
@@ -488,17 +506,8 @@ set_grub_default() {
     echo -e "${CYAN}Applying Node 0 fast-tier limit: ${memmap_param}${NC}"
 
     if grep -q "^GRUB_CMDLINE_LINUX_DEFAULT=" /etc/default/grub; then
-        # Atomic clean pass: strip mem=, numa=fake=, memmap=, and cstate/idle parameters, normalize spacing, and append target params
+        strip_grub_custom_params /etc/default/grub
         sed -i -E \
-            -e '/^GRUB_CMDLINE_LINUX_DEFAULT=/ s/\bmem=[0-9]+[kKmMgGtT]?[bB]?\b//g' \
-            -e '/^GRUB_CMDLINE_LINUX_DEFAULT=/ s/\bnuma=fake=[^ "]*/ /g' \
-            -e '/^GRUB_CMDLINE_LINUX_DEFAULT=/ s/\bmemmap=[^ "]*/ /g' \
-            -e '/^GRUB_CMDLINE_LINUX_DEFAULT=/ s/\bintel_idle\.max_cstate=[^ "]*/ /g' \
-            -e '/^GRUB_CMDLINE_LINUX_DEFAULT=/ s/\bprocessor\.max_cstate=[^ "]*/ /g' \
-            -e '/^GRUB_CMDLINE_LINUX_DEFAULT=/ s/\bidle=[^ "]*/ /g' \
-            -e '/^GRUB_CMDLINE_LINUX_DEFAULT=/ s/[[:space:]]+/ /g' \
-            -e '/^GRUB_CMDLINE_LINUX_DEFAULT=/ s/"[[:space:]]*/"/' \
-            -e '/^GRUB_CMDLINE_LINUX_DEFAULT=/ s/[[:space:]]*"[[:space:]]*$/"/' \
             -e "/^GRUB_CMDLINE_LINUX_DEFAULT=/ s/\"$/ ${memmap_param}\"/" \
             -e '/^GRUB_CMDLINE_LINUX_DEFAULT=/ s/"[[:space:]]+/"/' \
             /etc/default/grub
@@ -842,8 +851,6 @@ clean_kernel() {
     echo -e "${BLUE} Cleaning GRUB & Kernel: '${target}' ${NC}"
     echo -e "${BLUE}====================================================${NC}"
 
-    clean_boot_backups
-
     if [ "$target" == "all" ]; then
         echo -e "${YELLOW}Purging all custom baseline kernels from /boot, /lib/modules, and removing all source trees...${NC}"
         for t in "${BASELINE_TARGETS[@]}"; do
@@ -851,14 +858,16 @@ clean_kernel() {
         done
         [ -L /boot/vmlinuz ] && rm -f /boot/vmlinuz
         [ -L /boot/initrd.img ] && rm -f /boot/initrd.img
-        sed -i "s|^GRUB_DEFAULT=.*|GRUB_DEFAULT=0|" /etc/default/grub 2>/dev/null || true
-    elif [[ "$target" =~ ^(grub|clean_grub|old)$ ]]; then
-        echo -e "${GREEN}Cleaned all duplicate .old entries and links from /boot.${NC}"
-    else
+    elif [[ ! "$target" =~ ^(grub|clean_grub|old)$ ]]; then
         _uninstall_target_files "$target"
     fi
 
     clean_boot_backups
+
+    echo -e "${CYAN}Resetting GRUB defaults and stripping custom kernel parameters from /etc/default/grub...${NC}"
+    strip_grub_custom_params /etc/default/grub
+    sed -i "s|^GRUB_DEFAULT=.*|GRUB_DEFAULT=0|" /etc/default/grub 2>/dev/null || true
+    grub-set-default 0 2>/dev/null || true
 
     echo -e "${CYAN}Updating GRUB configuration...${NC}"
     update-grub

@@ -28,6 +28,15 @@ make clean
 # Remove host-built fixdep binary to avoid glibc compatibility issues
 rm -f tools/objtool/fixdep scripts/basic/fixdep
 
+MIG_STATS_PATCH="${PACT_DIR}/pact-mig-stats.patch"
+[[ -f "$MIG_STATS_PATCH" ]] || { echo "ERROR: patch not found: $MIG_STATS_PATCH"; exit 1; }
+echo "Applying $(basename "$MIG_STATS_PATCH") ..."
+if git apply --reverse --check "$MIG_STATS_PATCH" >/dev/null 2>&1; then
+    echo "  (already applied, skipping)"
+else
+    git apply "$MIG_STATS_PATCH"
+fi
+
 # Copy configuration from generic kernel to .config
 echo "configuring (olddefconfig) ..."
 GENERIC_CONFIG=$(ls /boot/config-*-generic 2>/dev/null | sort -V | tail -n 1)
@@ -48,11 +57,15 @@ scripts/config --disable CONFIG_LOCALVERSION_AUTO
 scripts/config --set-str CONFIG_SYSTEM_TRUSTED_KEYS ""
 scripts/config --set-str CONFIG_SYSTEM_REVOCATION_KEYS ""
 
-# 2. Apply Ubuntu Boot Fixes & Safety Nets
+# 2. Disable BTF to prevent building resolve_btfids/libbpf with modern host toolchain
+scripts/config --disable CONFIG_DEBUG_INFO_BTF
+scripts/config --disable CONFIG_DEBUG_INFO_BTF_MODULES
+
+# 3. Apply Ubuntu Boot Fixes & Safety Nets
 echo "Applying Ubuntu fixes configuration: $UBUNTU_FIXES_CONFIG"
 ./scripts/kconfig/merge_config.sh -m .config "$UBUNTU_FIXES_CONFIG"
 
-# 3. Enable PACT specific requirements:
+# 4. Enable PACT specific requirements:
 #    - CONFIG_INTEL_UNCORE_FREQ_CONTROL: uncore freq sysfs
 #    - CONFIG_KPROBES, CONFIG_KALLSYMS_ALL: required by tierinit to resolve mm/memory-tiers symbols
 #    - CONFIG_MODULES, CONFIG_MODULE_UNLOAD: load/unload tierinit & kswapdrst modules
@@ -62,7 +75,7 @@ scripts/config --enable CONFIG_KALLSYMS_ALL
 scripts/config --enable CONFIG_MODULES
 scripts/config --enable CONFIG_MODULE_UNLOAD
 
-# 4. Single-Socket NUMA Emulation Configs (managed in manage_kernels.sh)
+# 5. Single-Socket NUMA Emulation Configs (managed in manage_kernels.sh)
 if type configure_single_socket_numa >/dev/null 2>&1; then
     configure_single_socket_numa "$KERNEL_DIR"
 fi

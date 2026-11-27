@@ -8,7 +8,7 @@ ROOT_DIR="${ROOT_DIR:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
 TPP_DIR="${ROOT_DIR}/baselines/tpp"
 KERNEL_DIR="${TPP_DIR}/linux"
 LOGF="${TPP_DIR}/log"
-PATCHES=("${TPP_DIR}/tpp.patch" "${TPP_DIR}/tpp-prefetch.patch")
+PATCHES=("${TPP_DIR}/tpp.patch" "${TPP_DIR}/tpp-prefetch.patch" "${TPP_DIR}/tpp-mig-stats.patch")
 
 [[ -d "$KERNEL_DIR" ]] || { echo "ERROR: kernel tree not found at $KERNEL_DIR"; exit 1; }
 

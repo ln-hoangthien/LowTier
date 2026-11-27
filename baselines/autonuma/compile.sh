@@ -28,6 +28,15 @@ make clean
 # Remove host-built fixdep binary to avoid glibc compatibility issues
 rm -f tools/objtool/fixdep scripts/basic/fixdep
 
+MIG_STATS_PATCH="${AUTONUMA_DIR}/autonuma-mig-stats.patch"
+[[ -f "$MIG_STATS_PATCH" ]] || { echo "ERROR: patch not found: $MIG_STATS_PATCH"; exit 1; }
+echo "Applying $(basename "$MIG_STATS_PATCH") ..."
+if git apply --reverse --check "$MIG_STATS_PATCH" >/dev/null 2>&1; then
+    echo "  (already applied, skipping)"
+else
+    git apply "$MIG_STATS_PATCH"
+fi
+
 # Copy configuration from generic kernel to .config
 echo "configuring (olddefconfig) ..."
 GENERIC_CONFIG=$(ls /boot/config-*-generic 2>/dev/null | sort -V | tail -n 1)

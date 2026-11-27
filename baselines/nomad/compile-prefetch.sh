@@ -8,7 +8,7 @@ ROOT_DIR="${ROOT_DIR:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
 NOMAD_DIR="${ROOT_DIR}/baselines/nomad"
 KERNEL_DIR="${NOMAD_DIR}/linux"
 LOGF="${NOMAD_DIR}/log"
-PATCHES=("${NOMAD_DIR}/nomad.patch" "${NOMAD_DIR}/nomad-prefetch.patch")
+PATCHES=("${NOMAD_DIR}/nomad.patch" "${NOMAD_DIR}/nomad-prefetch.patch" "${NOMAD_DIR}/nomad-mig-stats.patch")
 
 [[ -d "$KERNEL_DIR" ]] || { echo "ERROR: kernel tree not found at $KERNEL_DIR"; exit 1; }
 

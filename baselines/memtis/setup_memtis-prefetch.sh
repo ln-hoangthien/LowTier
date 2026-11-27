@@ -6,7 +6,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="${ROOT_DIR:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
 MEMTIS_DIR="${ROOT_DIR}/baselines/memtis"
-PATCH_FILES=("${MEMTIS_DIR}/memtis.patch" "${MEMTIS_DIR}/memtis-prefetch.patch")
+PATCH_FILES=("${MEMTIS_DIR}/memtis.patch" "${MEMTIS_DIR}/memtis-prefetch.patch" "${MEMTIS_DIR}/memtis-mig-stats.patch")
 BASE_CONFIG="${MEMTIS_DIR}/config"
 KERNEL_DIR="${MEMTIS_DIR}/linux"
 LOGF="${MEMTIS_DIR}/log"

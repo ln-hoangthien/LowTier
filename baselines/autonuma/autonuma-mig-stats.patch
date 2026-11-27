@@ -1,0 +1,129 @@
+diff --git a/include/linux/vm_event_item.h b/include/linux/vm_event_item.h
+index 2628ccd..4b4cd2e 100644
+--- a/include/linux/vm_event_item.h
++++ b/include/linux/vm_event_item.h
+@@ -61,6 +61,11 @@ enum vm_event_item { PGPGIN, PGPGOUT, PSWPIN, PSWPOUT,
+ 		THP_MIGRATION_SUCCESS,
+ 		THP_MIGRATION_FAIL,
+ 		THP_MIGRATION_SPLIT,
++		MIG_WAIT_COUNT,
++		MIG_WAIT_US,
++		MIG_WAIT_HUGE_COUNT,
++		MIG_WAIT_HUGE_US,
++		MIG_COPY_NS,
+ #endif
+ #ifdef CONFIG_COMPACTION
+ 		COMPACTMIGRATE_SCANNED, COMPACTFREE_SCANNED,
+diff --git a/mm/migrate.c b/mm/migrate.c
+index 15b4583..d3f972b 100644
+--- a/mm/migrate.c
++++ b/mm/migrate.c
+@@ -14,6 +14,8 @@
+  */
+ 
+ #include <linux/migrate.h>
++#include <linux/ktime.h>
++#include <linux/math64.h>
+ #include <linux/export.h>
+ #include <linux/swap.h>
+ #include <linux/leafops.h>
+@@ -490,9 +492,24 @@ void remove_migration_ptes(struct folio *src, struct folio *dst,
+  * get to the page and wait until migration is finished.
+  * When we return from this function the fault will be retried.
+  */
++static inline void mig_record_wait(u64 start_ns, bool is_huge)
++{
++	unsigned long wait_us =
++		(unsigned long)div_u64(ktime_get_ns() - start_ns + 500, 1000);
++
++	if (is_huge) {
++		count_vm_event(MIG_WAIT_HUGE_COUNT);
++		count_vm_events(MIG_WAIT_HUGE_US, wait_us);
++	} else {
++		count_vm_event(MIG_WAIT_COUNT);
++		count_vm_events(MIG_WAIT_US, wait_us);
++	}
++}
++
+ void migration_entry_wait(struct mm_struct *mm, pmd_t *pmd,
+ 			  unsigned long address)
+ {
++	u64 wait_start_ns = ktime_get_ns();
+ 	spinlock_t *ptl;
+ 	pte_t *ptep;
+ 	pte_t pte;
+@@ -512,7 +529,8 @@ void migration_entry_wait(struct mm_struct *mm, pmd_t *pmd,
+ 	if (!softleaf_is_migration(entry))
+ 		goto out;
+ 
+ 	softleaf_entry_wait_on_locked(entry, ptl);
++	mig_record_wait(wait_start_ns, false);
+ 	return;
+ out:
+ 	spin_unlock(ptl);
+@@ -527,6 +545,7 @@ out:
+  */
+ void migration_entry_wait_huge(struct vm_area_struct *vma, unsigned long addr, pte_t *ptep)
+ {
++	u64 wait_start_ns = ktime_get_ns();
+ 	spinlock_t *ptl = huge_pte_lockptr(hstate_vma(vma), vma->vm_mm, ptep);
+ 	softleaf_t entry;
+ 	pte_t pte;
+@@ -547,7 +566,8 @@ void migration_entry_wait_huge(struct vm_area_struct *vma, unsigned long addr, p
+ 		 * lock release in softleaf_entry_wait_on_locked().
+ 		 */
+ 		hugetlb_vma_unlock_read(vma);
+ 		softleaf_entry_wait_on_locked(entry, ptl);
++		mig_record_wait(wait_start_ns, true);
+ 		return;
+ 	}
+ 
+@@ -560,12 +580,14 @@ fail:
+ #ifdef CONFIG_ARCH_HAS_PMD_SOFTLEAVES
+ void pmd_migration_entry_wait(struct mm_struct *mm, pmd_t *pmd)
+ {
++	u64 wait_start_ns = ktime_get_ns();
+ 	spinlock_t *ptl;
+ 
+ 	ptl = pmd_lock(mm, pmd);
+ 	if (!pmd_is_migration_entry(*pmd))
+ 		goto unlock;
+ 	softleaf_entry_wait_on_locked(softleaf_from_pmd(*pmd), ptl);
++	mig_record_wait(wait_start_ns, true);
+ 	return;
+ unlock:
+ 	spin_unlock(ptl);
+@@ -2101,6 +2123,7 @@ int migrate_pages(struct list_head *from, new_folio_t get_new_folio,
+ 		free_folio_t put_new_folio, unsigned long private,
+ 		enum migrate_mode mode, enum migrate_reason reason, unsigned int *ret_succeeded)
+ {
++	u64 mig_start_ns = ktime_get_ns();
+ 	int rc, rc_gather;
+ 	int nr_pages;
+ 	struct folio *folio, *folio2;
+@@ -2183,6 +2206,9 @@ out:
+ 	count_vm_events(THP_MIGRATION_SUCCESS, stats.nr_thp_succeeded);
+ 	count_vm_events(THP_MIGRATION_FAIL, stats.nr_thp_failed);
+ 	count_vm_events(THP_MIGRATION_SPLIT, stats.nr_thp_split);
++	if (stats.nr_succeeded)
++		count_vm_events(MIG_COPY_NS,
++				(unsigned long)(ktime_get_ns() - mig_start_ns));
+ 	trace_mm_migrate_pages(stats.nr_succeeded, stats.nr_failed_pages,
+ 			       stats.nr_thp_succeeded, stats.nr_thp_failed,
+ 			       stats.nr_thp_split, stats.nr_split, mode,
+diff --git a/mm/vmstat.c b/mm/vmstat.c
+index cb57714..913220a 100644
+--- a/mm/vmstat.c
++++ b/mm/vmstat.c
+@@ -1381,6 +1381,11 @@ const char * const vmstat_text[] = {
+ 	[I(THP_MIGRATION_SUCCESS)]		= "thp_migration_success",
+ 	[I(THP_MIGRATION_FAIL)]			= "thp_migration_fail",
+ 	[I(THP_MIGRATION_SPLIT)]		= "thp_migration_split",
++	[I(MIG_WAIT_COUNT)]			= "mig_wait_count",
++	[I(MIG_WAIT_US)]			= "mig_wait_us",
++	[I(MIG_WAIT_HUGE_COUNT)]		= "mig_wait_huge_count",
++	[I(MIG_WAIT_HUGE_US)]			= "mig_wait_huge_us",
++	[I(MIG_COPY_NS)]			= "mig_copy_ns",
+ #endif
+ #ifdef CONFIG_COMPACTION
+ 	[I(COMPACTMIGRATE_SCANNED)]		= "compact_migrate_scanned",

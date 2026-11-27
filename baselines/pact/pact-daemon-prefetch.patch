@@ -102,7 +102,7 @@ new file mode 100644
 index 0000000..765dc30
 --- /dev/null
 +++ b/baselines/pact/src/prefetch-coro.c
-@@ -0,0 +1,189 @@
+@@ -0,0 +1,187 @@
 +#ifndef _GNU_SOURCE
 +#define _GNU_SOURCE
 +#endif
@@ -111,8 +111,6 @@ index 0000000..765dc30
 +#include "pact.h"
 +#include "tsc.h"
 +#include "logging.h"
-+
-+int g_verbose = 0;
 +
 +/* Directly tie to the unified mig_telemetry and cha_mon subsystems */
 +#include "../../tier-prefetch-mon/mig_cha_mon.c"

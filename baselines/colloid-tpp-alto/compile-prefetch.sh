@@ -11,7 +11,7 @@ ROOT_DIR="${ROOT_DIR:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
 COLLOID_DIR="${ROOT_DIR}/baselines/colloid-tpp-alto"
 KERNEL_DIR="${COLLOID_DIR}/linux"
 LOGF="${COLLOID_DIR}/log"
-PATCHES=("${COLLOID_DIR}/colloid-skx.patch" "${COLLOID_DIR}/colloid-skx-alto.patch" "${COLLOID_DIR}/colloid-tpp-alto-prefetch.patch")
+PATCHES=("${COLLOID_DIR}/colloid-skx.patch" "${COLLOID_DIR}/colloid-skx-alto.patch" "${COLLOID_DIR}/colloid-tpp-alto-prefetch.patch" "${COLLOID_DIR}/colloid-tpp-alto-mig-stats.patch")
 UBUNTU_FIXES_CONFIG="${UBUNTU_FIXES_CONFIG:-${ROOT_DIR}/baselines/scripts/ubuntu_fixes.config}"
 
 [[ -d "$KERNEL_DIR" ]] || { echo "ERROR: kernel tree not found at $KERNEL_DIR"; exit 1; }
@@ -58,7 +58,7 @@ fi
 # Kernel Configuration Adjustments (scripts/config & merge_config.sh)
 # ------------------------------------------------------------------------------
 # 1. Kernel Naming & Certificate Key Fixes
-scripts/config --set-str CONFIG_LOCALVERSION "-Colloid-TPP-Alto-prefetch"
+scripts/config --set-str CONFIG_LOCALVERSION "-Colloid-TPP-Alto-Prefetch"
 scripts/config --disable CONFIG_LOCALVERSION_AUTO
 scripts/config --set-str CONFIG_SYSTEM_TRUSTED_KEYS ""
 scripts/config --set-str CONFIG_SYSTEM_REVOCATION_KEYS ""

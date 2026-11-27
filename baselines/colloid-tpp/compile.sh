@@ -8,7 +8,7 @@ ROOT_DIR="${ROOT_DIR:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
 COLLOID_DIR="${ROOT_DIR}/baselines/colloid-tpp"
 KERNEL_DIR="${COLLOID_DIR}/linux"
 LOGF="${COLLOID_DIR}/log"
-PATCHES=("${COLLOID_DIR}/colloid-skx.patch")
+PATCHES=("${COLLOID_DIR}/colloid-skx.patch" "${COLLOID_DIR}/colloid-tpp-mig-stats.patch")
 UBUNTU_FIXES_CONFIG="${UBUNTU_FIXES_CONFIG:-${ROOT_DIR}/baselines/scripts/ubuntu_fixes.config}"
 
 [[ -d "$KERNEL_DIR" ]] || { echo "ERROR: kernel tree not found at $KERNEL_DIR"; exit 1; }

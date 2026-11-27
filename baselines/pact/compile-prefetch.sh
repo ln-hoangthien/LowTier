@@ -10,7 +10,7 @@ ROOT_DIR="${ROOT_DIR:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
 PACT_DIR="${ROOT_DIR}/baselines/pact"
 KERNEL_DIR="${PACT_DIR}/linux"
 LOGF="${PACT_DIR}/log"
-PATCHES=("${PACT_DIR}/pact-prefetch.patch")
+PATCHES=("${PACT_DIR}/pact-prefetch.patch" "${PACT_DIR}/pact-mig-stats.patch")
 DAEMON_PATCH="${PACT_DIR}/pact-daemon-prefetch.patch"
 UBUNTU_FIXES_CONFIG="${UBUNTU_FIXES_CONFIG:-${ROOT_DIR}/baselines/scripts/ubuntu_fixes.config}"
 
@@ -69,16 +69,20 @@ fi
 # Kernel Configuration Adjustments (scripts/config & merge_config.sh)
 # ------------------------------------------------------------------------------
 # 1. Kernel Naming & Certificate Key Fixes
-scripts/config --set-str CONFIG_LOCALVERSION "-PACT-prefetch"
+scripts/config --set-str CONFIG_LOCALVERSION "-PACT-Prefetch"
 scripts/config --disable CONFIG_LOCALVERSION_AUTO
 scripts/config --set-str CONFIG_SYSTEM_TRUSTED_KEYS ""
 scripts/config --set-str CONFIG_SYSTEM_REVOCATION_KEYS ""
 
-# 2. Apply Ubuntu Boot Fixes & Safety Nets
+# 2. Disable BTF to prevent building resolve_btfids/libbpf with modern host toolchain
+scripts/config --disable CONFIG_DEBUG_INFO_BTF
+scripts/config --disable CONFIG_DEBUG_INFO_BTF_MODULES
+
+# 3. Apply Ubuntu Boot Fixes & Safety Nets
 echo "Applying Ubuntu fixes configuration: $UBUNTU_FIXES_CONFIG"
 ./scripts/kconfig/merge_config.sh -m .config "$UBUNTU_FIXES_CONFIG"
 
-# 3. Enable PACT specific requirements:
+# 4. Enable PACT specific requirements:
 #    - CONFIG_INTEL_UNCORE_FREQ_CONTROL: uncore freq sysfs
 #    - CONFIG_KPROBES, CONFIG_KALLSYMS_ALL: required by tierinit to resolve mm/memory-tiers symbols
 #    - CONFIG_MODULES, CONFIG_MODULE_UNLOAD: load/unload tierinit & kswapdrst modules
@@ -88,7 +92,7 @@ scripts/config --enable CONFIG_KALLSYMS_ALL
 scripts/config --enable CONFIG_MODULES
 scripts/config --enable CONFIG_MODULE_UNLOAD
 
-# 4. Single-Socket NUMA Emulation Configs (managed in manage_kernels.sh)
+# 5. Single-Socket NUMA Emulation Configs (managed in manage_kernels.sh)
 if type configure_single_socket_numa >/dev/null 2>&1; then
     configure_single_socket_numa "$KERNEL_DIR"
 fi

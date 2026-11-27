@@ -10,7 +10,7 @@ ROOT_DIR="${ROOT_DIR:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
 AUTONUMA_DIR="${ROOT_DIR}/baselines/autonuma"
 KERNEL_DIR="${AUTONUMA_DIR}/linux"
 LOGF="${AUTONUMA_DIR}/log"
-PATCHES=("${AUTONUMA_DIR}/autonuma-prefetch.patch")
+PATCHES=("${AUTONUMA_DIR}/autonuma-prefetch.patch" "${AUTONUMA_DIR}/autonuma-mig-stats.patch")
 UBUNTU_FIXES_CONFIG="${UBUNTU_FIXES_CONFIG:-${ROOT_DIR}/baselines/scripts/ubuntu_fixes.config}"
 
 [[ -d "$KERNEL_DIR" ]] || { echo "ERROR: kernel tree not found at $KERNEL_DIR"; exit 1; }
@@ -57,7 +57,7 @@ fi
 # Kernel Configuration Adjustments (scripts/config & merge_config.sh)
 # ------------------------------------------------------------------------------
 # 1. Kernel Naming & Certificate Key Fixes
-scripts/config --set-str CONFIG_LOCALVERSION "-AutoNUMA-prefetch"
+scripts/config --set-str CONFIG_LOCALVERSION "-AutoNUMA-Prefetch"
 scripts/config --disable CONFIG_LOCALVERSION_AUTO
 scripts/config --set-str CONFIG_SYSTEM_TRUSTED_KEYS ""
 scripts/config --set-str CONFIG_SYSTEM_REVOCATION_KEYS ""

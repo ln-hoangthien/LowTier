@@ -6,14 +6,16 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="${ROOT_DIR:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
 MEMTIS_DIR="${ROOT_DIR}/baselines/memtis"
-PATCH_FILE="${MEMTIS_DIR}/memtis.patch"
+PATCH_FILES=("${MEMTIS_DIR}/memtis.patch" "${MEMTIS_DIR}/memtis-mig-stats.patch")
 BASE_CONFIG="${MEMTIS_DIR}/config"
 KERNEL_DIR="${MEMTIS_DIR}/linux"
 LOGF="${MEMTIS_DIR}/log"
 
 [[ -d "$KERNEL_DIR" ]] || { echo "ERROR: kernel tree not found at $KERNEL_DIR"; exit 1; }
 
-[[ -e "$PATCH_FILE" ]] || { echo "ERROR: patch not found: $PATCH_FILE"; exit 1; }
+for p in "${PATCH_FILES[@]}"; do
+    [[ -e "$p" ]] || { echo "ERROR: patch not found: $p"; exit 1; }
+done
 
 [[ -e "$BASE_CONFIG" ]] || { echo "ERROR: base config not found: $BASE_CONFIG"; exit 1; }
 
@@ -30,12 +32,14 @@ make clean
 # Remove host-built fixdep binary to avoid glibc compatibility issues
 rm -f tools/objtool/fixdep scripts/basic/fixdep
 
-echo "Applying $(basename "$PATCH_FILE") ..."
-if git apply --reverse --check "$PATCH_FILE" >/dev/null 2>&1; then
-    echo "  (already applied, skipping)"
-else
-    git apply "$PATCH_FILE"
-fi
+for p in "${PATCH_FILES[@]}"; do
+    echo "Applying $(basename "$p") ..."
+    if git apply --reverse --check "$p" >/dev/null 2>&1; then
+        echo "  (already applied, skipping)"
+    else
+        git apply "$p"
+    fi
+done
 
 # Copy base configuration to .config
 echo "configuring (olddefconfig) ..."
